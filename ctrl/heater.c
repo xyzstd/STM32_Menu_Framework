@@ -18,13 +18,12 @@
 static struct {
     int16_t power;      /* 当前功率 0~1000 */
     bool enabled;       /* 加热使能 */
-} s_heater;
+} heater;
 
 void Heater_Init(void)
 {
     PWM_Init();
-    s_heater.power = 0;
-    s_heater.enabled = true;
+    heater.enabled = true;
     PWM_SetCompare1(0);
 }
 
@@ -40,9 +39,9 @@ void Heater_SetPower(int16_t power)
     if (power > HEATER_POWER_LIMIT)
         power = HEATER_POWER_LIMIT;
 
-    s_heater.power = power;
+    heater.power = power;
 
-    if (!s_heater.enabled)
+    if (!heater.enabled)
     {
         PWM_SetCompare1(0);
         return;
@@ -55,23 +54,23 @@ void Heater_SetPower(int16_t power)
 
 int16_t Heater_GetPower(void)
 {
-    return s_heater.power;
+    return heater.power;
 }
 
 void Heater_Enable(void)
 {
-    s_heater.enabled = true;
+    heater.enabled = true;
     /* 恢复之前的功率 */
-    Heater_SetPower(s_heater.power);
+    Heater_SetPower(heater.power);
 }
 
 void Heater_Disable(void)
 {
-    s_heater.enabled = false;
+    heater.enabled = false;
     PWM_SetCompare1(0);
 }
 
 bool Heater_IsEnabled(void)
 {
-    return s_heater.enabled;
+    return heater.enabled;
 }

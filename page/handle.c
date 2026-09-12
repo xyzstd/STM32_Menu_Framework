@@ -4,6 +4,7 @@
 #include "handle.h"
 #include "config.h"
 #include "work_task.h"
+#include "confirm.h"
 
 /*
  * 手柄型号页: T12 / T245 / T210
@@ -15,7 +16,7 @@
  *   - UP/DOWN : 循环切换当前型号 (仅预览, 不落地)
  *   - LPRESS  : 返回上级必经确认页
  *
- * 确认页 (YES/NO, 同 恢复默认 页操作逻辑, 显示当前选中的型号):
+ * 确认页 (YES/NO, 由通用 confirm 模板处理, 显示当前选中的型号):
  *   - UP/DOWN : 切换 否/是
  *   - CLICK   : 选"是"→ 写配置+安全闭合后退出; 选"否"→ 取消返回重选
  *   - LPRESS  : 取消, 返回重选
@@ -25,56 +26,36 @@
  */
 
 #define HANDLE_LABEL_NUM  3
-static const char *g_handle_labels[HANDLE_LABEL_NUM] = {"T12", "T245", "T210"};
+static const char *handle_labels[HANDLE_LABEL_NUM] = {"T12", "T245", "T210"};
 
-static uint8_t g_idx = HANDLE_T12;   /* 当前预览/待选中的型号 */
-static bool    g_confirm = false;    /* 是否正处于确认页 */
-static uint8_t g_confirm_yes = 0;    /* 确认项: 0=否(重选), 1=是(切换) */
+static uint8_t   cur_idx = HANDLE_T12;   /* 当前预览/待选中的型号 */
+static confirm_t cf;                 /* 确认页子状态机 */
 
-static void handle_enter(void *user_data)
+static void handle_enter(void *ud)
 {
-    (void)user_data;
-    g_idx        = Config_GetHandleIdx();   /* 以当前型号为初始选中 */
-    g_confirm    = false;
-    g_confirm_yes = 0;
+    (void)ud;
+    cur_idx       = Config_GetHandleIdx();   /* 以当前型号为初始选中 */
+    cf.active = false;                   /* 初始不在确认态 */
 }
 
-static menu_result_t handle_handler(const menu_cmd_t *cmd, void *user_data)
+static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
 {
-    (void)user_data;
+    (void)ud;
 
     /* ---- 确认页处理 (优先) ---- */
-    if (g_confirm)
+    if (cf.active)
     {
-        switch(cmd->event)
+        bool confirmed = false;
+        (void)confirm_handle(cmd, &cf, &confirmed);
+        if (confirmed)
         {
-            case MENU_EVENT_UP:
-            case MENU_EVENT_DOWN:
-                g_confirm_yes = (uint8_t)!g_confirm_yes;   /* 切换 否/是 */
-                break;
-            case MENU_EVENT_CLICK:
-                if (g_confirm_yes)
-                {
-                    /* 确认切换: 写配置 + 触发安全闭合, 然后退出返回上级 */
-                    g_config.handle_type = g_idx;
-                    Config_Save();
-                    WorkTask_OnHandleChanged();
-                    g_confirm = false;
-                    g_confirm_yes = 0;
-                    return MENU_RET_DONE;
-                }
-                /* 选"否": 取消, 返回单型号视图重选 */
-                g_confirm = false;
-                g_confirm_yes = 0;
-                break;
-            case MENU_EVENT_LPRESS:
-                /* 取消, 返回单型号视图重选 */
-                g_confirm = false;
-                g_confirm_yes = 0;
-                break;
-            default:
-                break;
+            /* 确认切换: 写配置 + 触发安全闭合, 然后退出返回上级 */
+            g_config.handle_type = cur_idx;
+            Config_Save();
+            WorkTask_OnHandleChanged();
+            return MENU_RET_DONE;
         }
+        /* 选"否"/长按: 取消, 返回单型号视图重选; 其余仍在确认态 */
         return MENU_RET_OK;
     }
 
@@ -82,15 +63,14 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *user_data)
     switch(cmd->event)
     {
         case MENU_EVENT_UP:
-            g_idx = (g_idx + 1 >= HANDLE_LABEL_NUM) ? 0 : (uint8_t)(g_idx + 1);
+            cur_idx = (cur_idx + 1 >= HANDLE_LABEL_NUM) ? 0 : (uint8_t)(cur_idx + 1);
             break;
         case MENU_EVENT_DOWN:
-            g_idx = (g_idx == 0) ? (uint8_t)(HANDLE_LABEL_NUM - 1) : (uint8_t)(g_idx - 1);
+            cur_idx = (cur_idx == 0) ? (uint8_t)(HANDLE_LABEL_NUM - 1) : (uint8_t)(cur_idx - 1);
             break;
         case MENU_EVENT_LPRESS:
             /* 返回上级必经确认页 */
-            g_confirm = true;
-            g_confirm_yes = 0;
+            confirm_open(&cf);
             break;
         default:
             break;
@@ -98,51 +78,32 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *user_data)
     return MENU_RET_OK;
 }
 
-static menu_period_t handle_display(void *user_data)
+static menu_period_t handle_display(void *ud)
 {
-    (void)user_data;
+    (void)ud;
     OLED_Clear();
 
-    /* ---- 确认页显示 (同 恢复默认 页布局, 标题带当前型号) ---- */
-    if (g_confirm)
+    /* ---- 确认页显示 (标题带当前型号) ---- */
+    if (cf.active)
     {
         char buf[24];
-        (void)snprintf(buf, sizeof(buf), "Switch to %s?", g_handle_labels[g_idx]);
-        OLED_ShowString(4, 16, buf, OLED_8X16);
-
-        /* 同时显示两个选项 */
-        OLED_ShowString(32, 34, "NO", OLED_8X16);
-        OLED_ShowString(80, 34, "YES", OLED_8X16);
-
-        /* 选中项反显, 未选中项实线框 */
-        if (g_confirm_yes)
-        {
-            OLED_DrawRoundRect(30, 33, 20, 18, 6, OLED_COLOR_SET);
-            OLED_ReverseRoundRect(78, 33, 28, 18, 6);
-        }
-        else
-        {
-            OLED_ReverseRoundRect(30, 33, 20, 18, 6);
-            OLED_DrawRoundRect(78, 33, 28, 18, 6, OLED_COLOR_SET);
-        }
-
-        OLED_Update();
+        (void)snprintf(buf, sizeof(buf), "Switch to %s?", handle_labels[cur_idx]);
+        confirm_display(&cf, buf);
+        OLED_UpdateDiff();
         return 0;
     }
 
     /* ---- 单个型号视图: 显示当前选中, 切换预览 ---- */
-    {
-        OLED_ShowString(8, 8, "Handle:", OLED_8X16);
+    OLED_ShowString(8, 8, "Handle:", OLED_8X16);
 
-        /* 当前型号大号反显框 (宽 40 容纳 "T245") */
-        OLED_ShowString(28, 32, g_handle_labels[g_idx], OLED_8X16);
-        OLED_ReverseRoundRect(24, 30, 40, 18, 6);
+    /* 当前型号大号反显框 (宽 40 容纳 "T245") */
+    OLED_ShowString(28, 32, handle_labels[cur_idx], OLED_8X16);
+    OLED_ReverseRoundRect(24, 30, 40, 18, 6);
 
-        /* 底部提示 */
-        OLED_ShowString(8, 54, "HOLD to Switch", OLED_6X8);
-    }
+    /* 底部提示 */
+    OLED_ShowString(8, 54, "HOLD to Switch", OLED_6X8);
 
-    OLED_Update();
+    OLED_UpdateDiff();
     return 0;
 }
 

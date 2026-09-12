@@ -38,9 +38,8 @@ void Encoder_Init(void)
         TIM_ICPolarity_Rising,
         TIM_ICPolarity_Falling);
 
-    TIM_SetCounter(TIMx, 0);
-
     TIM_Cmd(TIMx, ENABLE);
+	TIM_SetCounter(TIMx, 0);
 }
 
 int16_t Encoder_GetDiff(void)

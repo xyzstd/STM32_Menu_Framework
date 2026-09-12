@@ -29,8 +29,8 @@ typedef struct
     uint16_t sleep_temp;        /* 休眠温度 °C */
 
     /* PID 参数 (*100), 每型号一套
-     * 分段控制: ΔT>50°C 全速, 30~50°C 用激进组, ≤30°C 用保守组
-     * 积分限幅为内置固定值 (PID 输出满量程 30%), 不存入配置 */
+     * 分段控制: ΔT>50°C 全速, 30~50°C 用激进组(积分限幅 15%), ≤30°C 用保守组(限幅 30%)
+     * 积分限幅为内置固定值, 不存入配置 */
     int16_t pid_agg_kp[HANDLE_NUM];   /* 激进 Kp (*100) */
     int16_t pid_agg_ki[HANDLE_NUM];   /* 激进 Ki (*100) */
     int16_t pid_agg_kd[HANDLE_NUM];   /* 激进 Kd (*100) */

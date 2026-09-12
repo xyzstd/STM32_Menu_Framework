@@ -1,0 +1,13 @@
+# Keil 构建产物
+DebugConfig/
+Listings/
+Objects/
+*.log
+
+# Keil 用户本地配置（不随工程分发）
+*.uvoptx
+*.uvguix.*
+
+# 杂项
+NUL
+*.bak

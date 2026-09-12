@@ -3,19 +3,19 @@
 #include "stm32f10x.h"
 #include <stdio.h>
 
-static volatile bool s_app_request;
-static uint8_t s_req_state;
+static volatile bool app_request;
+static uint8_t req_state;
 
-void OTA_SetAppRequest(bool v) { s_app_request = v; }
-bool OTA_GetAppRequest(void)    { return s_app_request; }
+void OTA_SetAppRequest(bool v) { app_request = v; }
+bool OTA_GetAppRequest(void)    { return app_request; }
 
 void OTA_SerialFeedRx(uint8_t b)
 {
-    switch (s_req_state) {
-    case 0: if (b == OTA_APP_REQ_B0) s_req_state = 1; else s_req_state = 0; break;
-    case 1: if (b == OTA_APP_REQ_B1) s_req_state = 2; else if (b == OTA_APP_REQ_B0) s_req_state = 1; else s_req_state = 0; break;
-    case 2: if (b == OTA_APP_REQ_B2) { s_app_request = true; s_req_state = 0; }
-            else if (b == OTA_APP_REQ_B0) s_req_state = 1; else s_req_state = 0;
+    switch (req_state) {
+    case 0: if (b == OTA_APP_REQ_B0) req_state = 1; else req_state = 0; break;
+    case 1: if (b == OTA_APP_REQ_B1) req_state = 2; else if (b == OTA_APP_REQ_B0) req_state = 1; else req_state = 0; break;
+    case 2: if (b == OTA_APP_REQ_B2) { app_request = true; req_state = 0; }
+            else if (b == OTA_APP_REQ_B0) req_state = 1; else req_state = 0;
         break;
     }
 }

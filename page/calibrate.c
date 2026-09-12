@@ -22,22 +22,22 @@
 #define CAL_OFF_MIN   (-50)
 
 /* 各校准点的目标温度 (°C) */
-static const int16_t g_cal_points[CAL_POINT_NUM] = {100, 200, 300, 350, 400, 450};
+static const int16_t cal_points[CAL_POINT_NUM] = {100, 200, 300, 350, 400, 450};
 
-static int16_t g_off[CAL_POINT_NUM]; /* 各温度点偏移量 */
-static int16_t g_prev_setpoint;      /* 进入本页前的目标温度, 退出时恢复 */
-static uint8_t g_focus = 0;          /* 当前聚焦的温度点 0..5 */
-static bool g_sel = false;           /* false=导航态, true=调参态 */
-static bool g_dirty = false;         /* 参数是否被修改 */
+static int16_t off[CAL_POINT_NUM]; /* 各温度点偏移量 */
+static int16_t prev_setpoint;      /* 进入本页前的目标温度, 退出时恢复 */
+static uint8_t focus = 0;          /* 当前聚焦的温度点 0..5 */
+static bool sel = false;           /* false=导航态, true=调参态 */
+static bool dirty = false;         /* 参数是否被修改 */
 
-static const char *g_cal_names[CAL_POINT_NUM] = {"100:", "200:", "300:", "350:", "400:", "450:"};
+static const char *cal_names[CAL_POINT_NUM] = {"100:", "200:", "300:", "350:", "400:", "450:"};
 
 static void cal_draw_row(uint8_t y, uint8_t idx)
 {
-    int16_t v = g_off[idx];
+    int16_t v = off[idx];
     char buf[4];
 
-    OLED_ShowString(6, y, g_cal_names[idx], OLED_6X8);
+    OLED_ShowString(6, y, cal_names[idx], OLED_6X8);
     buf[0] = (v < 0) ? '-' : '+';
     buf[1] = (char)('0' + ((v < 0 ? -v : v) / 10));
     buf[2] = (char)('0' + ((v < 0 ? -v : v) % 10));
@@ -75,47 +75,47 @@ static menu_result_t calibrate_handler(const menu_cmd_t *cmd, void *user_data)
     {
         case MENU_EVENT_UP:
         case MENU_EVENT_DOWN:
-            if(!g_sel)
+            if(!sel)
             {
                 /* 导航态: 与菜单浏览同向 —— 正转(UP事件)向下一个校准点, 反转(DOWN事件)回上一个 */
                 if(cmd->event == MENU_EVENT_UP)
-                    g_focus = (g_focus == CAL_POINT_NUM - 1) ? 0
-                                                             : (uint8_t)(g_focus + 1);
+                    focus = (focus == CAL_POINT_NUM - 1) ? 0
+                                                             : (uint8_t)(focus + 1);
                 else
-                    g_focus = (g_focus == 0) ? (uint8_t)(CAL_POINT_NUM - 1)
-                                             : (uint8_t)(g_focus - 1);
+                    focus = (focus == 0) ? (uint8_t)(CAL_POINT_NUM - 1)
+                                             : (uint8_t)(focus - 1);
             }
             else
             {
                 /* 调参态: 调整当前聚焦点偏移 */
                 if(cmd->event == MENU_EVENT_UP)
-                    g_off[g_focus] += (int16_t)(1 * cmd->step);
+                    off[focus] += cmd->step;
                 else
-                    g_off[g_focus] -= (int16_t)(1 * cmd->step);
-                if (g_off[g_focus] > CAL_OFF_MAX) g_off[g_focus] = CAL_OFF_MAX;
-                if (g_off[g_focus] < CAL_OFF_MIN) g_off[g_focus] = CAL_OFF_MIN;
-                g_dirty = true;
+                    off[focus] -= cmd->step;
+                if (off[focus] > CAL_OFF_MAX) off[focus] = CAL_OFF_MAX;
+                if (off[focus] < CAL_OFF_MIN) off[focus] = CAL_OFF_MIN;
+                dirty = true;
             }
             break;
         case MENU_EVENT_CLICK:
-            if(g_sel)
+            if(sel)
             {
                 /* 退出调参 → 导航 */
-                g_sel = false;
+                sel = false;
             }
             else
             {
                 /* 进入调参: 选中后才把校准点设为目标温度, 烙铁加热至该校准点 */
-                g_sel = true;
-                PID_Controller_SetSetpoint(g_cal_points[g_focus]);
+                sel = true;
+                PID_Controller_SetSetpoint(cal_points[focus]);
                 PID_Controller_Reset();
             }
             break;
         case MENU_EVENT_LPRESS:
-            if(g_sel)
+            if(sel)
             {
                 /* 调参态长按: 改为非选中, 不直接退出 */
-                g_sel = false;
+                sel = false;
             }
             else
             {
@@ -157,12 +157,12 @@ static menu_period_t calibrate_display(void *user_data)
 
     /* 聚焦/选中框: 6x8 行文本 y..y+7 上下各留 1px, 故框起点 y (紧凑布局不再 -1),
      * 高度 10 覆盖整行; 标签 x6 左留 2px, 数值右缘 x61 右留 2px (OLED_6X8 实际按 8px 步进) */
-    if(g_sel)
-        OLED_ReverseRoundRect(4, row_y[g_focus], 60, 9, 4);
+    if(sel)
+        OLED_ReverseRoundRect(4, row_y[focus], 60, 9, 4);
     else
-        OLED_DrawRoundRect(4, row_y[g_focus], 60, 9, 4, OLED_COLOR_SET);
+        OLED_DrawRoundRect(4, row_y[focus], 60, 9, 4, OLED_COLOR_SET);
 
-    OLED_Update();
+    OLED_UpdateDiff();
     return 0;
 }
 
@@ -170,40 +170,40 @@ static void calibrate_enter(void *user_data)
 {
     (void)user_data;
     uint8_t h = Config_GetHandleIdx();
-    g_off[0] = (int16_t)g_config.cal_off_100[h];
-    g_off[1] = (int16_t)g_config.cal_off_200[h];
-    g_off[2] = (int16_t)g_config.cal_off_300[h];
-    g_off[3] = (int16_t)g_config.cal_off_350[h];
-    g_off[4] = (int16_t)g_config.cal_off_400[h];
-    g_off[5] = (int16_t)g_config.cal_off_450[h];
-    g_focus = 0;
-    g_sel = false;
-    g_dirty = false;
+    off[0] = (int16_t)g_config.cal_off_100[h];
+    off[1] = (int16_t)g_config.cal_off_200[h];
+    off[2] = (int16_t)g_config.cal_off_300[h];
+    off[3] = (int16_t)g_config.cal_off_350[h];
+    off[4] = (int16_t)g_config.cal_off_400[h];
+    off[5] = (int16_t)g_config.cal_off_450[h];
+    focus = 0;
+    sel = false;
+    dirty = false;
 
     /* 记住进入前的目标温度, 退出时恢复 */
-    g_prev_setpoint = PID_Controller_GetSetpoint();
+    prev_setpoint = PID_Controller_GetSetpoint();
     /* 不自动加热, 待用户 CLICK 选中校准点后才设置目标温度 */
 }
 
 static void calibrate_exit(void *user_data)
 {
     (void)user_data;
-    if(g_dirty)
+    if(dirty)
     {
         uint8_t h = Config_GetHandleIdx();
         /* 保存到配置 */
-        g_config.cal_off_100[h] = (int8_t)g_off[0];
-        g_config.cal_off_200[h] = (int8_t)g_off[1];
-        g_config.cal_off_300[h] = (int8_t)g_off[2];
-        g_config.cal_off_350[h] = (int8_t)g_off[3];
-        g_config.cal_off_400[h] = (int8_t)g_off[4];
-        g_config.cal_off_450[h] = (int8_t)g_off[5];
+        g_config.cal_off_100[h] = (int8_t)off[0];
+        g_config.cal_off_200[h] = (int8_t)off[1];
+        g_config.cal_off_300[h] = (int8_t)off[2];
+        g_config.cal_off_350[h] = (int8_t)off[3];
+        g_config.cal_off_400[h] = (int8_t)off[4];
+        g_config.cal_off_450[h] = (int8_t)off[5];
         Config_Save();
-        g_dirty = false;
+        dirty = false;
     }
 
     /* 恢复进入前的目标温度 */
-    PID_Controller_SetSetpoint(g_prev_setpoint);
+    PID_Controller_SetSetpoint(prev_setpoint);
     PID_Controller_Reset();
 }
 

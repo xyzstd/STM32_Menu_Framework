@@ -7,6 +7,25 @@
 
 uint8_t OLED_DisplayBuf[OLED_PAGE_NUM][OLED_WIDTH];
 
+/* 差量刷屏快照: 记录最近一次推送到屏幕的每页 32bit 校验和, 供 OLED_UpdateDiff 判脏.
+ * 以 8×4B 校验和取代整帧副本(省约 1KB RAM, 碰撞概率 2^-32 每页可忽略);
+ * 全推/局部推也同步本快照, 保证混合调用一致不错漏. */
+static uint32_t oled_snap_sum[OLED_PAGE_NUM];
+
+static uint32_t oled_page_sum(uint8_t page)
+{
+    uint32_t s = 0;
+    uint8_t c;
+    for(c=0;c<OLED_WIDTH;c++)
+        s += OLED_DisplayBuf[page][c];
+    return s;
+}
+
+static void oled_snap_sync(uint8_t page)
+{
+    oled_snap_sum[page] = oled_page_sum(page);
+}
+
 
 /*================ I2C =================*/
 
@@ -218,9 +237,28 @@ void OLED_Update(void)
     {
         oled_set_cursor(page,0);
         OLED_WriteData(OLED_DisplayBuf[page],OLED_WIDTH);
+        oled_snap_sync(page);
     }
 }
 
+/* 页级差量推送: 按页校验和与快照比对, 只把内容变化的页整页推送到屏幕并更新快照.
+ * 菜单/参数页每帧往往只改少数几页(高亮行、数值、功率条), 其余页一致则跳过,
+ * 大幅减少软 I2C 刷屏量, 消除连续旋转时 UI 卡顿. 静止时逐页全等 -> 零推送零闪烁.
+ * 校验和(32bit 累加)代替整帧比较, 节省 ~1KB RAM; 页内容变化则校验和必变. */
+void OLED_UpdateDiff(void)
+{
+    uint8_t page;
+
+    for(page=0;page<OLED_PAGE_NUM;page++)
+    {
+        if (oled_page_sum(page) != oled_snap_sum[page])
+        {
+            oled_set_cursor(page,0);
+            OLED_WriteData(OLED_DisplayBuf[page],OLED_WIDTH);
+            oled_snap_sync(page);
+        }
+    }
+}
 
 void OLED_UpdateArea(int16_t x,int16_t y,uint8_t width,uint8_t height)
 {
@@ -266,6 +304,7 @@ void OLED_UpdateArea(int16_t x,int16_t y,uint8_t width,uint8_t height)
     {
         oled_set_cursor(page,x);
         OLED_WriteData(&OLED_DisplayBuf[page][x],width);
+        oled_snap_sync(page);
     }
 }
 
@@ -800,21 +839,23 @@ void OLED_ShowNum(int16_t x,int16_t y,int32_t num,uint8_t len)
 {
     uint8_t i;
     uint8_t digit;
+    uint32_t v;
 
-
-    if(num<0)
+    if(num < 0)
     {
         OLED_ShowChar(x,y,'-',OLED_8X16);
-
         x+=8;
-        num=-num;
+        /* 无符号回绕取绝对值: 对 INT32_MIN 也定义良好, 消除 -num 的未定义行为 */
+        v = 0u - (uint32_t)num;
     }
-
+    else
+    {
+        v = (uint32_t)num;
+    }
 
     for(i=0;i<len;i++)
     {
-        digit=(num/oled_pow10(len-i-1))%10;
-
+        digit=(uint8_t)((v/oled_pow10(len-i-1))%10);
 
         OLED_ShowChar(
             x+i*8,
@@ -927,21 +968,25 @@ void OLED_ShowLargeNum(int16_t x,int16_t y,int32_t num)
     uint8_t i;
     int16_t pos;
     uint8_t neg=0;
-
+    uint32_t v;
 
     if(num<0)
     {
         neg=1;
-        num=-num;
+        /* 无符号回绕取绝对值: 对 INT32_MIN 也定义良好, 消除 -num 的未定义行为 */
+        v = 0u - (uint32_t)num;
     }
-
+    else
+    {
+        v = (uint32_t)num;
+    }
 
     do
     {
-        buf[len++]=num%10;
-        num/=10;
+        buf[len++]=(uint8_t)(v%10);
+        v/=10;
     }
-    while(num>0);
+    while(v>0);
 
 
     pos=x+16*(len+neg)-16;

@@ -66,6 +66,12 @@ uint8_t WorkTask_GetPowerPercent(void);
 bool WorkTask_IsHeaterFault(void);
 void WorkTask_ClearHeaterFault(void);
 
+/* 任一锁存保护故障(过温/热电偶失效/加热器故障)是否处于锁定态 */
+bool WorkTask_HasFault(void);
+
+/* 清除全部锁存故障, 允许重新加热 */
+void WorkTask_ClearFaults(void);
+
 /* ========== 新增接口 (Cai-Zi 功能) ========== */
 
 /* 获取输入电压 (*10, 如 240 = 24.0V) */

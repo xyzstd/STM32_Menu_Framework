@@ -1,4 +1,4 @@
-﻿#include "stm32f10x.h"
+#include "stm32f10x.h"
 #include "key.h"
 
 void Key_Init(key_info_t *key, GPIO_TypeDef *gpio, uint16_t pin, void (*callback)(key_event_t))
@@ -93,29 +93,30 @@ static void process_key_debounce(key_info_t *key)
 static void process_key_pressed(key_info_t *key)
 {
     update_timer(key);
-    if(is_key_pressed(key)){
-            // 释放后判断按下时间是否长于 KEY_LONG_TIME
+    if(is_key_pressed(key))
+    {
+        // 按下时间超过 KEY_LONG_TIME: 判定为长按
         if (key->timer >= KEY_LONG_TIME)
         {
-            if(key->event_callback)
-                key->event_callback(KEY_EVENT_LONG_PRESS); // 调用长按事件回调
+            key->event_callback(KEY_EVENT_LONG_PRESS); // 调用长按事件回调
             key->state = KEY_STATE_WAIT_RELEASE;
         }
     }
-    else if (!is_key_pressed(key)) // 按键释放
+    else // 按键释放: 进入等待单击判定
     {
-        key->state = KEY_STATE_WAIT_DOUBLE; // 切换到等待释放状态
+        key->state = KEY_STATE_WAIT_DOUBLE;
         reset_timer(key);
     }
 }
+
 // 状态机处理函数：等待释放状态
 static void process_pressed_release(key_info_t *key)
 {
-        if(!is_key_pressed(key))
-        {
-            key->state = KEY_STATE_IDLE; // 返回空闲状态
-            reset_timer(key);
-        }
+    if(!is_key_pressed(key))
+    {
+        key->state = KEY_STATE_IDLE; // 返回空闲状态
+        reset_timer(key);
+    }
 }
 
 // 状态机处理函数：判断是否双击
@@ -128,18 +129,16 @@ static void process_key_wait_double(key_info_t *key)
     {
         if (key->timer <= KEY_DOUBLE_TIME)
         {
-            if(key->event_callback)
-                key->event_callback(KEY_EVENT_DOUBLE_CLICK); // 调用双击事件回调'
+            key->event_callback(KEY_EVENT_DOUBLE_CLICK); // 调用双击事件回调
         }
         key->state = KEY_STATE_WAIT_RELEASE;
     }
     else if (key->timer > KEY_DOUBLE_TIME) // 超时，认为是单击
     {
 #endif
-		if(key->event_callback)
-            key->event_callback(KEY_EVENT_CLICK); // 调用单击事件回调
+        key->event_callback(KEY_EVENT_CLICK); // 调用单击事件回调
         key->state = KEY_STATE_IDLE;
-#if defined(ENABLE_DCLICK) && ENABLE_DCLICK==1	
+#if defined(ENABLE_DCLICK) && ENABLE_DCLICK==1
     }
 #endif
 }

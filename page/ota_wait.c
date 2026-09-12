@@ -10,17 +10,6 @@
 #define ANIM_FRAMES  4
 static uint8_t anim_frame = 0;
 
-static menu_result_t ota_wait_handler(const menu_cmd_t *cmd, void *user_data)
-{
-    (void)cmd; (void)user_data;
-
-    /* 功能页: 显示内容时点击/长按均可返回(点击/长按均退出等待) */
-    if (cmd->event == MENU_EVENT_CLICK || cmd->event == MENU_EVENT_LPRESS)
-        return MENU_RET_DONE;
-
-    return MENU_RET_OK;
-}
-
 static menu_period_t ota_wait_display(void *user_data)
 {
     (void)user_data;
@@ -53,7 +42,7 @@ static menu_period_t ota_wait_display(void *user_data)
     buf[0] = 'h'; buf[1] = 'o'; buf[2] = 's'; buf[3] = 't';
     buf[4] = d[0]; buf[5] = d[1]; buf[6] = d[2]; buf[7] = '\0';
     OLED_ShowString((OLED_WIDTH - 8 * 8) / 2, 38, buf, OLED_6X8);
-	OLED_Update();
+    OLED_UpdateDiff();
     return REFRESH_PERIOD_MS;
 }
 
@@ -72,7 +61,6 @@ static void ota_wait_exit(void *user_data)
 
 const menu_ops_t ota_wait_ops = {
     .enter   = ota_wait_enter,
-    .handler = ota_wait_handler,
     .display = ota_wait_display,
     .exit    = ota_wait_exit,
 };

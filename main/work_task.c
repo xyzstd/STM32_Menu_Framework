@@ -27,6 +27,11 @@
 #define TEMP_REACHED_THRESHOLD   5      /* 温度到达阈值 */
 #define OVER_TEMP_LIMIT          500    /* 过温保护阈值 (°C) */
 
+/* 热电偶失效(短路/断线)检测: 温度 ADC 低于此阈值判短路/断线 → 锁存断热.
+ * 校准原点: 0°C≈0, 25°C≈198; 烙铁正常工作温度远高于室温, 留裕量防误判.
+ * 开路(运放饱和近满量程)与 450°C+ 在 ADC 域重叠, 由加热器故障诊断兜底. */
+#define THERMO_ADC_MIN           50
+
 /* 输入电压: 分压比 11:1, 3.3V 参考 */
 #define VIN_DIVIDER_RATIO        11
 #define VIN_ADC_REF              3.3f   /* 不使用浮点, 用整数替代 */
@@ -47,7 +52,7 @@
  * (压在大焊点/地平面/大面积铜箔上吸热), 自动抬升设定温度, 恢复后回落.
  *
  * 触发前提(防误判):
- *   - 该目标温度下曾真正"到达"(s_boost_enabled 锁存), 冷启动/调温/唤醒不算;
+ *   - 该目标温度下曾真正"到达"(boost_enabled 锁存), 冷启动/调温/唤醒不算;
  *   - 只在工作态且加热器正常、供电充足时生效;
  *   - 持续 1.5s 才触发; 抬升量按"曲线"平滑爬升/回落, 不一次性跳满;
  *   - 单次最长 6s, 超时判定异常强制结束并进入冷却, 防反复抢功率. */
@@ -60,24 +65,24 @@
 #define BOOST_COOLDOWN_MS        10000  /* 异常结束后至少冷却 10s 才允许再次触发 */
 #define BOOST_VIN_MIN_x10        180    /* 供电低于 18.0V 不 Boost, 防止供电不足时误判加功率 */
 
-static uint16_t s_boost_timer;          /* 温差持续时间计数 */
-static int16_t  s_boost_target;         /* 抬升后的有效目标温度 */
-static bool     s_boost_enabled;        /* 该目标温度下曾真正到达过(锁存) */
-static uint32_t s_boost_cool;           /* 冷却倒计时剩余 ms, 0=允许触发 */
-static uint32_t s_boost_rt;             /* 本次 Boost 已持续 ms */
-static int16_t  s_last_setpoint;        /* 上一周期设定值, 检测调温/唤醒重置 */
+static int16_t  last_setpoint;   /* 上一周期设定值, 检测调温/唤醒重置 */
+static int16_t  boost_target;    /* 抬升后的有效目标温度 */
+static bool     boost_enabled;   /* 该目标温度下曾真正到达过(锁存) */
+static uint32_t boost_cooldown;  /* 冷却倒计时剩余 ms, 0=允许触发 */
+static uint32_t boost_elapsed;   /* 本次 Boost 已持续 ms */
 
 /* 运行时目标温度 (RAM, 不落 flash): HOME 页临时调解的温度保存在此,
  * 整个运行期间持续生效, 休眠唤醒时恢复到该值而非默认值. 掉电丢失. */
-static int16_t  s_runtime_temp;
+static int16_t  runtime_temp;
 
 /* NTC 温度计算: 简化的 beta 方程 */
 #define NTC_BETA                 3950
 #define NTC_ROOM_TEMP            25      /* 室温 °C */
 
-/* 温度 ADC 一阶低通滤波系数 (定点): K = 128/256 ≈ 0.5, 替代原 ADC 内部 5 次均值
- * 截止频率约对 200ms PID 周期的几次噪声有滚降, 平滑但不拖累响应 */
-#define TEMP_FILT_K              128
+/* 温度 ADC 一阶低通滤波系数 (定点): K = 192/256 ≈ 0.75.
+ * 高频噪声已由 ADC 8 帧过采样抑制, 此低通仅保留中频平滑 → K 提高到 0.75,
+ * 90% 阶跃响应从约 3.3 个 PID 周期降到约 1.7 个, 相位延迟减半、更跟手. */
+#define TEMP_FILT_K              192
 
 /* ========== 硬件抽象开关 ==========
  *  HW_SIM_MODE = 1 : 模拟模式(无真实外设/手柄)。开发与 GUI 模拟时使用,
@@ -124,7 +129,11 @@ static struct {
     uint32_t     diag_tick;
     int16_t      diag_temp_last;
     bool         heater_fault;
-} s_work;
+
+    /* 锁存保护故障 (置位后持续断热, 直到 WorkTask_ClearFaults 手动清除) */
+    bool         thermo_fault;      /* 热电偶短路/断线 */
+    bool         overtemp_fault;    /* 过温 */
+} work;
 
 
 /* ========== 内部函数 ========== */
@@ -295,11 +304,9 @@ static void read_input_voltage(void)
 {
 #if HW_SIM_MODE
     /* 模拟: 假定电源已接入, 恒为 24.0V */
-    s_work.vin_adc = (uint16_t)(240 * 4095 / 363);
-    s_work.vin_voltage_x10 = 240;   /* 直接固定 24.0V, 避免二次取整误差 */
+    work.vin_voltage_x10 = 240;   /* 直接固定 24.0V, 避免二次取整误差 */
 #else
-    s_work.vin_adc = AD_GetVin();
-    s_work.vin_voltage_x10 = calc_vin_x10(s_work.vin_adc);
+    work.vin_voltage_x10 = calc_vin_x10(work.vin_adc);
 #endif
 }
 
@@ -308,27 +315,24 @@ static void read_ntc_handle(void)
 {
 #if HW_SIM_MODE
     /* 模拟: 假定已接入手柄, NTC 恒为室温 → 判定"已连接" */
-    s_work.ntc_adc           = 2047;
-    s_work.ntc_temp          = NTC_ROOM_TEMP;
-    s_work.handle_err_count  = 0;
-    s_work.handle_connected  = true;
+    work.handle_connected  = true;
+    work.ntc_temp          = NTC_ROOM_TEMP;
+    work.handle_err_count  = 0;
 #else
     uint16_t adc = AD_GetNTC();
-    s_work.ntc_adc = adc;
-    s_work.ntc_temp = calc_ntc_temp(adc);
+    work.ntc_temp = calc_ntc_temp(adc);
 
     /* 手柄连接检测: 直接对 NTC ADC 原始值做区间判定,
      * 短路(≈0)和开路/未插(≈4095)都在区间外 → 判为断开 */
     if (adc >= HANDLE_ADC_MIN && adc <= HANDLE_ADC_MAX)
     {
-        s_work.handle_err_count = 0;
-        s_work.handle_connected = true;
+        work.handle_connected = true;
+        work.handle_err_count = 0;
     }
     else
     {
-        s_work.handle_err_count++;
-        if (s_work.handle_err_count >= 8)
-            s_work.handle_connected = false;
+        if (++work.handle_err_count >= 8)
+            work.handle_connected = false;
     }
 #endif
 }
@@ -338,32 +342,32 @@ static void read_motion_sensor(void)
 {
 #if HW_SIM_MODE
     /* 模拟: 默认静止(不触发唤醒/复位休眠计时) */
-    s_work.motion_detected = false;
+    work.motion_detected = false;
 #else
     /* PA8 配置为输入, 低电平有效 (震动开关闭合时 = 0) */
-    s_work.motion_detected = (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET);
+    work.motion_detected = (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET);
 #endif
 }
 
 /* 检查休眠/关机计时 */
 static void check_sleep_shutdown(uint32_t now)
 {
-    if (s_work.state != WORK_STATE_ACTIVE)
+    if (work.state != WORK_STATE_ACTIVE)
         return;
 
     /* 检测到运动 → 重置计时 */
-    if (s_work.motion_detected)
+    if (work.motion_detected)
     {
-        s_work.last_activity = now;
+        work.last_activity = now;
         return;
     }
 
-    uint32_t elapsed_ms = now - s_work.last_activity;
+    uint32_t elapsed_ms = now - work.last_activity;
     uint32_t elapsed_sec = elapsed_ms / 1000;
 
     if (g_config.sleep_time > 0 && elapsed_sec >= (uint32_t)g_config.sleep_time * 60)
     {
-        s_work.state = WORK_STATE_SLEEP;
+        work.state = WORK_STATE_SLEEP;
         PID_Controller_SetSetpoint((int16_t)g_config.sleep_temp);
         PID_Controller_Reset();
         return;
@@ -371,7 +375,7 @@ static void check_sleep_shutdown(uint32_t now)
 
     if (g_config.shutdown_time > 0 && elapsed_sec >= (uint32_t)g_config.shutdown_time * 60)
     {
-        s_work.state = WORK_STATE_SHUTDOWN;
+        work.state = WORK_STATE_SHUTDOWN;
         Heater_Disable();
         return;
     }
@@ -380,45 +384,41 @@ static void check_sleep_shutdown(uint32_t now)
 /* 加热器故障检测 */
 static void check_heater_diagnostic(uint32_t now)
 {
-    if (s_work.power <= 0)
+    if (work.power <= 0)
         return;
 
     int16_t setpoint = PID_Controller_GetSetpoint();
-    int16_t diff = setpoint - s_work.measured_temp;
+    int16_t diff = setpoint - work.measured_temp;
     if (diff < 50)
     {
-        s_work.diag_tick = now;
-        s_work.diag_temp_last = s_work.measured_temp;
+        work.diag_temp_last = work.measured_temp;
         return;
     }
 
-    if ((now - s_work.diag_tick) < DIAG_CHECK_MS)
+    if ((now - work.diag_tick) < DIAG_CHECK_MS)
         return;
 
-    int16_t rise = s_work.measured_temp - s_work.diag_temp_last;
+    int16_t rise = work.measured_temp - work.diag_temp_last;
     if (rise < DIAG_TEMP_RISE_THRESHOLD)
     {
-        s_work.heater_fault = true;
+        work.heater_fault = true;
         Heater_Disable();
-        s_work.power = 0;
+        work.power = 0;
 
         if (g_config.buzzer_enable)
             Buzzer_Beep(BUZZER_EVENT_ALARM);
     }
 
-    s_work.diag_tick = now;
-    s_work.diag_temp_last = s_work.measured_temp;
+    work.diag_temp_last = work.measured_temp;
 }
 
 /* 清除 Boost 自动加温状态: 设定值变化/型号切换/手柄断开/异常结束后调用,
  * 防止残留抬升量跨状态叠加到有效设定值. */
 static void boost_reset(void)
 {
-    s_boost_target  = 0;
-    s_boost_enabled = false;
-    s_boost_cool    = 0;
-    s_boost_rt      = 0;
-    s_boost_timer   = 0;
+    boost_elapsed  = 0;       /* 本次持续计时清零 */
+    boost_enabled  = false;   /* 需重新"到达"才允许触发 */
+    boost_target   = 0;       /* 抬升目标归零, offset 由斜坡自然回落 */
 }
 
 /* 执行 PID 控制周期 */
@@ -433,9 +433,9 @@ static void run_pid_cycle(void)
       加热器故障检测都能正常工作 */
     {
         int16_t setpoint = PID_Controller_GetSetpoint();
-        int16_t sim      = s_work.measured_temp;
+        int16_t sim      = work.measured_temp;
 
-        if (s_work.handle_connected)
+        if (work.handle_connected)
         {
             if (sim < setpoint)
                 sim = (int16_t)(sim + SIM_HEAT_RATE);
@@ -448,17 +448,34 @@ static void run_pid_cycle(void)
     }
 #else
     uint16_t adc_val = AD_GetT12();
-    /* 一阶低通: 替代原 ADC 内部 5 次平均, 抑制单次置乱噪声 (k ≈ 0.5) */
-    s_work.temp_filt = s_work.temp_filt + ((((int32_t)adc_val - s_work.temp_filt) * TEMP_FILT_K) >> 8);
-    meas_temp = adc_to_temp((uint16_t)s_work.temp_filt);
-#endif
-    s_work.measured_temp = meas_temp;
 
-    /* 3. 过温保护 */
+    /* 热电偶失效检测: ADC 低于物理下限(短路/断线) → 锁存断热,
+     * 防止读数偏低被当低温、满功率加热烧烙铁. 开路(近满量程)与
+     * 450°C+ 在 ADC 域重叠, 由加热器故障诊断(功率>0 温升不足)兜底. */
+    if (adc_val < THERMO_ADC_MIN)
+    {
+        work.thermo_fault = true;
+        Heater_Disable();
+        work.power = 0;
+        if (g_config.buzzer_enable)
+            Buzzer_Beep(BUZZER_EVENT_ALARM);
+        return;
+    }
+
+    /* 一阶低通: 替代原 ADC 内部 5 次平均, 抑制单次置乱噪声 (k ≈ 0.75) */
+    work.temp_filt = work.temp_filt + ((((int32_t)adc_val - work.temp_filt) * TEMP_FILT_K) >> 8);
+    meas_temp = adc_to_temp((uint16_t)work.temp_filt);
+#endif
+    work.measured_temp = meas_temp;
+
+    /* 3. 过温保护 (锁存: 直到手动清除才恢复, 防读数抖动在阈值附近反复开断) */
     if (meas_temp > OVER_TEMP_LIMIT)
     {
+        work.overtemp_fault = true;
         Heater_Disable();
-        s_work.power = 0;
+        work.power = 0;
+        if (g_config.buzzer_enable)
+            Buzzer_Beep(BUZZER_EVENT_ALARM);
         return;
     }
 
@@ -469,7 +486,7 @@ static void run_pid_cycle(void)
     if (AD_GetCurrent() > OVERCURRENT_LIMIT)
     {
         Heater_Disable();
-        s_work.power = 0;
+        work.power = 0;
         return;
     }
 #endif
@@ -488,49 +505,54 @@ static void run_pid_cycle(void)
 
         /* 0. 设定值变化(用户调温/休眠/唤醒) → 必须重新"到达"才允许 Boost,
          *    清除残留抬升(需要时由下方斜坡自然回落到 0) */
-        if (setpoint != s_last_setpoint)
+        if (setpoint != last_setpoint)
         {
-            s_last_setpoint = setpoint;
-            s_boost_enabled = false;
-            s_boost_target  = 0;
-            s_boost_rt      = 0;
+            boost_elapsed  = 0;
+            boost_enabled  = false;
+            boost_target   = 0;
         }
 
-        /* 冷却倒计时递减 */
-        if (s_boost_cool > 0)
+        /* 冷却倒计时递减; 冷却结束后累计 Boost 时长(触发前=持续低温计时, 触发后=加温计时) */
+        if (boost_cooldown > 0)
         {
-            if (s_boost_cool > PID_INTERVAL_MS)
-                s_boost_cool = s_boost_cool - PID_INTERVAL_MS;
+            if (boost_cooldown >= PID_INTERVAL_MS)
+                boost_cooldown -= PID_INTERVAL_MS;
             else
-                s_boost_cool = 0;
+                boost_cooldown = 0;
+        }
+        else
+        {
+            boost_elapsed += PID_INTERVAL_MS;
         }
 
-        if (s_boost_target > 0)
+        if (boost_target > 0)
         {
-            /* 加温中: 融化完成/温度回升到设定值附近 → 目标归零(下方斜坡回落) */
-            if (diff <= BOOST_RECOVER_HYS)
+            /* 加温中: 用有效设定值(含抬升)判断恢复 —— 温度追到抬升目标附近
+             * 才算真正恢复, 避免大焊点尚未融化、温度只回到基础设定值就提前回落.
+             * 恢复后目标归零, 下方斜坡平滑回落抬升量. */
+            int16_t eff_set = PID_Controller_GetEffectiveSetpoint();
+            int16_t diff_eff = (int16_t)(eff_set - meas_temp);
+            if (diff_eff <= BOOST_RECOVER_HYS)
             {
-                s_boost_target = 0;
+                boost_target = 0;
             }
             else
             {
                 /* 时长限制: 长时间仍回不了温 → 判定为异常(非焊点), 强制结束进冷却 */
-                s_boost_rt += PID_INTERVAL_MS;
-                if (s_boost_rt >= BOOST_MAX_MS)
+                if (boost_elapsed >= BOOST_MAX_MS)
                 {
-                    s_boost_target  = 0;
-                    s_boost_rt      = 0;
-                    s_boost_enabled = false;
-                    s_boost_cool    = BOOST_COOLDOWN_MS;
+                    boost_target   = 0;
+                    boost_enabled  = false;
+                    boost_cooldown = BOOST_COOLDOWN_MS;
                 }
             }
         }
 
         /* 需要升降斜坡 (正在抬升或 offset 未归零): 向目标抬升量逼近,
          * 恢复/超时后目标为 0 → 自然沿斜坡回落, 避免 offset 残留 */
-        if (s_boost_target > 0 || cur_off > 0)
+        if (boost_target > 0 || cur_off > 0)
         {
-            int16_t rise_target = (int16_t)(s_boost_target - setpoint);
+            int16_t rise_target = (int16_t)(boost_target - setpoint);
             int16_t delta;
 
             if (rise_target < 0) rise_target = 0;
@@ -538,34 +560,33 @@ static void run_pid_cycle(void)
             if (delta >  BOOST_RAMP_RATE) delta =  BOOST_RAMP_RATE;
             else if (delta < -BOOST_RAMP_RATE) delta = -BOOST_RAMP_RATE;
             PID_Controller_SetBoostOffset((int16_t)(cur_off + delta));
-            s_boost_timer = 0;
         }
-        else if (s_boost_enabled && diff >= BOOST_SAG_THRESHOLD
-                 && s_work.state == WORK_STATE_ACTIVE
-                 && !s_work.heater_fault
-                 && Heater_IsEnabled()
-                 && s_work.vin_voltage_x10 >= (uint16_t)BOOST_VIN_MIN_x10
-                 && s_boost_cool == 0)
+
+        /* 触发前提(防误判): 曾到达过 && 工作态 && 加热器正常 && 供电充足 && 冷却结束 */
+        if (boost_enabled
+            && work.vin_voltage_x10 >= BOOST_VIN_MIN_x10
+            && !work.heater_fault
+            && work.state == WORK_STATE_ACTIVE
+            && Heater_IsEnabled()
+            && boost_cooldown == 0)
         {
-            s_boost_timer += PID_INTERVAL_MS;
-            if (s_boost_timer >= BOOST_SAG_MS)
+            if (boost_elapsed >= BOOST_SAG_MS)
             {
-                s_boost_target = setpoint + BOOST_RISE_DEG;
-                if (s_boost_target > (int16_t)Config_GetBoostMax())
-                    s_boost_target = (int16_t)Config_GetBoostMax();
-                s_boost_timer = 0;
-                s_boost_rt    = 0;
+                boost_elapsed = 0;
+                boost_target  = (int16_t)(setpoint + BOOST_RISE_DEG);
+                if (boost_target > (int16_t)Config_GetBoostMax())
+                    boost_target = (int16_t)Config_GetBoostMax();
             }
         }
         else
         {
-            s_boost_timer = 0;
+            boost_elapsed = 0;
         }
     }
 
     /* 5. 执行分段 PID 计算 */
     power = PID_Controller_Compute();
-    s_work.power = power;
+    work.power = power;
 
     /* 6. 设置加热器功率 */
     Heater_SetPower(power);
@@ -577,18 +598,17 @@ static void run_pid_cycle(void)
         if (diff < 0)
             diff = (int16_t)(-diff);
 
-        s_work.temp_reached = (diff <= TEMP_REACHED_THRESHOLD);
+        work.temp_reached = (diff <= TEMP_REACHED_THRESHOLD);
 
         /* 曾真正到达过 → 允许本目标温度下后续触发 Boost */
-        if (s_work.temp_reached)
-            s_boost_enabled = true;
+        boost_enabled = true;
 
-        if (s_work.temp_reached && !s_work.temp_reached_prev)
+        if (work.temp_reached && !work.temp_reached_prev)
         {
             if (g_config.buzzer_enable)
                 Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
         }
-        s_work.temp_reached_prev = s_work.temp_reached;
+        work.temp_reached_prev = work.temp_reached;
     }
 
     /* 8. 加热器故障检测 */
@@ -608,38 +628,37 @@ void WorkTask_Init(void)
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &gpio);
 
-    s_work.state = WORK_STATE_ACTIVE;
-    s_work.last_activity = Timer_GetTick();
-    s_work.last_pid_tick = Timer_GetTick();
-    s_work.measured_temp = NTC_ROOM_TEMP;
-    s_work.power = 0;
-    s_work.temp_reached = false;
-    s_work.temp_reached_prev = false;
-    s_work.vin_adc = 0;
-    s_work.vin_voltage_x10 = 0;
-    s_work.ntc_adc = 0;
-    s_work.ntc_temp = NTC_ROOM_TEMP;
-    s_work.temp_filt = (int32_t)AD_GetT12();   /* 首次滤波以当前读数初始化, 避免从 0 爬升 */
-    s_work.handle_connected = true;
-    s_work.handle_err_count = 0;
-    s_work.motion_detected = false;
-    s_work.heater_fault = false;
-    s_work.diag_tick = Timer_GetTick();
-    s_work.diag_temp_last = NTC_ROOM_TEMP;
+    work.diag_temp_last = NTC_ROOM_TEMP;
+    work.last_activity = Timer_GetTick();
+    work.last_pid_tick = Timer_GetTick();
+    work.measured_temp = NTC_ROOM_TEMP;
+    work.power = 0;
+    work.temp_reached = false;
+    work.temp_reached_prev = false;
+    work.vin_adc = 0;
+    work.vin_voltage_x10 = 0;
+    work.ntc_adc = 0;
+    work.ntc_temp = NTC_ROOM_TEMP;
+    work.temp_filt = (int32_t)AD_GetT12();   /* 首次滤波以当前读数初始化, 避免从 0 爬升 */
+    work.handle_connected = true;
+    work.handle_err_count = 0;
+    work.motion_detected = false;
+    work.diag_temp_last = work.measured_temp;
+    work.thermo_fault  = false;
+    work.overtemp_fault = false;
+    work.diag_tick = Timer_GetTick();
 
     PID_Controller_SetSetpoint((int16_t)g_config.default_temp);
     PID_Controller_Reset();
 
     /* Boost 状态初值 */
-    s_boost_timer      = 0;
-    s_boost_target     = 0;
-    s_boost_enabled    = false;
-    s_boost_cool       = 0;
-    s_boost_rt         = 0;
-    s_last_setpoint    = (int16_t)g_config.default_temp;
+    boost_elapsed  = 0;
+    boost_enabled  = false;
+    boost_cooldown = 0;
+    boost_target   = 0;
 
     /* 运行时目标温度初值 = 默认温度 (RAM, 掉电丢失) */
-    s_runtime_temp     = (int16_t)g_config.default_temp;
+    runtime_temp = (int16_t)g_config.default_temp;
 }
 
 void WorkTask_Process(void)
@@ -647,11 +666,11 @@ void WorkTask_Process(void)
     uint32_t now = Timer_GetTick();
 
     /* 1. 读取输入电压 (每 200ms) */
-    if ((now - s_work.last_pid_tick) >= PID_INTERVAL_MS)
+    if ((now - work.last_pid_tick) >= PID_INTERVAL_MS)
         read_input_voltage();
 
     /* 2. 读取 NTC 手柄检测 (每 200ms) */
-    if ((now - s_work.last_pid_tick) >= PID_INTERVAL_MS)
+    if ((now - work.last_pid_tick) >= PID_INTERVAL_MS)
         read_ntc_handle();
 
     /* 3. 读取运动检测 */
@@ -661,23 +680,31 @@ void WorkTask_Process(void)
     check_sleep_shutdown(now);
 
     /* 5. PID 控制周期 */
-    if ((now - s_work.last_pid_tick) >= PID_INTERVAL_MS)
+    if ((now - work.last_pid_tick) >= PID_INTERVAL_MS)
     {
-        s_work.last_pid_tick = now;
+        work.last_pid_tick = now;
 
-        if (s_work.state == WORK_STATE_SHUTDOWN)
+        if (work.state == WORK_STATE_SHUTDOWN)
         {
             Heater_Disable();
-            s_work.power = 0;
+            work.power = 0;
+            return;
+        }
+
+        /* 锁存保护故障(过温/热电偶失效): 持续断热, 直到手动清除 */
+        if (work.thermo_fault || work.overtemp_fault)
+        {
+            Heater_Disable();
+            work.power = 0;
             return;
         }
 
         /* 手柄未连接时关加热, 并复位 PID/清除 Boost, 防止重连后从断开前的
          * 积分与陈旧微分续跑, 产生瞬时功率跳变 */
-        if (!s_work.handle_connected)
+        if (!work.handle_connected)
         {
             Heater_Disable();
-            s_work.power = 0;
+            work.power = 0;
             PID_Controller_Reset();
             boost_reset();
             return;
@@ -689,13 +716,13 @@ void WorkTask_Process(void)
 
 void WorkTask_MarkActivity(void)
 {
-    s_work.last_activity = Timer_GetTick();
+    work.last_activity = Timer_GetTick();
 
-    if (s_work.state != WORK_STATE_ACTIVE)
+    if (work.state != WORK_STATE_ACTIVE)
     {
-        s_work.state = WORK_STATE_ACTIVE;
+        work.diag_temp_last = NTC_ROOM_TEMP;
         /* 唤醒恢复运行时目标温度(HOME 临时调解值), 而非默认值 */
-        PID_Controller_SetSetpoint(s_runtime_temp);
+        PID_Controller_SetSetpoint(runtime_temp);
         PID_Controller_Reset();
         Heater_Enable();
     }
@@ -706,12 +733,12 @@ void WorkTask_SetRuntimeTemp(int16_t temp)
 {
     if (temp > (int16_t)Config_GetTempMax()) temp = (int16_t)Config_GetTempMax();
     if (temp < TEMP_MIN)                     temp = TEMP_MIN;
-    s_runtime_temp = temp;
+    runtime_temp = temp;
 }
 
 int16_t WorkTask_GetRuntimeTemp(void)
 {
-    return s_runtime_temp;
+    return runtime_temp;
 }
 
 /* 手柄型号切换后的安全闭环: 调用方须已更新 g_config.handle_type 并 Config_Save().
@@ -725,17 +752,17 @@ void WorkTask_OnHandleChanged(void)
     /* 先重载 PID(内部 Reset), 再用新型号上限钳位目标并复位 */
     PID_Controller_Reload();
 
-    if (s_runtime_temp > (int16_t)Config_GetTempMax())
-        s_runtime_temp = (int16_t)Config_GetTempMax();
-    if (s_runtime_temp < TEMP_MIN)
-        s_runtime_temp = TEMP_MIN;
+    if (runtime_temp > (int16_t)Config_GetTempMax())
+        runtime_temp = (int16_t)Config_GetTempMax();
+    if (runtime_temp < TEMP_MIN)
+        runtime_temp = TEMP_MIN;
 
-    PID_Controller_SetSetpoint(s_runtime_temp);
+    PID_Controller_SetSetpoint(runtime_temp);
     PID_Controller_Reset();
 
     /* Boost 状态清空, 防止跨型号残留抬升 */
     boost_reset();
-    s_last_setpoint = s_runtime_temp;
+    last_setpoint = runtime_temp;
 
     /* 新型号校准点非法(会退化线性映射, 读温偏差大)时蜂鸣警示, 提示需重新校准 */
     if (!Config_IsHandleCalValid(Config_GetHandleIdx()))
@@ -744,66 +771,81 @@ void WorkTask_OnHandleChanged(void)
 
 work_state_t WorkTask_GetState(void)
 {
-    return s_work.state;
+    return work.state;
 }
 
 bool WorkTask_IsTempReached(void)
 {
-    return s_work.temp_reached;
+    return work.temp_reached;
 }
 
 bool WorkTask_IsBoostActive(void)
 {
     /* 正在抬升有效设定值 或 抬升量尚未回落到 0(回落过程), 均视为 Boost 生效 */
-    return (s_boost_target > 0) || (PID_Controller_GetBoostOffset() > 0);
+    return (boost_target > 0) || (PID_Controller_GetBoostOffset() > 0);
 }
 
 int16_t WorkTask_GetMeasuredTemp(void)
 {
-    return s_work.measured_temp;
+    return work.measured_temp;
 }
 
 int16_t WorkTask_GetPower(void)
 {
-    return s_work.power;
+    return work.power;
 }
 
 uint8_t WorkTask_GetPowerPercent(void)
 {
-    uint32_t p = (uint32_t)s_work.power * 100 / HEATER_POWER_MAX;
+    uint32_t p = (uint32_t)work.power * 100 / HEATER_POWER_MAX;
     return (uint8_t)p;
 }
 
 bool WorkTask_IsHeaterFault(void)
 {
-    return s_work.heater_fault;
+    return work.heater_fault;
 }
 
 void WorkTask_ClearHeaterFault(void)
 {
-    s_work.heater_fault = false;
-    s_work.diag_tick = Timer_GetTick();
-    s_work.diag_temp_last = s_work.measured_temp;
+    work.diag_temp_last = work.measured_temp;
+    work.diag_tick = Timer_GetTick();
+}
+
+/* 任一锁存保护故障(过温/热电偶失效)是否处于锁定态 */
+bool WorkTask_HasFault(void)
+{
+    return work.heater_fault || work.thermo_fault || work.overtemp_fault;
+}
+
+/* 清除全部锁存故障, 允许重新加热 */
+void WorkTask_ClearFaults(void)
+{
+    work.heater_fault   = false;
+    work.thermo_fault   = false;
+    work.overtemp_fault = false;
+    work.diag_tick = Timer_GetTick();
+    work.diag_temp_last = work.measured_temp;
 }
 
 /* ========== 新增接口 ========== */
 
 uint16_t WorkTask_GetVinX10(void)
 {
-    return s_work.vin_voltage_x10;
+    return work.vin_voltage_x10;
 }
 
 int16_t WorkTask_GetNtcTemp(void)
 {
-    return s_work.ntc_temp;
+    return work.ntc_temp;
 }
 
 bool WorkTask_IsHandleConnected(void)
 {
-    return s_work.handle_connected;
+    return work.handle_connected;
 }
 
 bool WorkTask_IsMotionDetected(void)
 {
-    return s_work.motion_detected;
+    return work.motion_detected;
 }

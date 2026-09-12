@@ -1,4 +1,4 @@
-﻿#include "stm32f10x.h"
+#include "stm32f10x.h"
 #include "timer.h"
 #include "oled.h"
 #include "menu.h"
@@ -18,7 +18,7 @@
  * 本项目标准库未含 IWDG 驱动, 直接寄存器操作 (stm32f10x.h 已定义 IWDG 结构体).
  *   LSI ≈ 40kHz, 64 分频 → 625Hz; RLR=1875 → 1875/625 ≈ 3.0s. */
 #define WDG_PRESCALER_PR   0x04UL          /* IWDG_PR: 64 分频 */
-#define WDG_RELOAD          1875UL          /* ~3s 超时 */
+#define WDG_RELOAD          1250UL          /* ~2s 超时 */
 
 static void Watchdog_Init(void)
 {

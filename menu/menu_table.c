@@ -78,6 +78,7 @@ const menu_item_t menu_table[] =
         .parent      = 1,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
+        .flags       = MENU_FLAG_PASSIVE_VIEW,   /* 只读页: CLICK/LPRESS 一律退出, 无需 handler */
         .ops         = &ota_wait_ops,
         .name        = "固件升级",
     },
@@ -136,6 +137,7 @@ const menu_item_t menu_table[] =
         .parent      = 7,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
+        .flags       = MENU_FLAG_PASSIVE_VIEW,   /* 只读信息页: 任意事件即退 */
         .ops         = &version_ops,
         .name        = "版本信息",
     },
@@ -146,7 +148,7 @@ const menu_item_t menu_table[] =
         .parent      = 3,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
-        .ops         = &pid_agg_ops,
+        .ops         = &pid_agg_ops,       /* 激进参数页: enter/exit 薄闭包绑定静态实例 */
         .name        = "Fast PID",
     },
 
@@ -154,7 +156,7 @@ const menu_item_t menu_table[] =
         .parent      = 3,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
-        .ops         = &pid_cons_ops,
+        .ops         = &pid_cons_ops,      /* 保守参数页 */
         .name        = "Slow PID",
     },
 };

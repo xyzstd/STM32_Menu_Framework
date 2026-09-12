@@ -17,7 +17,9 @@
  *   - 输出钳位到 0 ~ PID_OUTPUT_MAX
  */
 
-/* 不完全微分低通系数 α: 192/256 ≈ 0.75 (α 越大 D 越平滑, 响应越慢) */
+/* 不完全微分低通系数 k: 192/256 ≈ 0.75 = 新值权重,
+ * 即 d_filter = (1-k)*旧 + k*新。k 越小 D 越平滑(响应越慢),
+ * k 越大越接近原始微分(测量噪声放大越明显)。 */
 #define PID_D_FILTER  192
 
 static struct {
@@ -42,7 +44,7 @@ static struct {
     bool     d_first;       /* 首次计算标志, 跳过首帧微分 */
 
     int16_t output;         /* 上次输出值 */
-} s_pid;
+} pid;
 
 void PID_Controller_Init(void)
 {
@@ -55,56 +57,60 @@ void PID_Controller_Reload(void)
 {
     uint8_t h = Config_GetHandleIdx();
 
-    s_pid.agg_kp  = g_config.pid_agg_kp[h];
-    s_pid.agg_ki  = g_config.pid_agg_ki[h];
-    s_pid.agg_kd  = g_config.pid_agg_kd[h];
-    s_pid.cons_kp = g_config.pid_cons_kp[h];
-    s_pid.cons_ki = g_config.pid_cons_ki[h];
-    s_pid.cons_kd = g_config.pid_cons_kd[h];
+    pid.agg_kp  = g_config.pid_agg_kp[h];
+    pid.agg_ki  = g_config.pid_agg_ki[h];
+    pid.agg_kd  = g_config.pid_agg_kd[h];
+    pid.cons_kp = g_config.pid_cons_kp[h];
+    pid.cons_ki = g_config.pid_cons_ki[h];
+    pid.cons_kd = g_config.pid_cons_kd[h];
     PID_Controller_Reset();
 }
 
 void PID_Controller_Reset(void)
 {
-    s_pid.boost_offset = 0;
-    s_pid.integral = 0;
-    s_pid.d_filter = 0;
-    s_pid.last_measured = 0;
-    s_pid.d_first = true;   /* 下次计算跳过首帧微分, 避免冷启动冲击 */
-    s_pid.output = 0;
+    pid.output = 0;
+    pid.integral = 0;
+    pid.d_filter = 0;
+    pid.last_measured = 0;
+    pid.d_first = true;   /* 下次计算跳过首帧微分, 避免冷启动冲击 */
 }
 
 void PID_Controller_SetSetpoint(int16_t setpoint)
 {
     /* 用户手动设定目标时清除自动加温抬升, 避免异常叠加 */
-    s_pid.boost_offset = 0;
+    pid.boost_offset = 0;
     /* 统一钳位到合法温度范围, 纵深防御: 即便某调用方漏钳/配置异常,
      * 也不会设出越界目标导致持续过热. 上限按当前型号运行时取值. */
     if (setpoint > (int16_t)Config_GetTempMax())
         setpoint = (int16_t)Config_GetTempMax();
     else if (setpoint < TEMP_MIN)
         setpoint = TEMP_MIN;
-    s_pid.setpoint = setpoint;
+    pid.setpoint = setpoint;
 }
 
 int16_t PID_Controller_GetSetpoint(void)
 {
-    return s_pid.setpoint;
+    return pid.setpoint;
 }
 
 void PID_Controller_SetMeasured(int16_t measured)
 {
-    s_pid.measured = measured;
+    pid.measured = measured;
 }
 
 int16_t PID_Controller_GetMeasured(void)
 {
-    return s_pid.measured;
+    return pid.measured;
 }
 
 int16_t PID_Controller_GetEffectiveSetpoint(void)
 {
-    return (int16_t)(s_pid.setpoint + s_pid.boost_offset);
+    /* 对外一致口径: 同样按 Boost 上限钳位, 与 Compute() 内部判据一致,
+     * 避免外部读到的有效设定值越出合法上限(如 T12 直读 460°C) */
+    int16_t eff = (int16_t)(pid.setpoint + pid.boost_offset);
+    if (eff > (int16_t)Config_GetBoostMax())
+        eff = (int16_t)Config_GetBoostMax();
+    return eff;
 }
 
 int16_t PID_Controller_Compute(void)
@@ -118,78 +124,82 @@ int16_t PID_Controller_Compute(void)
      * 注意: 钳位用 Boost 上限而非 temp_max, 否则用户设到接近 temp_max 时
      * Boost 抬升会被压死、T12(400/+450)在大焊点下无法继续抬温. */
     {
-        int16_t eff_set = (int16_t)(s_pid.setpoint + s_pid.boost_offset);
+        int16_t eff_set = (int16_t)(pid.setpoint + pid.boost_offset);
         if (eff_set > (int16_t)Config_GetBoostMax()) eff_set = (int16_t)Config_GetBoostMax();
-        error = (int16_t)(eff_set - s_pid.measured);
+        error = (int16_t)(eff_set - pid.measured);
     }
 
     /* 分段控制 */
     if (error > 50)
     {
         /* 温差 > 50°C: 全速加热 */
-        s_pid.output = PID_OUTPUT_MAX;
-        s_pid.integral = 0;         /* 全速时清零积分 */
-        /* 持续记录实测温度, 使切回 PID 时微分先行项保持连续,
-         * 避免输出瞬间跌落 */
-        s_pid.last_measured = s_pid.measured;
-        s_pid.d_first = false;
-        return s_pid.output;
+        pid.integral = 0;                       /* 全速时清零积分 */
+        pid.last_measured = pid.measured;       /* 持续记录实测温度, 使切回 PID 时微分先行项保持连续, 避免输出瞬间跌落 */
+        pid.output = PID_OUTPUT_MAX;            /* 同步"上次输出", 使 GetOutput() 在全速段也不失真 */
+        return PID_OUTPUT_MAX;
     }
 
     /* 选择 PID 参数集 */
     if (error > 30)
     {
         /* 30°C < 温差 ≤ 50°C: 激进 PID */
-        cur_kp = s_pid.agg_kp;
-        cur_ki = s_pid.agg_ki;
-        cur_kd = s_pid.agg_kd;
+        cur_kp = pid.agg_kp;
+        cur_ki = pid.agg_ki;
+        cur_kd = pid.agg_kd;
     }
     else
     {
         /* 温差 ≤ 30°C: 保守 PID */
-        cur_kp = s_pid.cons_kp;
-        cur_ki = s_pid.cons_ki;
-        cur_kd = s_pid.cons_kd;
+        cur_kp = pid.cons_kp;
+        cur_ki = pid.cons_ki;
+        cur_kd = pid.cons_kd;
     }
 
     /* 比例项: P = Kp * error / 100 */
     p_term = (int32_t)cur_kp * error / PID_SCALE;
 
     /* 积分项: I += Ki * error / 100
-     * 积分分离: |error| > 30°C (激进/全速区) 时停止积分,
-     * 避免积分在温差大时快速饱和, 抑制切换回保守 PID 时的超调;
-     * 积分抗饱和: 积分值限制在 PID 输出满量程 30% 范围内 (内置固定限幅). */
+     * 积分分离 + 抗饱和:
+     *   - 全速区(ΔT>50°C): 上方已清零积分, 不累计;
+     *   - 激进区(30<ΔT≤50°C): 累计积分(使 agg_ki 生效), 限幅收紧到 15%
+     *     满量程, 大误差下不致饱和;
+     *   - 过冲侧(ΔT<-30°C): 同样累计(用当前组 Ki)并收紧限幅, 加快回落;
+     *   - 保守区(ΔT≤30°C): 正常累计, 限幅 30% 满量程. */
     if (error > 30 || error < -30)
     {
-        /* 误差过大时不累计积分 */
+        pid.integral += (int32_t)cur_ki * error / PID_SCALE;
+        if (pid.integral > PID_INTEGRAL_LIMIT_AGG)
+            pid.integral = PID_INTEGRAL_LIMIT_AGG;
+        else if (pid.integral < -PID_INTEGRAL_LIMIT_AGG)
+            pid.integral = -PID_INTEGRAL_LIMIT_AGG;
     }
     else
     {
-        s_pid.integral += (int32_t)cur_ki * error / PID_SCALE;
-        if (s_pid.integral > PID_INTEGRAL_LIMIT)
-            s_pid.integral = PID_INTEGRAL_LIMIT;
-        else if (s_pid.integral < -PID_INTEGRAL_LIMIT)
-            s_pid.integral = -PID_INTEGRAL_LIMIT;
+        pid.integral += (int32_t)cur_ki * error / PID_SCALE;
+        if (pid.integral > PID_INTEGRAL_LIMIT)
+            pid.integral = PID_INTEGRAL_LIMIT;
+        else if (pid.integral < -PID_INTEGRAL_LIMIT)
+            pid.integral = -PID_INTEGRAL_LIMIT;
     }
-    i_term = s_pid.integral;
+    i_term = pid.integral;
 
     /* 微分项: 微分先行 + 不完全微分
      * 微分先行: 对实测温度微分 (D = Kd*(last_meas - meas)/100),
      * 设定值突变(调温/休眠唤醒)不进入微分, 消除微分冲击;
      * 不完全微分: 一阶低通滤波, 抑制测量噪声放大 */
-    if (s_pid.d_first)
+    if (pid.d_first)
     {
         /* 首帧仅记录温度, 不产生微分 */
-        s_pid.d_first = false;
-        s_pid.d_filter = 0;
+        pid.d_first = false;
+        pid.d_filter = 0;
     }
     else
     {
-        int32_t d_new = (int32_t)cur_kd * (s_pid.last_measured - s_pid.measured) / PID_SCALE;
-        s_pid.d_filter += (d_new - s_pid.d_filter) * PID_D_FILTER / 256;
+        int32_t d_new = (int32_t)(pid.last_measured - pid.measured) * cur_kd / PID_SCALE;
+        pid.d_filter += (d_new - pid.d_filter) * PID_D_FILTER / 256;
     }
-    s_pid.last_measured = s_pid.measured;
-    d_term = s_pid.d_filter;
+    pid.last_measured = pid.measured;   /* 持续记录, 供下一帧微分 */
+    d_term = pid.d_filter;
 
     /* 合成输出 */
     output = p_term + i_term + d_term;
@@ -200,52 +210,52 @@ int16_t PID_Controller_Compute(void)
     else if (output < 0)
         output = 0;
 
-    s_pid.output = (int16_t)output;
-    return s_pid.output;
+    pid.output = (int16_t)output;
+    return (int16_t)output;
 }
 
 void PID_Controller_SetAggKp(int16_t kp)
 {
-    s_pid.agg_kp = kp;
+    pid.agg_kp = kp;
 }
 
 void PID_Controller_SetAggKi(int16_t ki)
 {
-    s_pid.agg_ki = ki;
+    pid.agg_ki = ki;
 }
 
 void PID_Controller_SetAggKd(int16_t kd)
 {
-    s_pid.agg_kd = kd;
+    pid.agg_kd = kd;
 }
 
 void PID_Controller_SetConsKp(int16_t kp)
 {
-    s_pid.cons_kp = kp;
+    pid.cons_kp = kp;
 }
 
 void PID_Controller_SetConsKi(int16_t ki)
 {
-    s_pid.cons_ki = ki;
+    pid.cons_ki = ki;
 }
 
 void PID_Controller_SetConsKd(int16_t kd)
 {
-    s_pid.cons_kd = kd;
+    pid.cons_kd = kd;
 }
 
 void PID_Controller_SetBoostOffset(int16_t offset)
 {
     if (offset < 0) offset = 0;
-    s_pid.boost_offset = offset;
+    pid.boost_offset = offset;
 }
 
 int16_t PID_Controller_GetBoostOffset(void)
 {
-    return s_pid.boost_offset;
+    return pid.boost_offset;
 }
 
 int16_t PID_Controller_GetOutput(void)
 {
-    return s_pid.output;
+    return pid.output;
 }

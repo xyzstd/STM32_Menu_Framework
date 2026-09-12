@@ -6,8 +6,11 @@
 /* PID 输出范围: 0 ~ PID_OUTPUT_MAX (对应 0% ~ 100% 加热功率) */
 #define PID_OUTPUT_MAX  1000
 
-/* 积分限幅 (内置固定值, 不提供页面调节): PID 输出满量程的 30% */
-#define PID_INTEGRAL_LIMIT  ((PID_OUTPUT_MAX * 30) / 100)
+/* 积分限幅 (内置固定值, 不提供页面调节):
+ *   保守区(ΔT≤30°C): PID 输出满量程的 30%
+ *   激进区(30<ΔT≤50°C): 收紧到 15%, 让 agg_ki 生效又不致大误差饱和 */
+#define PID_INTEGRAL_LIMIT      ((PID_OUTPUT_MAX * 30) / 100)
+#define PID_INTEGRAL_LIMIT_AGG  ((PID_OUTPUT_MAX * 15) / 100)
 
 /* PID 参数存储格式: 实际值 = 存储值 / 100 */
 #define PID_SCALE       100
@@ -36,7 +39,8 @@ int16_t PID_Controller_GetMeasured(void);
  * - ΔT > 50°C: 全速加热
  * - 30°C < ΔT ≤ 50°C: 激进 PID
  * - ΔT ≤ 30°C: 保守 PID
- * - 积分: 分离 + 内置 30% 限幅; 微分: 先行 + 不完全微分低通
+ * - 积分: 全速区清零, 激进区累计(限幅 15%), 保守区限幅 30%;
+ *          微分: 先行 + 不完全微分低通
  */
 int16_t PID_Controller_Compute(void);
 

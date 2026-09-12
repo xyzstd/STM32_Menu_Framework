@@ -1,13 +1,13 @@
-﻿#include "stm32f10x.h"                  // Device header
+#include "stm32f10x.h"                  // Device header
 
 /*
  * ADC 采集: 双触发 — 规则组(自由采样) + 注入组(导通采, 电流)
  *
  *  规则组 (规则组外部触发 = None, 软件连续转换, 自由采样):
  *     CH0(PA0,T12热电偶), CH1(PA1,电流/关断), CH2(PA2,输入电压), CH6(PA6,NTC)
- *     → 连续扫描 + 循环 DMA → s_adc_buf, 采样噪声由 work_task 一阶低通 temp_filt 抑制
+ *     → 连续扫描 + 循环 DMA → adc_buf, 采样噪声由 work_task 一阶低通 temp_filt 抑制
  *  注入组 (注入组外部触发 = TIM1 CC4, 导通段中点, 有过流电流):
- *     电流采样电阻(运放B输出) ADC 通道 → JEOC 中断读 JDR1 → s_adc_cur
+ *     电流采样电阻(运放B输出) ADC 通道 → JEOC 中断读 JDR1 → adc_cur
  *
  *  规则组连续转换, 自由采样的 4 通道 DMA 缓存 (不锁 CC3 相位, 兼容 T12/T245);
  *  注入组被 CC4(导通)触发, 单通道电流采样, 中断取回。
@@ -39,11 +39,11 @@ typedef struct
 #define CUR_GPIOX           GPIOA
 
 /* 缓存: DMA 每次完成一轮(N 帧)后环形填充, 每帧按通道表顺序填入 */
-static volatile uint16_t s_adc_buf[ADC_CHANNEL_COUNT * TEMP_OVERSAMPLE];
+static volatile uint16_t adc_buf[ADC_CHANNEL_COUNT * TEMP_OVERSAMPLE];
 /* 注入组(电流)最新采样值, 由 ADC1_2_IRQHandler 更新 (导通电流) */
-static volatile uint16_t s_adc_cur;
+static volatile uint16_t adc_cur;
 
-static const adc_chan_cfg_t s_chans[ADC_CHANNEL_COUNT] =
+static const adc_chan_cfg_t chan_cfgs[ADC_CHANNEL_COUNT] =
 {
     { 0, ADC_Channel_0, GPIO_Pin_0, 0 }, /* 热电偶 T12 */
     { 1, ADC_Channel_1, GPIO_Pin_1, 1 }, /* 电流(关断)  */
@@ -68,7 +68,7 @@ void AD_Init(void)
         GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
         GPIO_InitStruct.GPIO_Pin = 0;
         for (i = 0; i < ADC_CHANNEL_COUNT; i++)
-            GPIO_InitStruct.GPIO_Pin |= s_chans[i].gpio_pin;
+            GPIO_InitStruct.GPIO_Pin |= chan_cfgs[i].gpio_pin;
         GPIO_Init(GPIOA, &GPIO_InitStruct);
 
         /* 电流采样引脚 (注入组, 运放B输出) */
@@ -81,7 +81,7 @@ void AD_Init(void)
         DMA_InitTypeDef DMA_InitStruct;
         DMA_DeInit(DMA1_Channel1);
         DMA_InitStruct.DMA_PeripheralBaseAddr = (uint32_t)&ADC1->DR;
-        DMA_InitStruct.DMA_MemoryBaseAddr     = (uint32_t)s_adc_buf;
+        DMA_InitStruct.DMA_MemoryBaseAddr     = (uint32_t)adc_buf;
         DMA_InitStruct.DMA_DIR                = DMA_DIR_PeripheralSRC;
         DMA_InitStruct.DMA_BufferSize         = ADC_CHANNEL_COUNT * TEMP_OVERSAMPLE;
         DMA_InitStruct.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
@@ -108,7 +108,7 @@ void AD_Init(void)
 
         /* 5. 各通道采样时间 + 在扫描顺序中的位置 */
         for (i = 0; i < ADC_CHANNEL_COUNT; i++)
-            ADC_RegularChannelConfig(ADC1, s_chans[i].adc_ch, i + 1, ADC_SampleTime_55Cycles5);
+            ADC_RegularChannelConfig(ADC1, chan_cfgs[i].adc_ch, i + 1, ADC_SampleTime_55Cycles5);
 
         ADC_DMACmd(ADC1, ENABLE);
         ADC_Cmd(ADC1, ENABLE);
@@ -143,20 +143,41 @@ void AD_Init(void)
     }
 }
 
-/* 读取指定 ADC 通道的 DMA 缓存值: 对该通道 N 帧过采样求平均(四舍五入), 抑制采样噪声 */
+/* 读取指定 ADC 通道的 DMA 缓存值: 对该通道 N 帧过采样求平均(四舍五入), 抑制采样噪声
+ * 循环 DMA 持续写入缓存, 读取期间可能跨越新老两轮 → 用 DMA 传输计数器(CNDTR)
+ * 做一致性快照: 读完整轮后 CNDTR 未变说明期间无传输, 样本同轮, 结果可信;
+ * 否则混入新老样本, 重读。正常读取仅亚微秒, 远小于单帧写入间隔(≈18.5µs), 首次即成功。 */
 uint16_t AD_GetValue(uint8_t channel_adc)
 {
     uint8_t i, ci = ADC_CHANNEL_COUNT;
-    uint32_t sum = 0;
+    uint32_t sum;
+    uint16_t v, vmin, vmax;
 
     for (i = 0; i < ADC_CHANNEL_COUNT; i++)
-        if (s_chans[i].adc_ch == channel_adc) { ci = i; break; }
+        if (chan_cfgs[i].adc_ch == channel_adc) { ci = i; break; }
     if (ci >= ADC_CHANNEL_COUNT) return 0;
 
-    for (i = 0; i < TEMP_OVERSAMPLE; i++)
-        sum += s_adc_buf[i * ADC_CHANNEL_COUNT + ci];
+    for (;;)
+    {
+        uint16_t before = DMA_GetCurrDataCounter(DMA1_Channel1);
+        sum = 0;
+        vmin = 0xFFFF;
+        vmax = 0;
+        for (i = 0; i < TEMP_OVERSAMPLE; i++)
+        {
+            v = adc_buf[i * ADC_CHANNEL_COUNT + ci];
+            sum += v;
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+        if (DMA_GetCurrDataCounter(DMA1_Channel1) == before)
+            break;
+    }
 
-    return (uint16_t)((sum + TEMP_OVERSAMPLE / 2) / TEMP_OVERSAMPLE);
+    /* 去极值平均: 丢弃一帧最大、一帧最小(偶发毛刺/PWM 开关沿), 对剩余帧求平均,
+     * 再按比例放大回满采样数, 避免被单帧毛刺拉偏。 */
+    sum -= (uint32_t)vmin + vmax;
+    return (uint16_t)((sum + TEMP_OVERSAMPLE / 2) / (TEMP_OVERSAMPLE - 2));
 }
 
 /* 读取 T12 热电偶温度 ADC (PA0, CH0) */
@@ -189,7 +210,7 @@ uint16_t AD_GetCurrentOff(void)
 uint16_t AD_GetCurrent(void)
 {
     uint16_t i_off = AD_GetCurrentOff();
-    uint16_t i_on  = s_adc_cur;
+    uint16_t i_on  = adc_cur;
     return (i_on > i_off) ? (i_on - i_off) : 0;
 }
 
@@ -198,7 +219,7 @@ void ADC1_2_IRQHandler(void)
 {
     if (ADC_GetITStatus(ADC1, ADC_IT_JEOC) != RESET)
     {
-        s_adc_cur = ADC_GetInjectedConversionValue(ADC1, ADC_InjectedChannel_1);
+        adc_cur = ADC_GetInjectedConversionValue(ADC1, ADC_InjectedChannel_1);
         ADC_ClearITPendingBit(ADC1, ADC_IT_JEOC);
     }
 }

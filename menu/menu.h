@@ -15,6 +15,7 @@
 
 /* 节点多功能标志(替代原 jump_id 的"目标ID"语义, 其余位预留) */
 #define MENU_FLAG_DIRECT_HANDLER  0x01U   /* 常驻页: 进入/返回时直接激活为 handler(如 HOME) */
+#define MENU_FLAG_PASSIVE_VIEW    0x08U   /* 只读信息页: 任意事件(CLICK/LPRESS)一律退出, 无需 handler 样板 */
 
 typedef enum{
     MENU_EVENT_UP=0,
@@ -38,10 +39,11 @@ typedef enum{
     MENU_RET_DONE,          /* 结束本页; 离场方向由节点结构(child_num)推导: 有子项→下钻, 否则→回父列表 */
 }menu_result_t;
 
-typedef uint16_t menu_period_t; 
-    
+typedef uint16_t menu_period_t;
+
+/* 页面回调: 内核经 Menu_GetUserData(item) 注入业务上下文(user_data).
+ * 表内显式填了 .user_data 则用之, 否则默认指向节点自身. 回调可忽略. */
 typedef struct{
-	
     void (*enter)(void *user_data);
     menu_result_t (*handler)(const menu_cmd_t *cmd, void *user_data);
     menu_period_t (*display)(void *user_data);
@@ -62,6 +64,9 @@ typedef struct{
 
 extern const menu_item_t menu_table[];
 extern const uint8_t menu_max_num;
+
+/* 取节点回调的业务上下文: 显式填 .user_data 用之, 否则默认指向节点自身 */
+void *Menu_GetUserData(const menu_item_t *item);
 
 
 void Menu_Init(void);

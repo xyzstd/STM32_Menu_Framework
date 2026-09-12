@@ -5,7 +5,7 @@
 config_t g_config;
 
 /* 默认配置 */
-static const config_t g_default_config =
+static const config_t default_config =
 {
     .magic         = CONFIG_MAGIC,
     .version       = CONFIG_VERSION,
@@ -61,11 +61,11 @@ uint16_t Config_GetBoostMax(void)
 }
 
 /* 手柄型号显示名 (与 HANDLE_* 索引一一对应) */
-static const char *const g_handle_names[HANDLE_NUM] = {"T12", "T245", "T210"};
+static const char *const handle_names[HANDLE_NUM] = {"T12", "T245", "T210"};
 
 const char *Config_GetHandleName(void)
 {
-    return g_handle_names[Config_GetHandleIdx()];
+    return handle_names[Config_GetHandleIdx()];
 }
 
 /* 型号校准有效性: 6 个 ADC 校准点须严格单调递增且首点非 0(对应 adc_to_temp
@@ -106,6 +106,10 @@ static uint16_t config_calc_crc(const config_t *cfg)
 
 void Config_Init(void)
 {
+    /* 先清零, 使结构体内对齐填充字节(handle_type 后)在任何存储类/加载路径下都确定为零,
+     * 保证 config_calc_crc 逐字节计算不依赖"全局/const 零初始化"的隐式约定 */
+    memset(&g_config, 0, sizeof(g_config));
+
     Config_Load();
 
     if (g_config.magic != CONFIG_MAGIC || g_config.version != CONFIG_VERSION)
@@ -132,6 +136,6 @@ void Config_Save(void)
 
 void Config_Reset(void)
 {
-    memcpy(&g_config, &g_default_config, sizeof(g_config));
+    memcpy(&g_config, &default_config, sizeof(g_config));
     Config_Save();
 }

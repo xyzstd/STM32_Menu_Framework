@@ -5,9 +5,9 @@
 
 #define SERIAL_RX_BUF_SIZE  512U
 #define UART_BAUDRATE       115200U   /* OTA 通信固定波特率 */
-static volatile uint8_t  s_rx_buf[SERIAL_RX_BUF_SIZE];
-static volatile uint16_t s_rx_head;
-static volatile uint16_t s_rx_tail;
+static volatile uint8_t  rx_buf[SERIAL_RX_BUF_SIZE];
+static volatile uint16_t rx_head;
+static volatile uint16_t rx_tail;
 
 void Serial_Init(void)
 {
@@ -42,7 +42,7 @@ void Serial_Init(void)
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_Init(&nvic);
 
-    s_rx_head = s_rx_tail = 0;
+    rx_head = rx_tail = 0;
     USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
     USART_Cmd(USART1, ENABLE);
 }
@@ -60,13 +60,13 @@ void Serial_SendBuf(const uint8_t *buf, uint16_t len)
 
 uint16_t Serial_Available(void)
 {
-    return (uint16_t)((s_rx_head - s_rx_tail + SERIAL_RX_BUF_SIZE) % SERIAL_RX_BUF_SIZE);
+    return (uint16_t)((rx_head - rx_tail + SERIAL_RX_BUF_SIZE) % SERIAL_RX_BUF_SIZE);
 }
 
 uint8_t Serial_ReadByte(void)
 {
-    uint8_t b = s_rx_buf[s_rx_tail];
-    s_rx_tail = (s_rx_tail + 1) % SERIAL_RX_BUF_SIZE;
+    uint8_t b = rx_buf[rx_tail];
+    rx_tail = (rx_tail + 1) % SERIAL_RX_BUF_SIZE;
     return b;
 }
 
@@ -74,10 +74,10 @@ void Serial_RxIRQHandler(void)
 {
     if (USART_GetITStatus(USART1, USART_IT_RXNE) != RESET) {
         uint8_t b = (uint8_t)USART_ReceiveData(USART1);
-        uint16_t next = (s_rx_head + 1) % SERIAL_RX_BUF_SIZE;
-        if (next != s_rx_tail) {
-            s_rx_buf[s_rx_head] = b;
-            s_rx_head = next;
+        uint16_t next = (rx_head + 1) % SERIAL_RX_BUF_SIZE;
+        if (next != rx_tail) {
+            rx_buf[rx_head] = b;
+            rx_head = next;
         }
         /* 同时喂进 OTA 请求状态机 */
         OTA_SerialFeedRx(b);

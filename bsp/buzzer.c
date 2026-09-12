@@ -42,7 +42,7 @@ static struct {
     buzz_state_t state;
     uint32_t     tick_start;   /* 进入当前状态的时间戳 */
     uint8_t      alarm_count;  /* 报警重复计数 */
-} s_buzz;
+} buzz;
 
 void Buzzer_Init(void)
 {
@@ -56,7 +56,7 @@ void Buzzer_Init(void)
     GPIO_Init(BUZZER_GPIO_PORT, &GPIO_InitStruct);
 
     BUZZER_OFF();
-    s_buzz.state = BUZZ_STATE_IDLE;
+    buzz.state = BUZZ_STATE_IDLE;
 }
 
 void Buzzer_Beep(buzzer_event_t event)
@@ -66,21 +66,18 @@ void Buzzer_Beep(buzzer_event_t event)
     switch (event)
     {
         case BUZZER_EVENT_TEMP_REACHED:
-            s_buzz.state = BUZZ_STATE_ON;
-            s_buzz.tick_start = now;
+            buzz.tick_start = now;
             BUZZER_ON();
             break;
 
         case BUZZER_EVENT_KEY_CLICK:
-            s_buzz.state = BUZZ_STATE_ON;
-            s_buzz.tick_start = now;
+            buzz.tick_start = now;
             BUZZER_ON();
             break;
 
         case BUZZER_EVENT_ALARM:
-            s_buzz.state = BUZZ_STATE_ALARM_ON;
-            s_buzz.tick_start = now;
-            s_buzz.alarm_count = 0;
+            buzz.alarm_count = 0;
+            buzz.tick_start = now;
             BUZZER_ON();
             break;
 
@@ -94,40 +91,38 @@ void Buzzer_Process(void)
     uint32_t now = Timer_GetTick();
     uint32_t elapsed;
 
-    switch (s_buzz.state)
+    switch (buzz.state)
     {
         case BUZZ_STATE_ON:
-            elapsed = now - s_buzz.tick_start;
+            elapsed = now - buzz.tick_start;
             if (elapsed >= BUZZ_ON_MS_NORMAL)
             {
                 BUZZER_OFF();
-                s_buzz.state = BUZZ_STATE_IDLE;
+                buzz.state = BUZZ_STATE_IDLE;
             }
             break;
 
         case BUZZ_STATE_ALARM_ON:
-            elapsed = now - s_buzz.tick_start;
+            elapsed = now - buzz.tick_start;
             if (elapsed >= BUZZ_ALARM_ON_MS)
             {
                 BUZZER_OFF();
-                s_buzz.state = BUZZ_STATE_ALARM_OFF;
-                s_buzz.tick_start = now;
+                buzz.tick_start = now;
             }
             break;
 
         case BUZZ_STATE_ALARM_OFF:
-            elapsed = now - s_buzz.tick_start;
+            elapsed = now - buzz.tick_start;
             if (elapsed >= BUZZ_ALARM_OFF_MS)
             {
-                s_buzz.alarm_count++;
-                if (s_buzz.alarm_count >= BUZZ_ALARM_REPEAT)
+                if (buzz.alarm_count >= BUZZ_ALARM_REPEAT)
                 {
-                    s_buzz.state = BUZZ_STATE_IDLE;
+                    buzz.state = BUZZ_STATE_IDLE;
                 }
                 else
                 {
-                    s_buzz.state = BUZZ_STATE_ALARM_ON;
-                    s_buzz.tick_start = now;
+                    buzz.alarm_count = 0;
+                    buzz.tick_start = now;
                     BUZZER_ON();
                 }
             }

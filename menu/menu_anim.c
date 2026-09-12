@@ -16,7 +16,7 @@ static struct {
     int16_t   to_y;          /* ANIM_BAR: 目标行 Y */
     int8_t    dir;           /* ANIM_PAGE: +1 向下翻页, -1 向上翻页 */
     uint8_t   prev_thumb_y;  /* 上次滚动条滑块 Y(翻页过渡) */
-} s_anim;
+} anim;
 
 /* 当前帧进度 —— 非线性缓动:
  * 归一化进度 t=step/ANIM_STEPS 经 easeOutBack 曲线映射,
@@ -41,7 +41,7 @@ static uint16_t anim_ease(uint16_t t01)
 /* 当前帧缓动后的归一化进度(0..ANIM_UNIT) */
 static uint16_t anim_eased01(void)
 {
-    uint16_t t01 = (uint16_t)((uint32_t)s_anim.step * ANIM_UNIT / ANIM_STEPS);
+    uint16_t t01 = (uint16_t)((uint32_t)anim.step * ANIM_UNIT / ANIM_STEPS);
     return anim_ease(t01);
 }
 
@@ -55,32 +55,30 @@ static int16_t anim_progress(void)
 
 void AnimNav_Stop(void)
 {
-    s_anim.type = ANIM_NONE;
-    s_anim.step = ANIM_STEPS;
+    anim.step = ANIM_STEPS;
 }
 
 void AnimNav_StartBar(int16_t from_y, int16_t to_y)
 {
-    s_anim.type   = ANIM_BAR;
-    s_anim.from_y = from_y;
-    s_anim.to_y   = to_y;
-    s_anim.step   = 1;
+    anim.step   = 1;
+    anim.from_y = from_y;
+    anim.to_y   = to_y;
 }
 
 void AnimNav_StartPage(int8_t dir)
 {
-    s_anim.type = ANIM_PAGE;
-    s_anim.dir  = dir;
-    s_anim.step = 1;
+    anim.step = 1;
+    anim.dir  = dir;
 }
 
 int AnimNav_Advance(void)
 {
-    if (s_anim.step < ANIM_STEPS) {
-        s_anim.step++;
+    if (anim.step < ANIM_STEPS)
+    {
+        anim.step++;
         return 1;
     }
-    s_anim.type = ANIM_NONE;
+    anim.step = ANIM_STEPS;
     return 0;
 }
 
@@ -88,7 +86,7 @@ int AnimNav_Advance(void)
 
 AnimType AnimNav_Type(void)
 {
-    return s_anim.type;
+    return anim.type;
 }
 
 /* 翻页动画: 内容尚未滑到位的垂直位移(0..ANIM_LINE_H) */
@@ -99,20 +97,19 @@ static int16_t anim_page_delta(void)
 
 int16_t AnimNav_PageOffset(void)
 {
-    if (s_anim.type != ANIM_PAGE)
+    if (anim.type != ANIM_PAGE)
         return 0;
     /* 向下翻页(dir=+1): 内容自底部(+LINE_H)上滑到原位; 向上翻页则相反 */
-    return (int16_t)((int16_t)s_anim.dir * anim_page_delta());
+    return (int16_t)((int16_t)anim.dir * anim_page_delta());
 }
 
 int16_t AnimNav_BarY(int16_t base_y)
 {
-    switch (s_anim.type) {
+    switch (anim.type) {
     case ANIM_PAGE:
-        return base_y + (int16_t)((int16_t)s_anim.dir * anim_page_delta());
+        return base_y + (int16_t)((int16_t)anim.dir * anim_page_delta());
     case ANIM_BAR:
-        return s_anim.from_y
-               + (s_anim.to_y - s_anim.from_y) * (int16_t)anim_eased01() / ANIM_UNIT;
+        return base_y + (int16_t)((anim.to_y - anim.from_y) * (int16_t)anim_eased01() / ANIM_UNIT);
     default:
         return base_y;
     }
@@ -127,11 +124,11 @@ int16_t AnimNav_StepRatio(void)
 
 void AnimNav_SetThumbY(uint8_t y)
 {
-    s_anim.prev_thumb_y = y;
+    anim.prev_thumb_y = y;
 }
 
 uint8_t AnimNav_GetThumbY(void)
 {
-    return s_anim.prev_thumb_y;
+    return anim.prev_thumb_y;
 }
 

@@ -10,6 +10,7 @@
 
 static menu_result_t home_handler(const menu_cmd_t *cmd, void *user_data)
 {
+    (void)user_data;
     int16_t current_set = WorkTask_GetRuntimeTemp();
 
     switch(cmd->event)
@@ -100,30 +101,26 @@ static menu_period_t home_display(void *user_data)
     OLED_DrawLine(0, 47, 127, 47, OLED_COLOR_SET);
 
     /* 主状态行 (8x16, 单行互斥显示, 避免覆盖残留像素):
-     * 手柄未连接 > 关机 > 休眠 > 大焊点加温(Boost) > 温度到达 > 加热 */
-    if (!handle_ok)
+     * 优先级阶梯即索引顺序: 手柄未连接 > 关机 > 休眠 > 大焊点加温(Boost) >
+     * 温度到达 > 加热. 查表取文本, 分支只裁决索引. */
     {
-        OLED_ShowString(2, 48, "NoHnd", OLED_8X16);
-    }
-    else if (state == WORK_STATE_SHUTDOWN)
-    {
-        OLED_ShowString(2, 48, "OFF", OLED_8X16);
-    }
-    else if (state == WORK_STATE_SLEEP)
-    {
-        OLED_ShowString(2, 48, "Sleep", OLED_8X16);
-    }
-    else if (WorkTask_IsBoostActive())
-    {
-        OLED_ShowString(2, 48, "Boost", OLED_8X16);
-    }
-    else if (WorkTask_IsTempReached())
-    {
-        OLED_ShowString(2, 48, "OK", OLED_8X16);
-    }
-    else
-    {
-        OLED_ShowString(2, 48, "Heat", OLED_8X16);
+        static const char *const state_text[] = {"NoHnd", "OFF", "Sleep", "Boost", "OK", "Heat"};
+        uint8_t state_idx = 0;
+
+        if (!handle_ok)
+            state_idx = 0;
+        else if (state == WORK_STATE_SHUTDOWN)
+            state_idx = 1;
+        else if (state == WORK_STATE_SLEEP)
+            state_idx = 2;
+        else if (WorkTask_IsBoostActive())
+            state_idx = 3;
+        else if (WorkTask_IsTempReached())
+            state_idx = 4;
+        else
+            state_idx = 5;
+
+        OLED_ShowString(2, 48, state_text[state_idx], OLED_8X16);
     }
 
     /* 加热功率进度条 (x=43~94, 左侧状态文本最长到 x=42, 右侧 100% 数字从 x=96 起) */
@@ -137,14 +134,13 @@ static menu_period_t home_display(void *user_data)
         OLED_ShowChar(120, 48, '%', OLED_8X16);
     }
 
-    OLED_Update();
+    OLED_UpdateDiff();      /* 页级差量推送: 仅更新内容变化页, 减少软 I2C 占用 */
     return 100;  /* 100ms 页面刷新 */
 }
 
 static void home_enter(void *user_data)
 {
     (void)user_data;
-
     /* 进入 HOME: 同步 PID 设定值到运行时目标温度(不重置为默认值),
      * 保持用户临时调解的温度在整个运行期间持续生效 */
     PID_Controller_SetSetpoint(WorkTask_GetRuntimeTemp());

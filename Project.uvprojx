@@ -336,7 +336,7 @@
               <MiscControls></MiscControls>
               <Define>USE_STDPERIPH_DRIVER</Define>
               <Undefine></Undefine>
-              <IncludePath>.\bsp;.\package;.\start;.\page;.\menu;.\sys;.\main;.\ota\app_side</IncludePath>
+              <IncludePath>.\bsp;.\package;.\start;.\page;.\ctrl;.\menu;.\sys;.\main;.\ota\app_side</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -409,6 +409,26 @@
               <FileName>system_stm32f10x.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\start\system_stm32f10x.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>ota_app_side</GroupName>
+          <Files>
+            <File>
+              <FileName>ota_boot.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\ota\app_side\ota_boot.c</FilePath>
+            </File>
+            <File>
+              <FileName>ota_boot.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\ota\app_side\ota_boot.h</FilePath>
+            </File>
+            <File>
+              <FileName>ota_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\ota\app_side\ota_config.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -781,14 +801,14 @@
               <FilePath>.\menu\menu.h</FilePath>
             </File>
             <File>
-              <FileName>menu_display.c</FileName>
+              <FileName>menu_table.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\menu\menu_display.c</FilePath>
+              <FilePath>.\menu\menu_table.c</FilePath>
             </File>
             <File>
-              <FileName>menu_display.h</FileName>
+              <FileName>menu_table.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\menu\menu_display.h</FilePath>
+              <FilePath>.\menu\menu_table.h</FilePath>
             </File>
             <File>
               <FileName>menu_anim.c</FileName>
@@ -801,14 +821,14 @@
               <FilePath>.\menu\menu_anim.h</FilePath>
             </File>
             <File>
-              <FileName>menu_table.c</FileName>
+              <FileName>menu_display.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\menu\menu_table.c</FilePath>
+              <FilePath>.\menu\menu_display.c</FilePath>
             </File>
             <File>
-              <FileName>menu_table.h</FileName>
+              <FileName>menu_display.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\menu\menu_table.h</FilePath>
+              <FilePath>.\menu\menu_display.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -838,22 +858,22 @@
             <File>
               <FileName>pid_controller.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\page\pid_controller.c</FilePath>
+              <FilePath>.\ctrl\pid_controller.c</FilePath>
             </File>
             <File>
               <FileName>pid_controller.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\page\pid_controller.h</FilePath>
+              <FilePath>.\ctrl\pid_controller.h</FilePath>
             </File>
             <File>
               <FileName>heater.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\page\heater.c</FilePath>
+              <FilePath>.\ctrl\heater.c</FilePath>
             </File>
             <File>
               <FileName>heater.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\page\heater.h</FilePath>
+              <FilePath>.\ctrl\heater.h</FilePath>
             </File>
             <File>
               <FileName>temp.c</FileName>
@@ -905,25 +925,25 @@
               <FileType>5</FileType>
               <FilePath>.\page\handle.h</FilePath>
             </File>
-          </Files>
-        </Group>
-        <Group>
-          <GroupName>ota_app_side</GroupName>
-          <Files>
             <File>
-              <FileName>ota_boot.c</FileName>
+              <FileName>confirm.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\ota\app_side\ota_boot.c</FilePath>
+              <FilePath>.\page\confirm.c</FilePath>
             </File>
             <File>
-              <FileName>ota_boot.h</FileName>
+              <FileName>confirm.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\ota\app_side\ota_boot.h</FilePath>
+              <FilePath>.\page\confirm.h</FilePath>
             </File>
             <File>
-              <FileName>ota_config.h</FileName>
+              <FileName>param.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\page\param.c</FilePath>
+            </File>
+            <File>
+              <FileName>param.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\ota\app_side\ota_config.h</FilePath>
+              <FilePath>.\page\param.h</FilePath>
             </File>
           </Files>
         </Group>
