@@ -5,18 +5,29 @@
 #include "config.h"
 #include "pid_controller.h"
 #include "param.h"
+#include "work_task.h"
 
 /*
- * 目标温度设置页 (单参数模板):
+ * 目标温度设置项 (单参数模板):
  *   范围 TEMP_MIN~当前型号上限, 步进 5°C.
+ *
+ * 本项是一个普通页(ops->display 非空): CLICK 由内核激活为 HANDLER 并调 enter,
+ * 页内独立整页显示当前值; CLICK/LPRESS 由 param_handler 返回 DONE → 内核走
+ * menu_exit_handler → exit 落盘并回列表。
  *
  * 因上限随当前型号(Config_GetTempMax)动态变化, param_t 的 max
  * 无法静态初始化, 故使用静态实例, 在 enter 时解析当前型号上限.
- * 页面内不会切换型号 (切换在 handle 页), 且返回本页会重新 enter,
- * 故进入时快照上限与实际行为一致.
  */
 
 static param_t temp;
+
+static void temp_load(param_t *it);
+static void temp_store(param_t *it);
+static void temp_setup(void);
+static void temp_enter(void *ud);
+static menu_result_t temp_handler(const menu_cmd_t *cmd, void *ud);
+static void temp_exit(void *ud);
+static menu_period_t temp_display(void *ud);
 
 static void temp_load(param_t *it)
 {
@@ -26,6 +37,10 @@ static void temp_load(param_t *it)
 static void temp_store(param_t *it)
 {
     g_config.default_temp = (uint16_t)it->val;
+    /* 同步运行时目标温度: 本项与 HOME 是同一温度的两条写入口, 只写 default_temp
+     * 会让休眠/关机时 remember_last_temp 用旧 runtime_temp 覆写回落盘值, 静默
+     * 丢弃本页设置 */
+    WorkTask_SetRuntimeTemp(it->val);
     PID_Controller_SetSetpoint(it->val);
 }
 
@@ -46,6 +61,12 @@ static void temp_enter(void *ud)
     param_enter(&temp);
 }
 
+static menu_result_t temp_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &temp); }
+
+/* 目标温度是 HOME 高频操作, 退出落盘不弹"已保存"框以免遮挡读数
+ * (param_exit 返回落盘标记, 此处有意忽略) */
+static void temp_exit(void *ud){ (void)ud; (void)param_exit(&temp); }
+
 static menu_period_t temp_display(void *ud)
 {
     (void)ud;
@@ -62,9 +83,6 @@ static menu_period_t temp_display(void *ud)
     OLED_UpdateDiff();
     return 0;
 }
-
-static menu_result_t temp_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &temp); }
-static void temp_exit(void *ud){ (void)ud; param_exit(&temp); }
 
 const menu_ops_t temp_ops = {
     .enter   = temp_enter,

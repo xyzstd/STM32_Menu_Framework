@@ -1,10 +1,14 @@
-﻿#include <stdio.h>
-#include "menu.h"
+﻿#include "menu.h"
+#include "input.h"
 #include "oled.h"
 #include "handle.h"
 #include "config.h"
 #include "work_task.h"
 #include "confirm.h"
+#include "heater.h"
+#include "buzzer.h"
+#include "cur_cal.h"
+#include "toast.h"
 
 /*
  * 手柄型号页: T12 / T245 / T210
@@ -14,7 +18,8 @@
  *
  * 交互 (单一项, 不做多选目录):
  *   - UP/DOWN : 循环切换当前型号 (仅预览, 不落地)
- *   - LPRESS  : 返回上级必经确认页
+ *   - CLICK / LPRESS: 预览型号已更改(≠当前配置)时弹出确认页;
+ *                     未更改时长按直接退出返回上层, 免确认页
  *
  * 确认页 (YES/NO, 由通用 confirm 模板处理, 显示当前选中的型号):
  *   - UP/DOWN : 切换 否/是
@@ -31,11 +36,31 @@ static const char *handle_labels[HANDLE_LABEL_NUM] = {"T12", "T245", "T210"};
 static uint8_t   cur_idx = HANDLE_T12;   /* 当前预览/待选中的型号 */
 static confirm_t cf;                 /* 确认页子状态机 */
 
+static void handle_enter(void *ud);
+static void handle_exit(void *ud);
+static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud);
+static menu_period_t handle_display(void *ud);
+
 static void handle_enter(void *ud)
 {
     (void)ud;
     cur_idx       = Config_GetHandleIdx();   /* 以当前型号为初始选中 */
     cf.active = false;                   /* 初始不在确认态 */
+
+    /* 门1前移: 进入换头界面即断热(对齐鲍鱼焊台做法), 防止用户握着
+     * 滚烫手柄停留在换头页. 取消/确认切换后由 handle_exit 恢复加热使能,
+     * 引导进 Cur Cal 时由校准页加热抑制接管. */
+    Heater_Disable();
+}
+
+static void handle_exit(void *ud)
+{
+    (void)ud;
+    /* 离开换头页恢复加热使能: 进入页时已断热(门1), 取消/确认切换/引导进
+     * Cur Cal 后由 PID 周期或校准页加热抑制接管. 存在锁存故障时不使能
+     * (故障门在下一 PID 周期也强制断热, 这里避免残差功率输出窗口). */
+    if (!WorkTask_HasFault())
+        Heater_Enable();
 }
 
 static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
@@ -49,10 +74,54 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
         (void)confirm_handle(cmd, &cf, &confirmed);
         if (confirmed)
         {
-            /* 确认切换: 写配置 + 触发安全闭合, 然后退出返回上级 */
+            bool    saved;
+            uint8_t prev_handle = Config_GetHandleIdx();   /* 切换前型号, 判定是否真切换 */
+            /* 安全检测 (目标型号 ≠ 当前型号时): 链路(热电偶/发热芯/供电) +
+             * 目标型号冷态阻值匹配, 异常则拒绝切换并蜂鸣告警, 返回预览态供
+             * 重选; 链路正常才落地. 按目标型号 cur_idx 判定: 换头场景下插入的
+             * 正是目标头, 匹配通过才允许切换; 防止"选了型号却插着别的头"的
+             * 误操作(如 T12 头被选成 T245 烧 450°C). */
+            if (cur_idx != prev_handle && !WorkTask_CheckChain(cur_idx))
+            {
+                Buzzer_Beep(BUZZER_EVENT_ALARM);
+                cf.active = false;   /* 退回单型号视图重选 */
+                return MENU_RET_OK;
+            }
+
+            /* 确认切换: 写配置 + 触发安全闭合 */
             g_config.handle_type = cur_idx;
-            Config_Save();
+            saved = Config_Save();
             WorkTask_OnHandleChanged();
+            if (saved)
+                Toast_Saved();   /* 仅在确实落盘成功时弹框 */
+
+            /* 切换到尚无冷态电流参考(未标定)的型号: 直接引导进 Cur Cal 完成
+             * 冷态标定, 之后细匹配保护才对新型号生效; 3 种型号均已标定则
+             * 无需跳转, 正常返回. 引导页已抑制加热, 热态头先显示 Cooling
+             * 等降温; 与安全自检状态机无冲突: 自检仅上电阶段运行, 切换
+             * 检测脉冲与标定测量脉冲同源且顺序执行, 不会并发. */
+            if (cur_idx != prev_handle && TypeCal_GetRef(cur_idx) == 0)
+            {
+                /* 进 Cur Cal 前清输入事件: 防残留 UP/DOWN 切掉 Tip Cal 预选型号.
+                 * 注意 CurCal_BootEnter() 内部自己调 Menu_SetCurrentId, 不经过
+                 * 本处, 故这行必须留在调用之前. */
+                Input_ClearEvents();
+                CurCal_BootEnter();
+                return MENU_RET_OK;
+            }
+
+            /* 切换成功(与当前型号不同)直接回 HOME: 切换是"完成态"(断热/PID
+             * 重载/目标钳位/Err4 自动重检均已收敛), 回 HOME 看温度继续焊接是
+             * 用户自然下一步, 省一步导航. Menu_SetCurrentId 自动 exit 本页
+             * (handle_exit 恢复加热使能). 同型号确认(未真正切换)走 MENU_RET_DONE
+             * 返回上一层. */
+            if (cur_idx != prev_handle)
+            {
+                /* 跳 HOME 前清输入事件: 防残留旋转事件被 HOME 错位消费(误调温) */
+                Input_ClearEvents();   /* 跳转前丢弃积压事件, 防目标页错位消费 */
+                Menu_SetCurrentId(MENU_HOME_ID);
+                return MENU_RET_OK;
+            }
             return MENU_RET_DONE;
         }
         /* 选"否"/长按: 取消, 返回单型号视图重选; 其余仍在确认态 */
@@ -68,9 +137,14 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
         case MENU_EVENT_DOWN:
             cur_idx = (cur_idx == 0) ? (uint8_t)(HANDLE_LABEL_NUM - 1) : (uint8_t)(cur_idx - 1);
             break;
+        case MENU_EVENT_CLICK:
         case MENU_EVENT_LPRESS:
-            /* 返回上级必经确认页 */
-            confirm_open(&cf);
+            /* 焦点已变化(预览≠当前配置) → CLICK 与长按均可弹确认页;
+             * 型号未更改 → 长按直接退出返回上层, 免去无效确认 */
+            if (cur_idx != Config_GetHandleIdx())
+                confirm_open(&cf);
+            else if (cmd->event == MENU_EVENT_LPRESS)
+                return MENU_RET_DONE;
             break;
         default:
             break;
@@ -86,22 +160,30 @@ static menu_period_t handle_display(void *ud)
     /* ---- 确认页显示 (标题带当前型号) ---- */
     if (cf.active)
     {
-        char buf[24];
-        (void)snprintf(buf, sizeof(buf), "Switch to %s?", handle_labels[cur_idx]);
-        confirm_display(&cf, buf);
+        /* 直接拼接显示, 不经 snprintf/stdio: 各段都是字面量, 宽度可在调用点算准.
+         * 文案为 "切换到" + 型号 + "?", 分两步拼接(本页只有这一处, 不值得引入变参拼接).
+         * confirm_display 仍负责水平居中, 故这里只传拼好的标题字符串 */
+        char title[20];
+        oled_pair_cat(title, sizeof(title), "切换到", handle_labels[cur_idx]);
+        oled_pair_cat(title, sizeof(title), title, "?");
+        confirm_display(&cf, title);
         OLED_UpdateDiff();
         return 0;
     }
 
     /* ---- 单个型号视图: 显示当前选中, 切换预览 ---- */
-    OLED_ShowString(8, 8, "Handle:", OLED_8X16);
+    OLED_ShowChinese(8, 0, "手柄");   /* 标题 y0, 与其它页统一 */
 
-    /* 当前型号大号反显框 (宽 40 容纳 "T245") */
-    OLED_ShowString(28, 32, handle_labels[cur_idx], OLED_8X16);
-    OLED_ReverseRoundRect(24, 30, 40, 18, 6);
+    /* 当前型号大号反显框 (宽 40 容纳 "T245", 整行居中 x44..83):
+     * 文字 8x16 在 18px 高框内上下各留 1px; 标题(0..15)/型号框(27..44)/
+     * 提示(56)三行间距均衡 */
+    OLED_ShowString(48, 28, handle_labels[cur_idx], OLED_8X16);
+    OLED_ReverseRoundRect(44, 27, 40, 18, 6);
 
-    /* 底部提示 */
-    OLED_ShowString(8, 54, "HOLD to Switch", OLED_6X8);
+    /* 底部操作提示 (6x8, 统一"键名: 动作"形式, 两行各居中):
+     * CLK: Switch = 型号已改动时按键弹确认页切换; HLD: Exit = 未改动时长按退出 */
+    OLED_ShowString(21, 48, "CLK: Switch", OLED_6X8);   /* 11 字 86px x21..107 */
+    OLED_ShowString(29, 56, "HLD: Exit", OLED_6X8);     /* 9 字 70px x29..99 */
 
     OLED_UpdateDiff();
     return 0;
@@ -111,5 +193,5 @@ const menu_ops_t handle_ops = {
     .enter   = handle_enter,
     .handler = handle_handler,
     .display = handle_display,
-    .exit    = NULL,
+    .exit    = handle_exit,
 };

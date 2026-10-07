@@ -5,15 +5,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* 结构字段的"空值"哨兵 —— 统一用 0 表示"无"。
- * 0 兼作占位虚拟根(索引0)的自身索引: 虚拟根永不成为当前活动节点, 故无歧义. */
 #define MENU_NO_PARENT 0U    /* parent: 无父(仅占位虚拟根, parent 也指向自身 0) */
 #define MENU_NO_CHILD  0U    /* first_child: 叶子项无子项 */
 #define MENU_INVALID   0U    /* 内部状态哨兵: 无有效序号(渲染层 last_first/prev_index) */
 #define MENU_HOME_ID 1U      /* HOME 位于索引 0 的占位虚拟根之下 */
 #define MENU_LEAF    0U       /* child_num: 叶子项无子项个数 */
 
-/* 节点多功能标志(替代原 jump_id 的"目标ID"语义, 其余位预留) */
 #define MENU_FLAG_DIRECT_HANDLER  0x01U   /* 常驻页: 进入/返回时直接激活为 handler(如 HOME) */
 #define MENU_FLAG_PASSIVE_VIEW    0x08U   /* 只读信息页: 任意事件(CLICK/LPRESS)一律退出, 无需 handler 样板 */
 
@@ -76,10 +73,17 @@ void Menu_HandleEvent(const menu_cmd_t *cmd);
 uint8_t Menu_GetCurrentId(void);
 menu_state_t Menu_GetState(void);
 
+/* 强制跳转到指定节点(设置当前 id):
+ * 离开当前页面(若有 HANDLER 态则调 exit 回调) → 定位到目标节点;
+ * 目标为可激活页面(常驻页 DIRECT_HANDLER, 或带 display 回调的叶子页如
+ * Cur Cal 引导页)则直接激活进 handler, 否则落在其父列表。
+ * 用于异常处理: 任意页面发生锁存故障时回到常驻页 HOME 统一处理;
+ * 亦用于首次冷态标定引导自动进入 Cur Cal 页。 */
+void Menu_SetCurrentId(uint8_t id);
+
 const menu_item_t *Menu_GetItem(uint8_t id);
 const menu_item_t *Menu_GetCurrent(void);
 
 bool Menu_GetSiblingRange(uint8_t id,uint8_t *first,uint8_t *last);
-
 
 #endif

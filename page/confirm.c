@@ -44,20 +44,31 @@ menu_result_t confirm_handle(const menu_cmd_t *cmd, confirm_t *c, bool *confirme
 
 void confirm_display(const confirm_t *c, const char *title)
 {
-    OLED_ShowString(8, 16, title, OLED_8X16);
+    /* 混合宽度: ASCII 8px/字符, 中文 16px/字符 */
+    uint8_t w = 0;
+    const char *p = title;
+    while (*p)
+    {
+        if ((*p & 0x80) == 0) { w += 8;  p++; }
+        else                  { w += 16; p += 3; }
+    }
 
-    OLED_ShowString(32, 34, "NO", OLED_8X16);
-    OLED_ShowString(80, 34, "YES", OLED_8X16);
+    /* 标题水平居中, 顶部留白 12px */
+    OLED_ShowChinese((OLED_WIDTH - (int16_t)w) / 2, 12, title);
+
+    /* 按钮对(20+28=76px)整体居中: 起始 x26, 垂直均衡(下边距 10px) */
+    OLED_ShowChinese(28, 37, "否");
+    OLED_ShowChinese(80, 37, "是");
 
     /* 选中项反显, 未选中项实线框 */
     if (c->choice == CONFIRM_YES)
     {
-        OLED_DrawRoundRect(30, 33, 20, 18, 6, OLED_COLOR_SET);
-        OLED_ReverseRoundRect(78, 33, 28, 18, 6);
+        OLED_DrawRoundRect(26, 36, 20, 18, 6, OLED_COLOR_SET);
+        OLED_ReverseRoundRect(74, 36, 28, 18, 6);
     }
     else
     {
-        OLED_ReverseRoundRect(30, 33, 20, 18, 6);
-        OLED_DrawRoundRect(78, 33, 28, 18, 6, OLED_COLOR_SET);
+        OLED_ReverseRoundRect(26, 36, 20, 18, 6);
+        OLED_DrawRoundRect(74, 36, 28, 18, 6, OLED_COLOR_SET);
     }
 }

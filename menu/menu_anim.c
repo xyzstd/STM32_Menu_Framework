@@ -18,6 +18,13 @@ static struct {
     uint8_t   prev_thumb_y;  /* 上次滚动条滑块 Y(翻页过渡) */
 } anim;
 
+static uint16_t anim_ease(uint16_t t01);
+static uint16_t anim_eased01(void);
+static int16_t anim_progress(void);
+
+static int16_t anim_page_delta(void);
+
+
 /* 当前帧进度 —— 非线性缓动:
  * 归一化进度 t=step/ANIM_STEPS 经 easeOutBack 曲线映射,
  * 使动画"快启动、滑过目标后轻微回弹", 视觉更具弹性。 */

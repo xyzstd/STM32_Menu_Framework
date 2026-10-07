@@ -4,6 +4,7 @@
 #include "pid.h"
 #include "config.h"
 #include "pid_controller.h"
+#include "toast.h"
 
 /*
  * PID 参数设置: 两个子页面
@@ -40,6 +41,22 @@ typedef struct {
 
 static pid_edit_t agg;   /* 激进参数组 */
 static pid_edit_t cons;  /* 保守参数组 */
+
+static menu_result_t pid_edit_handler(const menu_cmd_t *cmd, pid_edit_t *e);
+static void pid_agg_load(void);
+static void pid_agg_store(void);
+static void pid_cons_load(void);
+static void pid_cons_store(void);
+static void pid_edit_draw_row(int16_t y, const char *name, int16_t val);
+static menu_period_t pid_edit_display(const pid_edit_t *e);
+static void pid_agg_enter(void *ud);
+static menu_result_t pid_agg_handler(const menu_cmd_t *cmd, void *ud);
+static menu_period_t pid_agg_display(void *ud);
+static void pid_agg_exit(void *ud);
+static void pid_cons_enter(void *ud);
+static menu_result_t pid_cons_handler(const menu_cmd_t *cmd, void *ud);
+static menu_period_t pid_cons_display(void *ud);
+static void pid_cons_exit(void *ud);
 
 /* 编辑状态机: 导航聚焦(环形) / 调参增减(线性钳位) / CLICK 切换 / LPRESS 退出 */
 static menu_result_t pid_edit_handler(const menu_cmd_t *cmd, pid_edit_t *e)
@@ -102,7 +119,8 @@ static void pid_agg_store(void)
     PID_Controller_SetAggKp(agg.val[0]);
     PID_Controller_SetAggKi(agg.val[1]);
     PID_Controller_SetAggKd(agg.val[2]);
-    Config_Save();
+    if (Config_Save())
+        Toast_Saved();   /* 仅在确实落盘成功时弹框: 失败却提示"已保存"会误导用户 */
 }
 
 /* ==================== 保守参数 ==================== */
@@ -124,7 +142,8 @@ static void pid_cons_store(void)
     PID_Controller_SetConsKp(cons.val[0]);
     PID_Controller_SetConsKi(cons.val[1]);
     PID_Controller_SetConsKd(cons.val[2]);
-    Config_Save();
+    if (Config_Save())
+        Toast_Saved();   /* 仅在确实落盘成功时弹框 */
 }
 
 /* ==================== 共享 display 布局 (本页私有) ==================== */
@@ -159,15 +178,15 @@ static menu_period_t pid_edit_display(const pid_edit_t *e)
         while (nm[len]) len++;
         int16_t bx = (int16_t)(OLED_WIDTH - len * 8 - 2);
         OLED_ShowString(bx, 0, nm, OLED_6X8);
-        if (!Config_IsHandleCalValid(Config_GetHandleIdx()))
+        if (!Cal_IsHandleValid(Config_GetHandleIdx()))
             OLED_ReverseRoundRect(bx, 0, len * 8, 8, 2);
     }
 
-    /* 聚焦/选中框: 行文本 y..y+15 上下各留 1px; 标签 x4 左留 2px, 数值右缘 x79 右留 2px */
+    /* 聚焦/选中框: 16px 高与行距一致, 相邻行框精确贴合不重叠 */
     if (e->editing)
-        OLED_ReverseRoundRect(2, row_y[e->focus] - 1, 80, 18, 6);
+        OLED_ReverseRoundRect(2, row_y[e->focus], 80, 16, 6);
     else
-        OLED_DrawRoundRect(2, row_y[e->focus] - 1, 80, 18, 6, OLED_COLOR_SET);
+        OLED_DrawRoundRect(2, row_y[e->focus], 80, 16, 6, OLED_COLOR_SET);
 
     OLED_UpdateDiff();
     return 0;

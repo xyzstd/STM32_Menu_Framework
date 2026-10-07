@@ -61,6 +61,38 @@ menu_state_t Menu_GetState(void)
 }
 
 
+/* 强制跳转(见 menu.h 注释): 仅做"离开当前页 → 定位 → 常驻页激活"三步,
+ * 不改动列表滚动/差量渲染等既有逻辑; 渲染层经 GetCurrentId/GetState 自动适配. */
+void Menu_SetCurrentId(uint8_t id)
+{
+    if(id >= menu_max_num)
+        return;
+
+    /* 真无操作才提前返回: 仅当"已在目标节点 且 该节点已是活动 handler 态".
+     * 旧实现只比 id, 于是调用方若已parked在目标索引(如 CurCal_BootEnter 在
+     * current 恰为 Cur Cal 时), 调用被静默丢弃, 而调用方已经把副作用状态
+     * (cal_boot/cal_idx 等)改好了 —— 结果既没激活页面, 标志又留在半途,
+     * 直到某次无关的 exit 才被当成"跳过引导"误处理. */
+    if(id == menu_ctrl.current && menu_ctrl.state == MENU_STATE_HANDLER)
+        return;
+
+    if(menu_ctrl.state == MENU_STATE_HANDLER)
+        menu_exit_handler();   /* 离开当前页面: 调 exit 回调, 回落 NORMAL */
+
+    menu_ctrl.current = id;
+
+    /* 目标为可激活页面(常驻页 DIRECT_HANDLER, 或带 display 回调的叶子页如
+     * Cur Cal 引导页): 直接激活为 handler, 保持页面渲染. 判定与 menu_activate
+     * 自身一致(以 display 回调为准); 内联参数项(INLINE_PARAM)无调用
+     * 方会跳转至此, 不受影响. */
+    {
+        const menu_item_t *target = menu_current();
+        if(target && target->ops && target->ops->display)
+            menu_activate();
+    }
+}
+
+
 const menu_item_t *Menu_GetItem(uint8_t id)
 {
     if(id>=menu_max_num)
@@ -123,6 +155,7 @@ static void menu_state_handler(const menu_cmd_t *cmd)
     const menu_item_t *item=menu_current();
     menu_result_t ret=MENU_RET_OK;
     bool has_children;   /* 是否下钻子列表: 先取, 避免依赖"退出 handler 后 current 不变"的隐式约定 */
+    uint8_t acted_id;    /* 派发时所在节点 id, 供下面判断 handler 是否已经自行跳页 */
 
     if(!item||!item->ops)
     {
@@ -138,6 +171,8 @@ static void menu_state_handler(const menu_cmd_t *cmd)
             menu_exit_handler();
         return;
     }
+
+    acted_id = menu_ctrl.current;
 
     switch(cmd->event)
     {
@@ -158,6 +193,13 @@ static void menu_state_handler(const menu_cmd_t *cmd)
         default:
             break;
     }
+
+    /* handler 有权调 Menu_SetCurrentId 自行跳页(如手柄页跳 Cur Cal、故障跳 HOME).
+     * 那种情况下当前节点与状态已被它接管, 此处若再按旧 item 收尾, 就会对新页面
+     * 做一次"没有配对 enter 的 exit"(不平衡), 并按旧节点的 child_num 误下钻.
+     * 现状两个跳转点都返回 MENU_RET_OK 才没暴露; 显式加护栏, 不再依赖调用方自觉. */
+    if(menu_ctrl.current != acted_id || menu_ctrl.state != MENU_STATE_HANDLER)
+        return;
 
     has_children = (item->child_num > 0);
 
@@ -188,7 +230,7 @@ static void menu_state_normal(const menu_cmd_t *cmd)
             break;
 
         case MENU_EVENT_LPRESS:
-            menu_back();   
+            menu_back();
             break;
 
         default:
@@ -292,8 +334,10 @@ bool Menu_GetSiblingRange(uint8_t id,uint8_t *first,uint8_t *last)
         return false;
 
     /* 常驻页(HOME)通过占位虚拟根拥有真实父级(idx 0), 故此处无需对"无父"特判:
-     * 唯一的无父节点是虚拟根本身, 其 parent=0xFF 经 Menu_GetItem 必返回 NULL,
-     * 由下方 !parent 统一拦截. */
+     * 唯一的无父节点是虚拟根本身, 其 parent = MENU_NO_PARENT = 0 指向自身(idx 0),
+     * Menu_GetItem(0) 是合法节点, 不会被 !parent 拦下; 真正兜底的是下方
+     * "id 必须是该列表成员"的范围校验 —— 虚拟根 first_child=1/child_num=1,
+     * 而它自身 id=0 落在 [1,2) 之外, 故返回 false. */
     parent=Menu_GetItem(item->parent);
 
     /* 父节点必须确实拥有子列表 */

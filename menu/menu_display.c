@@ -13,29 +13,6 @@ static int16_t menu_item_y(uint8_t id, uint8_t first, uint8_t page_start)
 }
 #endif
 
-/* 计算 UTF-8 字符串显示宽度: ASCII 8px, 多字节字符(中文/扩展)16px (与 OLED_ShowChinese 一致) */
-static uint8_t menu_text_width(const char *str)
-{
-    uint8_t width = 0;
-
-    while (str && *str)
-    {
-        uint8_t b = (uint8_t)*str;
-
-        if (b < 0x80)
-        {
-            width += 8;
-            str += 1;
-        }
-        else if ((b & 0xE0) == 0xC0)       { width += 16; str += 2; }   /* 2 字节: 拉丁扩展/希腊 */
-        else if ((b & 0xF0) == 0xE0)       { width += 16; str += 3; }   /* 3 字节: 中文 */
-        else if ((b & 0xF8) == 0xF0)       { width += 16; str += 4; }
-        else                               str += 1;
-    }
-
-    return width;
-}
-
 /* 环形滚动窗口状态: 窗口顶行项(相对 first 的下标) + 高亮所在行(0..lines-1)。
  * 高亮在窗口内逐格移动; 到达窗口边缘时才整体滚动一行; 首↔末由取模保证连续。
  * 不变量: 静止时 (win_top + win_cursor) % count == index。 */
@@ -44,6 +21,17 @@ static uint8_t win_count  = 0;
 static uint8_t win_top    = 0;   /* 窗口第 0 行显示的项下标 */
 static uint8_t win_cursor = 0;   /* 高亮所在行(0..lines-1) */
 static uint8_t win_prev   = 0;   /* 上一帧选中下标, 用于判定移动方向(含环回) */
+static bool    win_entry_pending = false;   /* 刚离开列表态(渲染过页面): 下次进入列表按"新进入"复位窗口 */
+
+static bool menu_list_advance(uint8_t index, uint8_t first, uint8_t count);
+
+static void menu_draw_dot(int16_t yc);
+static void menu_draw_chevron(int16_t y);
+static void menu_reverse_row(int16_t y);
+
+static void menu_list_render(uint8_t first, uint8_t count, uint8_t index);
+static menu_period_t menu_list_display(void);
+static menu_period_t menu_page_display(void);
 
 
 /* 环形窗口状态推进: 依当前选中下标(index)与上一帧(win_prev)更新 win_top/win_cursor。
@@ -68,6 +56,25 @@ static bool menu_list_advance(uint8_t index, uint8_t first, uint8_t count)
 
     if (count > 1)
     {
+        int16_t jump = (int16_t)index - (int16_t)win_prev;
+
+        /* 快速旋转跳变(两帧间选中项跨多格, 且非首末环回): 跳过逐格动画,
+         * 保持高亮所在行不变, 窗口整体跟随选中项滑动, 消除"先到顶再掉回"的错位抖动.
+         * 首末环回(|jump|==count-1)仍走逐格滚动, 保留慢速环回的连贯动画. */
+        if (jump != (int16_t)(count - 1) && jump != -(int16_t)(count - 1))
+        {
+            if (jump > 1 || jump < -1)
+            {
+                int16_t top = (int16_t)index - (int16_t)win_cursor;
+
+                while (top < 0)
+                    top += (int16_t)count;
+                win_top    = (uint8_t)(top % (int16_t)count);
+                win_prev   = index;
+                return true;
+            }
+        }
+
         /* 移动方向仅 ±1, 首末处由环回值识别(跨界方向不歧义) */
         int8_t dir = 0;
 
@@ -114,6 +121,79 @@ static bool menu_list_advance(uint8_t index, uint8_t first, uint8_t count)
 }
 
 
+/* 行高 16px 的绘图布局 (靠左): [x8 圆点] [x22 菜单名] ...... [右侧内容] */
+#define MENU_DOT_X      12    /* 圆点圆心 x */
+#define MENU_TEXT_X     22
+#define MENU_CHEV_X     114   /* 可进入三角 ▶ 起始列 */
+
+/* 左侧状态圆点: 靶心 (r3~4 圆环 + r1 中心亮心).
+ * 逐点绘制保证真圆, 反显不影响 */
+static void menu_draw_dot(int16_t yc)
+{
+    for (int16_t j = -4; j <= 4; j++)
+        for (int16_t i = -4; i <= 4; i++)
+        {
+            int16_t d = i * i + j * j;
+            if (d <= 16 && (d >= 9 || d <= 1))
+                OLED_DrawPixel(MENU_DOT_X + i, yc + j, OLED_COLOR_SET);
+        }
+}
+
+/* 右侧可进入三角 ▶: 8px 高 4px 宽, 行内垂直居中 (逐列渐宽实心列) */
+static void menu_draw_chevron(int16_t y)
+{
+    for (uint8_t i = 0; i < 4; i++)
+        OLED_FillRect((int16_t)(MENU_CHEV_X + i), (int16_t)(y + 3 + i), 1,
+                      (uint8_t)(9 - 2 * i), OLED_COLOR_SET);
+}
+
+/* 选中框反显(字节级): 与 OLED_ReverseRoundRect(1,y,OLED_WIDTH-2,16,6) 逐像素结果
+ * 完全一致——按同款圆角跨度公式(与 OLED_FillRoundRect 相同的 dx 判定)逐行算出
+ * left..right, 直接对显示缓冲按位 XOR, 免去 ~2000 次 DrawPixel 函数调用
+ * (≈0.9ms/帧 → ≈0.05ms). 行高 16px 页对齐, 单行 = 2 个整页, 无跨页拆分. */
+static void menu_reverse_row(int16_t y)
+{
+    const int16_t x      = 1;
+    const int16_t width  = OLED_WIDTH - 2;
+    const int16_t height = 16;
+    const int16_t radius = 6;
+    int16_t yy;
+
+    for (yy = 0; yy < height; yy++)
+    {
+        int16_t left  = x;
+        int16_t right = x + width - 1;
+        int16_t dx    = 0;
+
+        if (yy < radius)
+        {
+            int16_t dy = radius - 1 - yy;
+            while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius)
+                dx++;
+            left  = x + radius - dx;
+            right = x + width - radius + dx - 1;
+        }
+        else if (yy >= height - radius)
+        {
+            int16_t dy = yy - (height - radius);
+            while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius)
+                dx++;
+            left  = x + radius - dx;
+            right = x + width - radius + dx - 1;
+        }
+
+        {
+            uint8_t page = (uint8_t)((y + yy) >> 3);
+            uint8_t mask = (uint8_t)(1u << ((y + yy) & 0x07));
+            int16_t c;
+
+            for (c = left; c <= right; c++)
+                OLED_DisplayBuf[page][c] ^= mask;
+        }
+    }
+}
+
+
 /* 列表渲染: 按已推进的窗口(win_top/win_cursor)绘制当前帧, 环形取模显示可见项 */
 static void menu_list_render(uint8_t first, uint8_t count, uint8_t index)
 {
@@ -142,22 +222,20 @@ static void menu_list_render(uint8_t first, uint8_t count, uint8_t index)
 
         int16_t y = (int16_t)r * MENU_ITEM_HEIGHT;
 
+        /* 左侧圆点: 导航态=靶心圆环 */
+        menu_draw_dot((int16_t)(y + 8));
+
+        /* 名字靠左 */
         if (item->name)
-        {
-            /* 文本在选中框内水平居中: 由文本宽度动态求起始 X, 再左移 2px 视觉微调 */
-            uint8_t text_width = menu_text_width(item->name);
-            int16_t x_center = (int16_t)((OLED_WIDTH - text_width) / 2) - 2;
+            OLED_ShowChinese(MENU_TEXT_X, y, item->name);
 
-            if (x_center < 0)
-                x_center = 0;
-
-            OLED_ShowChinese(x_center, y, item->name);
-        }
+        if (item->child_num > 0 || item->ops)
+            menu_draw_chevron(y);   /* 可进入: 子菜单/页面/动作 → 右侧三角 */
 
         if (idx == index)
         {
-            /* 选中框: 反显整行(黑底白字), 与文本 8x16 行高完全贴合 */
-            OLED_ReverseRoundRect(1, y, OLED_WIDTH - 2, 16, 6);
+            /* 选中框: 反显整行(黑底白字). 字节级 XOR, 与 OLED_ReverseRoundRect 逐像素一致 */
+            menu_reverse_row(y);
         }
     }
 
@@ -179,6 +257,24 @@ static menu_period_t menu_list_display(void)
 
     uint8_t count = last - first + 1;
     uint8_t index = selected - first;
+
+    /* 从页面态回到列表(常驻页/参数页/确认页)视为"新进入": 子菜单进入恒落首项(index==0),
+     * 强制复位窗口到首行首项(进入始终指向第一项); 参数页返回落在自身项(index 可能非 0),
+     * 保持原位窗口不清零, 高亮不动. 列表内连续导航不触发. */
+    if (win_entry_pending)
+    {
+        win_entry_pending = false;
+        if (index == 0)
+        {
+            win_first  = first;
+            win_count  = count;
+            win_top    = index;
+            win_cursor = 0;
+            win_prev   = index;
+            menu_list_render(first, count, index);
+            return 0;
+        }
+    }
 
     menu_list_advance(index, first, count);   /* 更新环形窗口状态 */
     menu_list_render(first, count, index);    /* 绘制当前帧 */
@@ -211,5 +307,6 @@ menu_period_t UI_Render(void)
 
         return ret;
     }
+    win_entry_pending = true;   /* 离开列表态(渲染页面): 下次进入列表按新进入处理 */
     return menu_page_display();
 }

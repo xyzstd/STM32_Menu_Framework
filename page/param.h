@@ -33,6 +33,6 @@ struct param_s {
 
 void          param_enter(param_t *it);
 menu_result_t param_handler(const menu_cmd_t *cmd, param_t *it);
-void          param_exit(param_t *it);
+bool          param_exit(param_t *it);   /* 返回 true=本次退出确有改动**且已成功落盘** */
 
 #endif

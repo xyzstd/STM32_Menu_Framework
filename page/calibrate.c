@@ -14,10 +14,10 @@
  *   1. 进入本页后, 先用 UP/DOWN 导航切换聚焦点 (100/200/300/350/400/450), 此时不改变目标温度
  *   2. CLICK 选中当前聚焦点后, 才将其设为目标温度, 烙铁加热至该校准点
  *   3. 调参态 UP/DOWN 调整该点偏移; CLICK 或 LPRESS 返回导航态 (不退出页面)
- *   4. 等温度稳定后, 用万用表测烙铁头实际温度, 差值反号填入偏移
+ *   4. 等温度稳定后, 用万用表测烙铁头实际温度, 将"实测 - 设定"的差值直接填入偏移
+ *      (实际温度 = 基准 + 偏移, 实测比设定高则填正值, 如设定350/实测355 → +5)
  *   5. 导航态 LPRESS 退出, 恢复进入前的目标温度 */
 
-#define CAL_POINT_NUM 6
 #define CAL_OFF_MAX   50
 #define CAL_OFF_MIN   (-50)
 
@@ -31,6 +31,13 @@ static bool sel = false;           /* false=导航态, true=调参态 */
 static bool dirty = false;         /* 参数是否被修改 */
 
 static const char *cal_names[CAL_POINT_NUM] = {"100:", "200:", "300:", "350:", "400:", "450:"};
+
+static void cal_draw_row(uint8_t y, uint8_t idx);
+static void cal_draw_live(uint8_t y);
+static menu_result_t calibrate_handler(const menu_cmd_t *cmd, void *user_data);
+static menu_period_t calibrate_display(void *user_data);
+static void calibrate_enter(void *user_data);
+static void calibrate_exit(void *user_data);
 
 static void cal_draw_row(uint8_t y, uint8_t idx)
 {
@@ -61,11 +68,11 @@ static void cal_draw_live(uint8_t y)
     buf[3] = '\0';
     n = (t >= 100) ? 3u : (t >= 10) ? 2u : 1u;
 
-    OLED_ShowChar(4, y, 'T', OLED_8X16);
-    OLED_ShowChar(12, y, ':', OLED_8X16);
-    OLED_ShowString(24, y, buf + (3 - n), OLED_8X16);
-    OLED_ShowDegree(24 + 8 * n, y);
-    OLED_ShowChar(24 + 8 * n + 8, y, 'C', OLED_8X16);
+    /* 底部实时温度显示: 让用户对照实际温度调偏移 ("温度" 32px x4..36, 值列 x40) */
+    OLED_ShowChinese(4, y, "温度");
+    OLED_ShowString(40, y, buf + (3 - n), OLED_8X16);
+    OLED_ShowDegree(40 + 8 * n, y);
+    OLED_ShowChar(40 + 8 * n + 8, y, 'C', OLED_8X16);
 }
 
 static menu_result_t calibrate_handler(const menu_cmd_t *cmd, void *user_data)
@@ -151,7 +158,7 @@ static menu_period_t calibrate_display(void *user_data)
         while (nm[len]) len++;
         int16_t bx = (int16_t)(OLED_WIDTH - len * 8 - 2);
         OLED_ShowString(bx, 0, nm, OLED_6X8);
-        if (!Config_IsHandleCalValid(Config_GetHandleIdx()))
+        if (!Cal_IsHandleValid(Config_GetHandleIdx()))
             OLED_ReverseRoundRect(bx, 0, len * 8, 8, 2);
     }
 
@@ -170,15 +177,17 @@ static void calibrate_enter(void *user_data)
 {
     (void)user_data;
     uint8_t h = Config_GetHandleIdx();
-    off[0] = (int16_t)g_config.cal_off_100[h];
-    off[1] = (int16_t)g_config.cal_off_200[h];
-    off[2] = (int16_t)g_config.cal_off_300[h];
-    off[3] = (int16_t)g_config.cal_off_350[h];
-    off[4] = (int16_t)g_config.cal_off_400[h];
-    off[5] = (int16_t)g_config.cal_off_450[h];
+    uint8_t i;
+
+    for (i = 0; i < CAL_POINT_NUM; i++)
+        off[i] = Cal_GetOff(i, h);   /* int8 → int16 隐式符号提升 */
+
     focus = 0;
     sel = false;
     dirty = false;
+
+    /* 校准需长时间等温稳定, 期间抑制休眠/关机, 防止目标温度被入睡切走 */
+    WorkTask_SetSleepSuppress(true);
 
     /* 记住进入前的目标温度, 退出时恢复 */
     prev_setpoint = PID_Controller_GetSetpoint();
@@ -191,20 +200,20 @@ static void calibrate_exit(void *user_data)
     if(dirty)
     {
         uint8_t h = Config_GetHandleIdx();
-        /* 保存到配置 */
-        g_config.cal_off_100[h] = (int8_t)off[0];
-        g_config.cal_off_200[h] = (int8_t)off[1];
-        g_config.cal_off_300[h] = (int8_t)off[2];
-        g_config.cal_off_350[h] = (int8_t)off[3];
-        g_config.cal_off_400[h] = (int8_t)off[4];
-        g_config.cal_off_450[h] = (int8_t)off[5];
-        Config_Save();
+        uint8_t i;
+
+        for (i = 0; i < CAL_POINT_NUM; i++)
+            Cal_SetOff(i, h, (int8_t)off[i]);   /* int16 → int8 需显式回缩 */
+        /* 只写校准独立页, 不动用户设置. 返回值暂不向用户上报(本页无"已保存"
+         * 提示, 见 F16); (void) 显式表明"有意忽略"而非漏检. */
+        (void)Cal_Save();
         dirty = false;
     }
 
     /* 恢复进入前的目标温度 */
     PID_Controller_SetSetpoint(prev_setpoint);
     PID_Controller_Reset();
+    WorkTask_SetSleepSuppress(false);   /* 退出校准, 恢复休眠/关机计时 */
 }
 
 const menu_ops_t calibrate_ops = {

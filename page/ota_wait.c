@@ -10,11 +10,27 @@
 #define ANIM_FRAMES  4
 static uint8_t anim_frame = 0;
 
+static menu_result_t ota_wait_handler(const menu_cmd_t *cmd, void *user_data);
+static menu_period_t ota_wait_display(void *user_data);
+static void ota_wait_enter(void *user_data);
+static void ota_wait_exit(void *user_data);
+
+/* 事件处理: 本页要"停留等待"上位机握手, 故 CLICK/UP/DOWN 一律不响应(返回 OK 留守),
+ * 只有长按才退出。这与只读信息页(PASSIVE_VIEW, 任意键即退)语义相反 —— 本页已从
+ * 菜单表移除该标志, 退出裁决权收归这里。 */
+static menu_result_t ota_wait_handler(const menu_cmd_t *cmd, void *user_data)
+{
+    (void)user_data;
+    if (cmd->event == MENU_EVENT_LPRESS)
+        return MENU_RET_DONE;   /* 长按: 放弃等待, 返回列表 */
+    return MENU_RET_OK;         /* CLICK/UP/DOWN: 留在本页继续等握手 */
+}
+
 static menu_period_t ota_wait_display(void *user_data)
 {
     (void)user_data;
     static const char *dots[ANIM_FRAMES] = {"   ", ".  ", ".. ", "..."};
-    char buf[8];
+    char buf[16];
     const char *d = dots[anim_frame];
 
     /* 检查 OTA 请求标志（串口 RX 中断里 OTA_SerialFeedRx 状态机设置）。*/
@@ -23,10 +39,9 @@ static menu_period_t ota_wait_display(void *user_data)
         OLED_Clear();
         /* 黑底白字提示条: 先白条→黑字→整体反显; 文本 y20..35 完全落在条内 y19..36 */
         OLED_FillRect(0, 19, OLED_WIDTH, 18, OLED_COLOR_SET);
-        OLED_ShowString((OLED_WIDTH - 8 * 10) / 2, 20, "Connected!", OLED_8X16);
+        OLED_ShowChinese(40, 20, "已连接");
         OLED_ReverseArea(0, 19, OLED_WIDTH, 18);
-        /* OLED_6X8 实际按 8px/字符步进, 故按 8*11 计算居中 */
-        OLED_ShowString((OLED_WIDTH - 8 * 11) / 2, 42, "Resetting...", OLED_6X8);
+        OLED_ShowChinese(32, 42, "正在重启");
         OLED_Update();
         OTA_EnterBootloader();  /* 写 noinit 魔数 + NVIC_SystemReset()，不返回 */
     }
@@ -36,12 +51,15 @@ static menu_period_t ota_wait_display(void *user_data)
     OLED_Clear();
 
     /* status text */
-    OLED_ShowString((OLED_WIDTH - 8 * 11) / 2, 20, "Waiting for", OLED_8X16);
+    OLED_ShowChinese(32, 20, "等待主机");
 
-    /* animated dots: OLED_6X8 实际按 8px/字符步进, 故按 8*8 计算居中 */
-    buf[0] = 'h'; buf[1] = 'o'; buf[2] = 's'; buf[3] = 't';
-    buf[4] = d[0]; buf[5] = d[1]; buf[6] = d[2]; buf[7] = '\0';
-    OLED_ShowString((OLED_WIDTH - 8 * 8) / 2, 38, buf, OLED_6X8);
+    /* animated dots: "连接" 32px + 3 点 24px = 56px, 居中 x=36 */
+    oled_pair_cat(buf, sizeof(buf), "连接", d);
+    OLED_ShowChinese(36, 38, buf);
+
+    /* 底部提示: 本页 CLICK/UP/DOWN 均不退出(要等待握手), 必须让用户知道怎么离开 */
+    OLED_ShowChinese(32, 56, "长按退出");   /* 4 汉字 64px, 居中 x=32 */
+
     OLED_UpdateDiff();
     return REFRESH_PERIOD_MS;
 }
@@ -61,6 +79,7 @@ static void ota_wait_exit(void *user_data)
 
 const menu_ops_t ota_wait_ops = {
     .enter   = ota_wait_enter,
+    .handler = ota_wait_handler,
     .display = ota_wait_display,
     .exit    = ota_wait_exit,
 };
