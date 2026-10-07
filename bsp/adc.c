@@ -1,18 +1,20 @@
-#include "stm32f10x.h"                  // Device header
+﻿#include "stm32f10x.h"                  // Device header
+#include <stdbool.h>
+#include "pwm.h"
 
 /*
- * ADC 采集: 双触发 — 规则组(自由采样) + 注入组(导通采, 电流)
+ * ADC 采集: 双触发 — 规则组(自由采样) + 注入组(相位锁定, 电流)
  *
  *  规则组 (规则组外部触发 = None, 软件连续转换, 自由采样):
- *     CH0(PA0,T12热电偶), CH1(PA1,电流/关断), CH2(PA2,输入电压), CH6(PA6,NTC)
+ *     CH0(PA0,T12热电偶), CH2(PA2,输入电压), CH16(CPU 内部温度, 冷端补偿参考)
  *     → 连续扫描 + 循环 DMA → adc_buf, 采样噪声由 work_task 一阶低通 temp_filt 抑制
- *  注入组 (注入组外部触发 = TIM1 CC4, 导通段中点, 有过流电流):
- *     电流采样电阻(运放B输出) ADC 通道 → JEOC 中断读 JDR1 → adc_cur
+ *  注入组 (注入组外部触发 = TIM1 CC4, 单通道电流):
+ *     电流采样电阻(运放B输出) ADC 通道 → JEOC 中断读 JDR1
+ *     CC4 触发点由 pwm.c 逐帧在"导通段中点"与"关断段中点"之间交替, 中断按当前
+ *     相位把采样分派到 adc_cur(导通电流) / adc_cur_off(关断基准)。
  *
- *  规则组连续转换, 自由采样的 4 通道 DMA 缓存 (不锁 CC3 相位, 兼容 T12/T245);
- *  注入组被 CC4(导通)触发, 单通道电流采样, 中断取回。
- *  差分校准: 过流电流 = 导通电流(注入) - 关断电流(规则组电流通道),
- *              消去运放失调/共模/ADC 偏置。
+ *  差分校准: 过流电流 = 导通相位采样 - 关断相位采样, 消去运放失调/共模/ADC 偏置。
+ *              两路都由 CC4 相位锁定, 与 PWM 严格同步, 不依赖规则组的自由采样相位。
  *  非阻塞: AD_Get* 返回缓存, 跨周期平均由调用方(work_task 一阶低通)完成。
  */
 
@@ -25,30 +27,37 @@ typedef struct
     uint8_t  report_slot; /* 在报告数组中的下标 */
 } adc_chan_cfg_t;
 
-#define ADC_CHANNEL_COUNT   4
+#define ADC_CHANNEL_COUNT   3
 
 /* 规则组过采样帧数: 连续自由采样下对同一通道 N 帧求平均, 抑制 PWM 开关沿/工频噪声。
- * 一轮 4 通道 ≈ 18.5µs(12MHz/55.5周期), N=8 → 均值窗口 ≈ 148µs, 延迟可忽略.
- * 缓存按 N×通道数展开成环形, 由循环 DMA 持续填充。 */
+ * 一轮 3 通道 ≈ 32µs(68+68+252 个 12MHz 时钟, CH16 用长采样), N=8 → 均值窗口 ≈ 0.26ms,
+ * 延迟可忽略. 缓存按 N×通道数展开成环形, 由循环 DMA 持续填充。 */
 #define TEMP_OVERSAMPLE      8
 
+/* 一致性快照最大尝试次数: 正常读取亚微秒级, 首次即成功; 上限只为防止
+ * DMA/ADC 异常停摆时 CNDTR 恒变而无限空转(会拖到 IWDG 复位整机)。 */
+#define ADC_SNAPSHOT_RETRY   8
+
 /* 电流采样通道 (PA1 = ADC_Channel_1, 按实际接线可改)
- * 同时用于: 注入组=导通电流,  规则组=关断电流(差分校准) */
+ * 只走注入组(CC4 相位锁定): 导通段中点采导通电流, 关断段中点采关断基准 */
 #define CUR_ADC_CH          ADC_Channel_1
 #define CUR_ADC_PIN         GPIO_Pin_1
 #define CUR_GPIOX           GPIOA
 
 /* 缓存: DMA 每次完成一轮(N 帧)后环形填充, 每帧按通道表顺序填入 */
 static volatile uint16_t adc_buf[ADC_CHANNEL_COUNT * TEMP_OVERSAMPLE];
-/* 注入组(电流)最新采样值, 由 ADC1_2_IRQHandler 更新 (导通电流) */
-static volatile uint16_t adc_cur;
+/* 注入组(电流)最新采样值, 由 ADC1_2_IRQHandler 按触发相位分别更新 */
+static volatile uint16_t adc_cur;       /* 导通段中点采样 → 导通电流 */
+static volatile uint16_t adc_cur_off;   /* 关断段中点采样 → 关断基准(运放失调/偏置) */
+/* 自上次读取以来是否收到过新的导通采样。断热(PWM CCR=0)期间 CC4 不产生导通采样,
+ * adc_cur 会停留在停机前的陈旧值, 靠此标志让 AD_GetCurrent 区分"无导通"与"有电流"。 */
+static volatile bool adc_cur_fresh;
 
 static const adc_chan_cfg_t chan_cfgs[ADC_CHANNEL_COUNT] =
 {
-    { 0, ADC_Channel_0, GPIO_Pin_0, 0 }, /* 热电偶 T12 */
-    { 1, ADC_Channel_1, GPIO_Pin_1, 1 }, /* 电流(关断)  */
-    { 2, ADC_Channel_2, GPIO_Pin_2, 2 }, /* 输入电压    */
-    { 6, ADC_Channel_6, GPIO_Pin_6, 3 }, /* NTC 手柄    */
+    { 0,  ADC_Channel_0,  GPIO_Pin_0, 0 }, /* 热电偶 T12 */
+    { 2,  ADC_Channel_2,  GPIO_Pin_2, 2 }, /* 输入电压    */
+    { 16, ADC_Channel_16, 0,          3 }, /* CPU 内部温度(冷端补偿参考, 无外部引脚) */
 };
 
 void AD_Init(void)
@@ -106,11 +115,15 @@ void AD_Init(void)
         ADC_InitStruct.ADC_NbrOfChannel       = ADC_CHANNEL_COUNT;
         ADC_Init(ADC1, &ADC_InitStruct);
 
-        /* 5. 各通道采样时间 + 在扫描顺序中的位置 */
+        /* 5. 各通道采样时间 + 在扫描顺序中的位置.
+         * 内部温度传感器建议长采样(≥239.5 周期)以获得稳定读数, 其余通道 55.5. */
         for (i = 0; i < ADC_CHANNEL_COUNT; i++)
-            ADC_RegularChannelConfig(ADC1, chan_cfgs[i].adc_ch, i + 1, ADC_SampleTime_55Cycles5);
+            ADC_RegularChannelConfig(ADC1, chan_cfgs[i].adc_ch, i + 1,
+                (chan_cfgs[i].adc_ch == ADC_Channel_16) ? ADC_SampleTime_239Cycles5
+                                                        : ADC_SampleTime_55Cycles5);
 
         ADC_DMACmd(ADC1, ENABLE);
+        ADC_TempSensorVrefintCmd(ENABLE);   /* 使能内部温度传感器 + VREFINT (先于 ADC 上电) */
         ADC_Cmd(ADC1, ENABLE);
 
         /* 校准 */
@@ -146,10 +159,13 @@ void AD_Init(void)
 /* 读取指定 ADC 通道的 DMA 缓存值: 对该通道 N 帧过采样求平均(四舍五入), 抑制采样噪声
  * 循环 DMA 持续写入缓存, 读取期间可能跨越新老两轮 → 用 DMA 传输计数器(CNDTR)
  * 做一致性快照: 读完整轮后 CNDTR 未变说明期间无传输, 样本同轮, 结果可信;
- * 否则混入新老样本, 重读。正常读取仅亚微秒, 远小于单帧写入间隔(≈18.5µs), 首次即成功。 */
+ * 否则混入新老样本, 重读。正常读取仅亚微秒, 远小于单帧写入间隔(≈18.5µs), 首次即成功。
+ * 重读设上限(ADC_SNAPSHOT_RETRY): DMA/ADC 停摆时 CNDTR 恒变, 无上限会死等拖到
+ * IWDG 复位; 达到上限即接受最近一轮样本(可能跨轮混样, 但远优于整机复位)。 */
 uint16_t AD_GetValue(uint8_t channel_adc)
 {
     uint8_t i, ci = ADC_CHANNEL_COUNT;
+    uint8_t retry;
     uint32_t sum;
     uint16_t v, vmin, vmax;
 
@@ -157,7 +173,7 @@ uint16_t AD_GetValue(uint8_t channel_adc)
         if (chan_cfgs[i].adc_ch == channel_adc) { ci = i; break; }
     if (ci >= ADC_CHANNEL_COUNT) return 0;
 
-    for (;;)
+    for (retry = 0; retry < ADC_SNAPSHOT_RETRY; retry++)
     {
         uint16_t before = DMA_GetCurrDataCounter(DMA1_Channel1);
         sum = 0;
@@ -192,34 +208,64 @@ uint16_t AD_GetVin(void)
     return AD_GetValue(2);
 }
 
-/* 读取 NTC 手柄温度 ADC (PA6, CH6) */
-uint16_t AD_GetNTC(void)
+/* 读取 CPU 内部温度 (°C×10). 走规则组 CH16 缓存, 同 8 帧去极值平均.
+ * STM32F1 内部温度传感器: Vsense = adc*3300/4096 (mV), 25°C 时 V25≈1430mV,
+ * 正温度系数 ≈4.3mV/°C → T = (Vsense−1430)/4.3 + 25.
+ * 定点: T_x10 = 250 + (adc*330000/4096 − 143000)/43.
+ * 注意: 绝对精度受 V25 芯片间散布(±0.09V → ±21°C)限制, 冷端补偿应使用
+ * 相对变化量(见 work_task 冷端补偿), 而非本函数的绝对读数. */
+int16_t AD_GetCpuTempC(void)
 {
-    return AD_GetValue(6);
+    int32_t adc   = (int32_t)AD_GetValue(ADC_Channel_16);
+    int32_t t_x10 = 250 + (((adc * 330000) / 4096 - 143000) / 43);
+
+    if (t_x10 < 0)      t_x10 = 0;    /* 钳 0~125°C */
+    if (t_x10 > 1250)   t_x10 = 1250;
+    return (int16_t)t_x10;
 }
 
-/* 读取关断段电流 (规则组缓存里的电流通道, 自由采样) */
-uint16_t AD_GetCurrentOff(void)
-{
-    return AD_GetValue(CUR_ADC_CH);
-}
-
-/* 差分校准后电流 = 导通电流(注入组, CC4) - 关断电流(规则组电流通道, 自由采样)
- * 消去运放失调/共模/ADC 偏置, 接近真实工作电流。
- * 导通值被偏置抬高时结果更大 → 过流判断更准；关断 ≥ 导通时钳到 0 防下溢。 */
+/* 差分校准后电流 = 导通相位采样 - 关断相位采样 (同一注入组, CC4 逐帧交替相位)
+ * 两路都与 PWM 相位严格锁定, 消去运放失调/共模/ADC 偏置, 接近真实工作电流。
+ * 导通值被偏置抬高时结果更大 → 过流判断更准；关断 ≥ 导通时钳到 0 防下溢。
+ *
+ * 新鲜度: 加热全关(PWM CCR=0 → 导通相位触发点为 0)时不产生导通采样, adc_cur
+ * 停留在停机前的陈旧值。若直接返回, 断热态会被读成"仍有电流", 过流判据失真。
+ * 故先消费新鲜标志: 自上次读取以来无新导通采样即返回 0(物理上无导通→无电流),
+ * 有采样则返回差分值。标志为"消费式"(读一次清一次), 每个 PID 周期读一次即够。 */
 uint16_t AD_GetCurrent(void)
 {
-    uint16_t i_off = AD_GetCurrentOff();
-    uint16_t i_on  = adc_cur;
+    uint16_t i_off, i_on;
+    bool fresh = adc_cur_fresh;
+
+    adc_cur_fresh = false;
+
+    if (!fresh)
+        return 0;
+
+    i_off = adc_cur_off;
+    i_on  = adc_cur;
     return (i_on > i_off) ? (i_on - i_off) : 0;
 }
 
-/* 注入组 JEOC 中断: 导通中采样完成 → 读回电流值 (过流检测) */
+/* 注入组 JEOC 中断: 一帧电流采样完成 → 按当前触发相位分派, 再把 CC4 换到另一相位。
+ * 相位只由本中断改写(主循环仅读), 故"分派"与"刚触发的那一帧"始终对应。 */
 void ADC1_2_IRQHandler(void)
 {
     if (ADC_GetITStatus(ADC1, ADC_IT_JEOC) != RESET)
     {
-        adc_cur = ADC_GetInjectedConversionValue(ADC1, ADC_InjectedChannel_1);
+        uint16_t v  = ADC_GetInjectedConversionValue(ADC1, ADC_InjectedChannel_1);
+        bool     off = PWM_GetInjectPhase();
+
+        if (off)
+            adc_cur_off = v;        /* 关断段中点: 关断基准 */
+        else
+        {
+            adc_cur = v;            /* 导通段中点: 导通电流 */
+            adc_cur_fresh = true;   /* 标记"有新的导通采样", 供 AD_GetCurrent 判新鲜度 */
+        }
+
+        PWM_SetInjectPhase(!off);   /* 下一帧换到另一相位(导通↔关断) */
+
         ADC_ClearITPendingBit(ADC1, ADC_IT_JEOC);
     }
 }

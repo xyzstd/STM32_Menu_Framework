@@ -1,6 +1,5 @@
 ﻿#include "stm32f10x.h"                  // Device header
 #include "serial.h"
-#include "ota_boot.h"
 #include "misc.h"
 
 #define SERIAL_RX_BUF_SIZE  512U
@@ -8,6 +7,14 @@
 static volatile uint8_t  rx_buf[SERIAL_RX_BUF_SIZE];
 static volatile uint16_t rx_head;
 static volatile uint16_t rx_tail;
+
+/* 接收回调(注册者: ota_boot). volatile: 主循环注册, 中断随时读取 */
+static volatile serial_rx_fn rx_cb = NULL;
+
+void Serial_SetRxCallback(serial_rx_fn fn)
+{
+    rx_cb = fn;
+}
 
 void Serial_Init(void)
 {
@@ -79,13 +86,9 @@ void Serial_RxIRQHandler(void)
             rx_buf[rx_head] = b;
             rx_head = next;
         }
-        /* 同时喂进 OTA 请求状态机 */
-        OTA_SerialFeedRx(b);
+        /* 额外派发一份给注册者(OTA 请求序列识别). 经回调而非直接调用:
+         * 本驱动不认识 OTA 协议, 也不再依赖 ota/ 的头文件. */
+        if (rx_cb)
+            rx_cb(b);
     }
-}
-
-int fputc(int ch, FILE *f)
-{
-    Serial_SendByte((uint8_t)ch);
-    return ch;
 }

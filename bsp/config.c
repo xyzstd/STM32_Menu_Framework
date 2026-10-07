@@ -3,12 +3,15 @@
 #include <string.h>
 
 config_t g_config;
+cal_t    g_cal;
+type_cal_t g_typecal;
 
-/* 默认配置 */
+/* 默认配置 (仅用户设置; 校准数据独立在 default_cal) */
 static const config_t default_config =
 {
     .magic         = CONFIG_MAGIC,
     .version       = CONFIG_VERSION,
+    .size          = sizeof(config_t),
     .handle_type   = HANDLE_T12,
     .default_temp  = 300,
     .sleep_temp    = 200,
@@ -22,25 +25,52 @@ static const config_t default_config =
     /* 温度上限: T12 常规 400°C(留余量给 Boost 爬升至 450), T245/T210 常规 450°C */
     .temp_max      = {400,  450,  450 },
     .boost_max     = {450,  450,  450 },
+    .sleep_time    = 5,      /* 5分钟 */
+    .shutdown_time = 30,     /* 30分钟 */
+    .buzzer_enable = 1,      /* 开 */
+    .brightness    = 180,
+    .crc           = 0,
+};
+
+/* 默认校准 (每型号一套, 参考 Cai-Zi; T245/T210 先同 T12 占位, 可在校准页重新标定) */
+static const cal_t default_cal =
+{
+    .magic         = CAL_MAGIC,
+    .version       = CAL_VERSION,
     .cal_off_100   = {0, 0, 0},
     .cal_off_200   = {0, 0, 0},
     .cal_off_300   = {0, 0, 0},
     .cal_off_350   = {0, 0, 0},
     .cal_off_400   = {0, 0, 0},
     .cal_off_450   = {0, 0, 0},
-    .sleep_time    = 5,      /* 5分钟 */
-    .shutdown_time = 30,     /* 30分钟 */
-    .buzzer_enable = 1,      /* 开 */
-    .brightness    = 180,
-    /* ADC 校准点 (每型号一套, 参考 Cai-Zi; T245/T210 先同 T12 占位) */
     .cal_adc_100   = {790,  790,  790 },   /* 100°C ADC 值 */
     .cal_adc_200   = {1670, 1670, 1670},   /* 200°C ADC 值 */
     .cal_adc_300   = {2900, 2900, 2900},   /* 300°C ADC 值 */
     .cal_adc_350   = {3396, 3396, 3396},   /* 350°C ADC 值 */
     .cal_adc_400   = {3892, 3892, 3892},   /* 400°C ADC 值 */
-    .cal_adc_450   = {4095, 4095, 4095},   /* 450°C ADC 值 */
+    .cal_adc_450   = {3920, 3920, 3920},   /* 450°C ADC 值: 出厂占位须显著低于开路阈值
+                                              (THERMO_ADC_OPEN=4000), 否则未校准状态焊 450°C
+                                              会被热电偶开路检测误锁存; 真机校准时 450°C 点
+                                              也应满足 ＜4000 且留裕量 */
     .crc           = 0,
 };
+
+/* 默认电流标定: 出厂全 0 = 各型号均"未标定", 型号匹配检查默认跳过.
+ * 真机用菜单 "Cur Cal" 实测后写入 (各型号冷态脉冲电流 ADC). */
+static const type_cal_t default_typecal =
+{
+    .magic    = TYPECAL_MAGIC,
+    .version  = TYPECAL_VERSION,
+    .cur_ref  = {0, 0, 0},
+    .crc      = 0,
+};
+
+static uint16_t crc16(const uint8_t *p, uint16_t len);
+static uint16_t config_calc_crc(const config_t *cfg);
+static uint16_t cal_calc_crc(const cal_t *c);
+static uint16_t typecal_calc_crc(const type_cal_t *c);
+static bool save_page(uint32_t addr, const void *buf, uint16_t len);
+static void cal_migrate_v10(const config_v10_t *old);
 
 /* 型号索引越界保护: 非法 handle_type 一律回落到 T12 */
 uint8_t Config_GetHandleIdx(void)
@@ -68,31 +98,16 @@ const char *Config_GetHandleName(void)
     return handle_names[Config_GetHandleIdx()];
 }
 
-/* 型号校准有效性: 6 个 ADC 校准点须严格单调递增且首点非 0(对应 adc_to_temp
- * 的防退化判定). 非法时测温会退化线性映射, 读数偏差大, 需重新校准. */
-bool Config_IsHandleCalValid(uint8_t h)
-{
-    if (h >= HANDLE_NUM) return false;
-    return (g_config.cal_adc_100[h] != 0 &&
-            g_config.cal_adc_200[h] > g_config.cal_adc_100[h] &&
-            g_config.cal_adc_300[h] > g_config.cal_adc_200[h] &&
-            g_config.cal_adc_350[h] > g_config.cal_adc_300[h] &&
-            g_config.cal_adc_400[h] > g_config.cal_adc_350[h] &&
-            g_config.cal_adc_450[h] > g_config.cal_adc_400[h]);
-}
-
-/* 简单 CRC16 校验 */
-static uint16_t config_calc_crc(const config_t *cfg)
+/* 简单 CRC16 (配置页与校准页共用) */
+static uint16_t crc16(const uint8_t *p, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
-    const uint8_t *p = (const uint8_t *)cfg;
-    uint16_t len = sizeof(config_t) - sizeof(cfg->crc);
     uint16_t i;
 
     for (i = 0; i < len; i++)
     {
-        crc ^= p[i];
         uint8_t j;
+        crc ^= p[i];
         for (j = 0; j < 8; j++)
         {
             if (crc & 1)
@@ -104,38 +119,272 @@ static uint16_t config_calc_crc(const config_t *cfg)
     return crc;
 }
 
+static uint16_t config_calc_crc(const config_t *cfg)
+{
+    return crc16((const uint8_t *)cfg, sizeof(config_t) - sizeof(cfg->crc));
+}
+
+static uint16_t cal_calc_crc(const cal_t *c)
+{
+    return crc16((const uint8_t *)c, sizeof(cal_t) - sizeof(c->crc));
+}
+
+static uint16_t typecal_calc_crc(const type_cal_t *c)
+{
+    return crc16((const uint8_t *)c, sizeof(type_cal_t) - sizeof(c->crc));
+}
+
+/* 落盘一个数据页: 真机擦页后写入; 模拟模式仅保留 RAM 状态(仿真器擦写可能死等).
+ * 三个 Save 共用, 避免各写一份 #if 分支导致规则漂移.
+ * 返回 true=确实写入成功. 擦除失败时不继续编程(Flash 只能 1→0, 在未擦净区
+ * 编程得到的是按位与的脏数据, 比不写更危险), 直接把失败上报给调用方. */
+/* 注意: 模拟模式下 save_page 无地址/数据引用, 但本函数被三个 Save 无条件调用,
+ * 故不加 #if —— 保持"调用点在两种模式下都编译"的既有约定. */
+static bool save_page(uint32_t addr, const void *buf, uint16_t len)
+{
+#if !HW_SIM_MODE
+    if (!Flash_ErasePage(addr))
+        return false;
+    return Flash_Write(addr, buf, len);
+#else
+    (void)addr; (void)buf; (void)len;
+    return true;   /* 模拟模式不落盘, 视为成功(仅保留 RAM 状态) */
+#endif
+}
+
+/* v10 旧校准字段整体迁入独立校准页 (升级固件不丢校准).
+ * 以默认校准打底(带 magic/version), 仅覆盖 6 偏移 + 6 ADC 数据;
+ * 各字段在 v10 与 cal_t 内均连续排布, 分两块整体拷贝. */
+static void cal_migrate_v10(const config_v10_t *old)
+{
+    memcpy(&g_cal, &default_cal, sizeof(g_cal));
+    memcpy(g_cal.cal_off_100, old->cal_off_100, sizeof(g_cal.cal_off_100) * CAL_POINT_NUM);
+    memcpy(g_cal.cal_adc_100, old->cal_adc_100, sizeof(g_cal.cal_adc_100) * CAL_POINT_NUM);
+    (void)Cal_Save();
+}
+
 void Config_Init(void)
 {
     /* 先清零, 使结构体内对齐填充字节(handle_type 后)在任何存储类/加载路径下都确定为零,
-     * 保证 config_calc_crc 逐字节计算不依赖"全局/const 零初始化"的隐式约定 */
+     * 保证 CRC 逐字节计算不依赖"全局/const 零初始化"的隐式约定 */
     memset(&g_config, 0, sizeof(g_config));
+    memset(&g_cal, 0, sizeof(g_cal));
+    memset(&g_typecal, 0, sizeof(g_typecal));
 
     Config_Load();
-
-    if (g_config.magic != CONFIG_MAGIC || g_config.version != CONFIG_VERSION)
-        Config_Reset();
-    else
-    {
-        uint16_t calc = config_calc_crc(&g_config);
-        if (calc != g_config.crc)
-            Config_Reset();
-    }
+    Cal_Init();
+    TypeCal_Init();
 }
 
 void Config_Load(void)
 {
-    Flash_Read(CONFIG_FLASH_ADDR, &g_config, sizeof(g_config));
+    uint32_t magic;
+    uint16_t version;
+
+    /* 默认值打底: 迁移时未覆盖的字节(新字段/缺失数据)自动落到默认 */
+    memcpy(&g_config, &default_config, sizeof(g_config));
+
+    Flash_Read(CONFIG_FLASH_ADDR, &magic, sizeof(magic));
+    if (magic != CONFIG_MAGIC)
+    {
+        Config_Reset();   /* 空页(全FF)/magic 不符 → 出厂默认 */
+        return;
+    }
+
+    Flash_Read(CONFIG_FLASH_ADDR + 4, &version, sizeof(version));
+
+    if (version == CONFIG_VERSION)
+    {
+        /* 当前版本: 整读后按 size 迁移. 同版本结构体尾部新增字段时,
+         * 校验旧 CRC 后按旧长度覆盖, 新字段留默认; 此后版本迁移需同步更新此分支. */
+        config_t old;
+        Flash_Read(CONFIG_FLASH_ADDR, &old, sizeof(old));
+
+        if (old.size == sizeof(config_t))
+        {
+            g_config = old;
+        }
+        else if (old.size >= 8 && old.size < sizeof(config_t))
+        {
+            const uint8_t *p = (const uint8_t *)&old;
+            uint16_t old_crc = (uint16_t)(p[old.size - 2] | ((uint16_t)p[old.size - 1] << 8));
+            if (crc16(p, (uint16_t)(old.size - 2)) != old_crc)
+            {
+                Config_Reset();
+                return;
+            }
+            memcpy(&g_config, p, old.size);
+            (void)Config_Save();   /* 补齐新字段与 CRC, 一次落盘 */
+            return;
+        }
+        else
+        {
+            Config_Reset();   /* size 异常 → 出厂默认 */
+            return;
+        }
+
+        if (config_calc_crc(&g_config) != g_config.crc)
+            Config_Reset();
+    }
+    else if (version == 10)
+    {
+        /* v10 旧布局: 逐字段迁移用户设置, 旧校准字段一并迁入独立校准页 (升级不丢校准).
+         * v10 CRC 已覆盖全结构, 含校准数据, 通过校验即视为数据可信. */
+        config_v10_t old;
+        Flash_Read(CONFIG_FLASH_ADDR, &old, sizeof(old));
+
+        if (crc16((const uint8_t *)&old, sizeof(old) - sizeof(old.crc)) != old.crc)
+        {
+            Config_Reset();
+            return;
+        }
+
+        g_config.handle_type   = old.handle_type;
+        g_config.default_temp  = old.default_temp;
+        g_config.sleep_temp    = old.sleep_temp;
+        memcpy(g_config.pid_agg_kp,  old.pid_agg_kp,  sizeof(g_config.pid_agg_kp));
+        memcpy(g_config.pid_agg_ki,  old.pid_agg_ki,  sizeof(g_config.pid_agg_ki));
+        memcpy(g_config.pid_agg_kd,  old.pid_agg_kd,  sizeof(g_config.pid_agg_kd));
+        memcpy(g_config.pid_cons_kp, old.pid_cons_kp, sizeof(g_config.pid_cons_kp));
+        memcpy(g_config.pid_cons_ki, old.pid_cons_ki, sizeof(g_config.pid_cons_ki));
+        memcpy(g_config.pid_cons_kd, old.pid_cons_kd, sizeof(g_config.pid_cons_kd));
+        memcpy(g_config.temp_max,    old.temp_max,    sizeof(g_config.temp_max));
+        memcpy(g_config.boost_max,   old.boost_max,   sizeof(g_config.boost_max));
+        g_config.sleep_time    = old.sleep_time;
+        g_config.shutdown_time = old.shutdown_time;
+        g_config.buzzer_enable = old.buzzer_enable;
+        g_config.brightness    = old.brightness;
+
+        cal_migrate_v10(&old);   /* 旧校准迁入独立页 (校验通过, 数据可信) */
+        (void)Config_Save();   /* 回写 v11 布局 */
+    }
+    else
+    {
+        Config_Reset();   /* 无法解析的版本 → 出厂默认 */
+    }
 }
 
-void Config_Save(void)
+/* 返回 true=已成功写入 Flash. RAM 副本无论成败都已更新为待写内容(缓存权威),
+ * 故失败时立刻重试是安全的; 调用方不应把 false 当作"值没变". */
+bool Config_Save(void)
 {
     g_config.crc = config_calc_crc(&g_config);
-    Flash_ErasePage(CONFIG_FLASH_ADDR);
-    Flash_Write(CONFIG_FLASH_ADDR, &g_config, sizeof(g_config));
+    return save_page(CONFIG_FLASH_ADDR, &g_config, sizeof(g_config));
 }
 
 void Config_Reset(void)
 {
     memcpy(&g_config, &default_config, sizeof(g_config));
-    Config_Save();
+    (void)Config_Save();   /* 只重置用户设置, 不触碰校准页 */
+}
+
+/* ==================== 校准数据独立页 ==================== */
+
+/* 校准点按温度点索引 0..5 ↔ 100/200/300/350/400/450.
+ * 各字段在 cal_t 内按型号连续排布, 用基址 + idx*HANDLE_NUM + h 统一寻址,
+ * 免去 6 行逐字段判断 */
+
+int8_t Cal_GetOff(uint8_t idx, uint8_t h)
+{
+    if (idx >= CAL_POINT_NUM || h >= HANDLE_NUM)
+        return 0;
+    return ((int8_t *)&g_cal.cal_off_100)[idx * HANDLE_NUM + h];
+}
+
+void Cal_SetOff(uint8_t idx, uint8_t h, int8_t v)
+{
+    if (idx >= CAL_POINT_NUM || h >= HANDLE_NUM)
+        return;
+    ((int8_t *)&g_cal.cal_off_100)[idx * HANDLE_NUM + h] = v;
+}
+
+uint16_t Cal_GetAdc(uint8_t idx, uint8_t h)
+{
+    if (idx >= CAL_POINT_NUM || h >= HANDLE_NUM)
+        return 0;
+    return ((uint16_t *)&g_cal.cal_adc_100)[idx * HANDLE_NUM + h];
+}
+
+/* 型号校准有效性: 6 个 ADC 校准点须严格单调递增且首点非 0(对应 adc_to_temp
+ * 的防退化判定). 非法时测温会退化线性映射, 读数偏差大, 需重新校准. */
+bool Cal_IsHandleValid(uint8_t h)
+{
+    if (h >= HANDLE_NUM) return false;
+    return (Cal_GetAdc(0, h) != 0 &&
+            Cal_GetAdc(1, h) > Cal_GetAdc(0, h) &&
+            Cal_GetAdc(2, h) > Cal_GetAdc(1, h) &&
+            Cal_GetAdc(3, h) > Cal_GetAdc(2, h) &&
+            Cal_GetAdc(4, h) > Cal_GetAdc(3, h) &&
+            Cal_GetAdc(5, h) > Cal_GetAdc(4, h));
+}
+
+void Cal_Init(void)
+{
+    Cal_Load();
+
+    if (g_cal.magic != CAL_MAGIC || g_cal.version != CAL_VERSION ||
+        cal_calc_crc(&g_cal) != g_cal.crc)
+        Cal_Reset();   /* 空页(全FF)/版本不符/数据损坏 → 出厂校准 */
+}
+
+void Cal_Load(void)
+{
+    Flash_Read(CAL_FLASH_ADDR, &g_cal, sizeof(g_cal));
+}
+
+bool Cal_Save(void)
+{
+    g_cal.crc = cal_calc_crc(&g_cal);
+    return save_page(CAL_FLASH_ADDR, &g_cal, sizeof(g_cal));
+}
+
+void Cal_Reset(void)
+{
+    memcpy(&g_cal, &default_cal, sizeof(g_cal));
+    (void)Cal_Save();
+}
+
+/* ==================== 电流标定数据独立页 ==================== */
+
+void TypeCal_Init(void)
+{
+    TypeCal_Load();
+
+    if (g_typecal.magic != TYPECAL_MAGIC || g_typecal.version != TYPECAL_VERSION ||
+        typecal_calc_crc(&g_typecal) != g_typecal.crc)
+        TypeCal_Reset();   /* 空页(全FF)/版本不符/数据损坏 → 全 0 未标定 */
+}
+
+void TypeCal_Load(void)
+{
+    Flash_Read(TYPECAL_FLASH_ADDR, &g_typecal, sizeof(g_typecal));
+}
+
+bool TypeCal_Save(void)
+{
+    g_typecal.crc = typecal_calc_crc(&g_typecal);
+    return save_page(TYPECAL_FLASH_ADDR, &g_typecal, sizeof(g_typecal));
+}
+
+void TypeCal_Reset(void)
+{
+    memcpy(&g_typecal, &default_typecal, sizeof(g_typecal));
+    (void)TypeCal_Save();
+}
+
+uint16_t TypeCal_GetRef(uint8_t h)
+{
+    if (h >= HANDLE_NUM)
+        return 0;
+    return g_typecal.cur_ref[h];
+}
+
+void TypeCal_SetRef(uint8_t h, uint16_t v)
+{
+    if (h >= HANDLE_NUM)
+        return;
+    if (g_typecal.cur_ref[h] == v)
+        return;   /* 值未变化: 跳过落盘, 避免无谓的 Flash 擦写损耗 */
+    g_typecal.cur_ref[h] = v;
+    (void)TypeCal_Save();
 }

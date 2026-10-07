@@ -1,23 +1,55 @@
 ﻿#include "oled.h"
 #include "oled_data.h"
 #include "stm32f10x.h"
-#include <stdio.h>
-#include <stdarg.h>
-#include <stdlib.h>
+#include <stddef.h>   /* NULL */
+#include <stdlib.h>   /* abs */
+
+/* 不再包含 <stdio.h>/<stdarg.h>: 原 OLED_Print 走 vsnprintf, 是全工程最后一处
+ * 把 stdio 格式化机制拉进链接的引用(连带浮点支持, 实测约 2.3KB).
+ * 文案拼接改用 oled_pair_cat, 数值显示改用 OLED_ShowNum/OLED_ShowNumPad. */
 
 uint8_t OLED_DisplayBuf[OLED_PAGE_NUM][OLED_WIDTH];
 
-/* 差量刷屏快照: 记录最近一次推送到屏幕的每页 32bit 校验和, 供 OLED_UpdateDiff 判脏.
- * 以 8×4B 校验和取代整帧副本(省约 1KB RAM, 碰撞概率 2^-32 每页可忽略);
- * 全推/局部推也同步本快照, 保证混合调用一致不错漏. */
+/* 差量刷屏快照: 记录最近一次推送到屏幕的每页 32bit 指纹, 供 OLED_UpdateDiff 判脏.
+ * 以 8×4B 指纹取代整帧副本(省约 1KB RAM); 全推/局部推也同步本快照,
+ * 保证混合调用一致不错漏. */
 static uint32_t oled_snap_sum[OLED_PAGE_NUM];
 
+static uint32_t oled_page_sum(uint8_t page);
+static void oled_snap_sync(uint8_t page);
+
+static void oled_w_scl(uint8_t bit);
+static void oled_w_sda(uint8_t bit);
+static void oled_i2c_start(void);
+static void oled_i2c_stop(void);
+static void oled_i2c_send_byte(uint8_t byte);
+
+static void oled_gpio_init(void);
+
+static void oled_set_cursor(uint8_t page,uint8_t x);
+
+static void oled_draw_quarter_circle(int16_t cx,int16_t cy,uint8_t r,uint8_t corner,uint8_t color);
+static uint32_t oled_pow10(uint8_t n);
+static uint8_t oled_utf8_len(const char *str);
+
+/* 页指纹: 必须是"位置敏感"的 —— 内容只要有一个字节变化就必须改变指纹.
+ * 旧实现用逐字节无符号累加, 加法与字节顺序无关, 于是同页内字节多重集相同、
+ * 仅位置不同的改动(字形水平移 1 像素、menu_reverse_row 交换两列等)指纹不变,
+ * 该页会被判为"未变化"而永不推送, 表现为像素残影到下次整页刷新.
+ * 这不是概率碰撞, 是结构性碰撞 —— 注释里原来"2^-32 可忽略"的说法低估了它.
+ * 改用多项式滚动哈希(每字节先左旋 5 位再累加), 使某个字节的贡献取决于其位置,
+ * 单字节改动与换位都无法保持指纹不变; 32bit 下真实碰撞概率才是可忽略的量级.
+ * 成本: 每字节一次移位/或/加, 每帧最多 8×128 字节, 对 72MHz M3 可忽略. */
 static uint32_t oled_page_sum(uint8_t page)
 {
     uint32_t s = 0;
     uint8_t c;
     for(c=0;c<OLED_WIDTH;c++)
-        s += OLED_DisplayBuf[page][c];
+    {
+        uint32_t v = OLED_DisplayBuf[page][c];
+        s = (s << 5) | (s >> 27);   /* 左旋 5 位: 让早先字节的贡献随位置累积 */
+        s += v + 0x9E3779B9u;       /* 加黄金分割常数, 抑制规律性图案的抵消 */
+    }
     return s;
 }
 
@@ -31,13 +63,15 @@ static void oled_snap_sync(uint8_t page)
 
 static void oled_w_scl(uint8_t bit)
 {
-    GPIO_WriteBit(GPIOC,GPIO_Pin_8,(BitAction)bit);
+    if (bit) GPIOC->BSRR = GPIO_Pin_8;
+    else     GPIOC->BRR  = GPIO_Pin_8;
 }
 
 
 static void oled_w_sda(uint8_t bit)
 {
-    GPIO_WriteBit(GPIOC,GPIO_Pin_9,(BitAction)bit);
+    if (bit) GPIOC->BSRR = GPIO_Pin_9;
+    else     GPIOC->BRR  = GPIO_Pin_9;
 }
 
 
@@ -70,11 +104,13 @@ static void oled_i2c_stop(void)
 static void oled_i2c_send_byte(uint8_t byte)
 {
     uint8_t i;
+    volatile uint32_t delay;
 
     for(i=0;i<8;i++)
     {
         oled_w_sda(byte&(0x80>>i));
         oled_w_scl(1);
+        for(delay=0;delay<12;delay++);   /* 保持 SCL 高电平宽度, 满足 SSD1315 采样 */
         oled_w_scl(0);
     }
 
@@ -241,10 +277,10 @@ void OLED_Update(void)
     }
 }
 
-/* 页级差量推送: 按页校验和与快照比对, 只把内容变化的页整页推送到屏幕并更新快照.
+/* 页级差量推送: 按页指纹与快照比对, 只把内容变化的页整页推送到屏幕并更新快照.
  * 菜单/参数页每帧往往只改少数几页(高亮行、数值、功率条), 其余页一致则跳过,
- * 大幅减少软 I2C 刷屏量, 消除连续旋转时 UI 卡顿. 静止时逐页全等 -> 零推送零闪烁.
- * 校验和(32bit 累加)代替整帧比较, 节省 ~1KB RAM; 页内容变化则校验和必变. */
+ * 大幅减少软 I2C 刷屏量, 消除连续旋转时 UI 卡顿. 静止时逐页指纹全等 -> 零推送零闪烁.
+ * 指纹(32bit 位置敏感哈希)代替整帧比较, 节省 ~1KB RAM. */
 void OLED_UpdateDiff(void)
 {
     uint8_t page;
@@ -257,54 +293,6 @@ void OLED_UpdateDiff(void)
             OLED_WriteData(OLED_DisplayBuf[page],OLED_WIDTH);
             oled_snap_sync(page);
         }
-    }
-}
-
-void OLED_UpdateArea(int16_t x,int16_t y,uint8_t width,uint8_t height)
-{
-    uint8_t page_start;
-    uint8_t page_end;
-    uint8_t page;
-
-
-    if(width==0||height==0)
-        return;
-
-
-    if(x<0)
-    {
-        width+=x;
-        x=0;
-    }
-
-    if(y<0)
-    {
-        height+=y;
-        y=0;
-    }
-
-
-    if(x>=OLED_WIDTH||y>=OLED_HEIGHT)
-        return;
-
-
-    if(x+width>OLED_WIDTH)
-        width=OLED_WIDTH-x;
-
-
-    if(y+height>OLED_HEIGHT)
-        height=OLED_HEIGHT-y;
-
-
-    page_start=y>>3;
-    page_end=(y+height-1)>>3;
-
-
-    for(page=page_start;page<=page_end;page++)
-    {
-        oled_set_cursor(page,x);
-        OLED_WriteData(&OLED_DisplayBuf[page][x],width);
-        oled_snap_sync(page);
     }
 }
 
@@ -743,7 +731,7 @@ void OLED_ShowImage(int16_t x,int16_t y,uint8_t width,uint8_t height,const uint8
         {
             data=image[(row>>3)*width+col];
 
-            if(data&(1<<(row&0x07)))
+            if(data&(0x80>>(row&0x07)))   /* 字模统一 MSB 在上: bit7=该列最上像素 */
                 OLED_DrawPixel(x+col,y+row,OLED_COLOR_SET);
             else
                 OLED_DrawPixel(x+col,y+row,OLED_COLOR_CLEAR);
@@ -867,38 +855,13 @@ void OLED_ShowNum(int16_t x,int16_t y,int32_t num,uint8_t len)
 
 
 
-/*================ printf =================*/
-
-void OLED_Print(int16_t x,int16_t y,const char *format,...)
-{
-    char buf[32];
-
-    va_list args;
-
-
-    va_start(args,format);
-
-    vsnprintf(buf,sizeof(buf),format,args);
-
-    va_end(args);
-
-
-    OLED_ShowString(
-        x,
-        y,
-        buf,
-        OLED_8X16);
-}
-
-
-
 /*================ 16x32 =================*/
 
-/*
- * 字模取模方式：列行式、从上到下、从左到右、高位在前
- * 即每个字节 bit7 表示该列最上方像素、bit0 表示最下方像素。
- * 显示缓冲区约定 bit0 为页内最上方像素，故逐字节位反转后再写入。
- */
+/* 字模取模方向统一约定: 所有字模(ASCII/中文/大数字/图标)一律
+ * 列行式、从上到下、从左到右、高位在前(bit7=该列最上像素),
+ * 与常见取模工具(PCTOLCD 等)默认输出一致, 新增字模可直接粘贴.
+ * 注意: 显示缓冲为低位在前(bit0=页内最上像素), 整字节写入前需
+ * 经 OLED_Rev8 反转; 逐像素读取路径(OLED_ShowImage)则用 MSB 位序. */
 uint8_t OLED_Rev8(uint8_t b)
 {
     b = (uint8_t)((b & 0xF0u) >> 4) | (uint8_t)((b & 0x0Fu) << 4);
@@ -989,20 +952,28 @@ void OLED_ShowLargeNum(int16_t x,int16_t y,int32_t num)
     while(v>0);
 
 
-    pos=x+16*(len+neg)-16;
+    /* 摆位: 从左端第 1 个槽开始, 每绘一个字符 x 右移 16 —— 这样"先绘的字符
+     * 在左", 与人的阅读方向一致. 用满宽右对齐: 最右字符右边缘落在 x+16*span.
+     * 起始 x = 末尾槽起点 - 16*(span-1) = x + 16*(len+neg) - 16*span,
+     * 其中 span = len+neg(负号也占一格). */
+    pos=x+16*(len+neg)-16*(len+neg);
 
 
     if(neg)
     {
         OLED_ShowLargeChar(pos,y,'-');
-        pos-=16;
+        pos+=16;
     }
 
-
+    /* 位数顺序: buf[] 由上面的 do-while 生成 —— buf[0] 是最低位(个位),
+     * buf[len-1] 才是最高位. 由左往右绘, 故须自最高位起取: buf[len-1-i].
+     * 曾误用 buf[i] 配右起左行的摆位: 把个位摆在最左, 两位数以上整体倒序
+     * (25 显示 "52"、350 显示 "053"、300 显示 "003"); 只有 1 位数
+     * 因次序无关而正确, 掩盖了该 bug. */
     for(i=0;i<len;i++)
     {
         OLED_ShowLargeChar(pos,y,'0'+buf[len-1-i]);
-        pos-=16;
+        pos+=16;
     }
 }
 
@@ -1112,6 +1083,50 @@ void OLED_ShowChinese(int16_t x, int16_t y, const char *str)
         x += 16;
         str += n;
     }
+}
+
+
+/* 拼接两段字面量: 等价于 snprintf(dst, cap, "%s%s", head, tail) 但不引入 stdio.
+ * 仅供"固定标签 + 固定小段变量"的显示文案使用(如 "切换到"+"T245?"、
+ * "固件版本:"+"1.0.0"), 两段都是编译期字面量, 故结果的像素宽度
+ * (中文 16px / ASCII 8px)在调用点即可算准 —— 调用方自行居中/摆位, 本函数只管拼串.
+ * 越界即截断(始终以 '\0' 收尾), 逐字节拷贝避免额外 strlen 与 dest 初值依赖. */
+void oled_pair_cat(char *dst, uint8_t cap, const char *head, const char *tail)
+{
+    uint8_t n = 0;
+
+    if (dst == NULL || cap == 0)
+        return;
+
+    while (*head && n < (uint8_t)(cap - 1))
+        dst[n++] = *head++;
+
+    while (*tail && n < (uint8_t)(cap - 1))
+        dst[n++] = *tail++;
+
+    dst[n] = '\0';
+}
+
+
+/* 右对齐整数, 不足位补空格: 等价于固定宽度的 printf("%*d").
+ * 与 OLED_ShowNum 的区别: 后者补 '0'(007), 本函数补空格(  7) —— 菜单内联调节行
+ * 原本走 OLED_Print("%3d") 的空格填充, 本函数保持同样的观感且不引入 stdio.
+ * 位数超 len 时由 OLED_ShowNum 自行向右溢出(与 printf 固定宽度语义一致). */
+void OLED_ShowNumPad(int16_t x, int16_t y, int32_t num, uint8_t len)
+{
+    int32_t mag = (num < 0) ? -num : num;
+    uint8_t digits = 1;
+    uint8_t i;
+
+    while (mag >= 10) { mag /= 10; digits++; }   /* 十进制位数(不含符号) */
+
+    for (i = digits; i < len; i++)
+        OLED_ShowChar(x, y, ' ', OLED_8X16);
+
+    if (i > digits)                              /* 补过空格, 数字整体右移 */
+        OLED_ShowNum((int16_t)(x + (uint8_t)(i - digits) * 8), y, num, digits);
+    else
+        OLED_ShowNum(x, y, num, digits);
 }
 
 

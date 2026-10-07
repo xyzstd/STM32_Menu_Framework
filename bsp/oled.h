@@ -54,12 +54,9 @@ void OLED_Update(void);
 
 void OLED_UpdateDiff(void);
 
-void OLED_UpdateArea(int16_t x,int16_t y,
-                     uint8_t width,uint8_t height);
 
 
-
-/*================ ���� =================*/
+/*================ 清屏 =================*/
 
 void OLED_Clear(void);
 
@@ -150,9 +147,10 @@ void OLED_ShowNum(int16_t x,int16_t y,
                   int32_t num,
                   uint8_t len);
 
-
-void OLED_Print(int16_t x,int16_t y,
-                const char *format,...);
+/* Right-aligned integer padded with spaces (printf "%*d"); OLED_ShowNum pads '0'. */
+void OLED_ShowNumPad(int16_t x,int16_t y,
+                     int32_t num,
+                     uint8_t len);
 
 
 /*================ 16x32 =================*/
@@ -175,10 +173,14 @@ void OLED_DrawProgressBar(int16_t x,int16_t y,
 
 void OLED_ShowChinese(int16_t x, int16_t y, const char *str);
 
+/* Concatenate two literal string segments into dst (NUL-terminated, truncated to
+ * cap). Avoids snprintf/stdio for display text such as "切换到" + "T245?"; the
+ * caller keeps its own centring math. */
+void oled_pair_cat(char *dst, uint8_t cap, const char *head, const char *tail);
+
 
 /*================ 亮度控制 =================*/
 
 void OLED_SetContrast(uint8_t val);
-
 
 #endif

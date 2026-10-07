@@ -42,6 +42,8 @@ static struct {
     buzz_state_t state;
     uint32_t     tick_start;   /* 进入当前状态的时间戳 */
     uint8_t      alarm_count;  /* 报警重复计数 */
+    uint8_t      on_ms;        /* 本次 ON 鸣叫时长 (温度到达/按键点击不同) */
+    bool         enabled;      /* 静音开关, 由 Buzzer_SetEnabled 下发 */
 } buzz;
 
 void Buzzer_Init(void)
@@ -57,25 +59,54 @@ void Buzzer_Init(void)
 
     BUZZER_OFF();
     buzz.state = BUZZ_STATE_IDLE;
+    buzz.enabled = true;      /* 默认允许鸣叫 */
+}
+
+/* 静音开关: 由应用层在配置加载/变更时下发.
+ * 原实现直接读 g_config.buzzer_enable, 使驱动依赖应用配置模块(config.h);
+ * 改为被动接收一个布尔量后, 本驱动只依赖 GPIO 与 tick, 可独立使用/测试. */
+void Buzzer_SetEnabled(bool en)
+{
+    buzz.enabled = en;
+    if (!en)
+    {
+        BUZZER_OFF();                    /* 立即停止当前鸣叫 */
+        buzz.state = BUZZ_STATE_IDLE;
+    }
 }
 
 void Buzzer_Beep(buzzer_event_t event)
 {
+    /* 静音开关集中判断: 关闭时忽略一切蜂鸣(含报警), 调用方无需重复判断 */
+    if (!buzz.enabled)
+        return;
+
+    /* 报警进行中忽略普通提示(按键滴声/温度到达), 防止报警段被截断;
+     * 报警事件本身仍可覆盖重新报警 */
+    if ((buzz.state == BUZZ_STATE_ALARM_ON || buzz.state == BUZZ_STATE_ALARM_OFF) &&
+        event != BUZZER_EVENT_ALARM)
+        return;
+
     uint32_t now = Timer_GetTick();
 
     switch (event)
     {
         case BUZZER_EVENT_TEMP_REACHED:
+            buzz.state = BUZZ_STATE_ON;
+            buzz.on_ms = BUZZ_ON_MS_NORMAL;   /* 温度到达: 长鸣 200ms */
             buzz.tick_start = now;
             BUZZER_ON();
             break;
 
         case BUZZER_EVENT_KEY_CLICK:
+            buzz.state = BUZZ_STATE_ON;
+            buzz.on_ms = BUZZ_ON_MS_SHORT;    /* 按键点击: 短鸣 50ms */
             buzz.tick_start = now;
             BUZZER_ON();
             break;
 
         case BUZZER_EVENT_ALARM:
+            buzz.state = BUZZ_STATE_ALARM_ON;
             buzz.alarm_count = 0;
             buzz.tick_start = now;
             BUZZER_ON();
@@ -95,7 +126,7 @@ void Buzzer_Process(void)
     {
         case BUZZ_STATE_ON:
             elapsed = now - buzz.tick_start;
-            if (elapsed >= BUZZ_ON_MS_NORMAL)
+            if (elapsed >= buzz.on_ms)
             {
                 BUZZER_OFF();
                 buzz.state = BUZZ_STATE_IDLE;
@@ -107,6 +138,7 @@ void Buzzer_Process(void)
             if (elapsed >= BUZZ_ALARM_ON_MS)
             {
                 BUZZER_OFF();
+                buzz.state = BUZZ_STATE_ALARM_OFF;
                 buzz.tick_start = now;
             }
             break;
@@ -115,13 +147,14 @@ void Buzzer_Process(void)
             elapsed = now - buzz.tick_start;
             if (elapsed >= BUZZ_ALARM_OFF_MS)
             {
+                buzz.alarm_count++;
                 if (buzz.alarm_count >= BUZZ_ALARM_REPEAT)
                 {
                     buzz.state = BUZZ_STATE_IDLE;
                 }
                 else
                 {
-                    buzz.alarm_count = 0;
+                    buzz.state = BUZZ_STATE_ALARM_ON;
                     buzz.tick_start = now;
                     BUZZER_ON();
                 }

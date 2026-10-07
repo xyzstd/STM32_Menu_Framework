@@ -26,6 +26,10 @@ typedef enum {
 /* 初始化蜂鸣器 */
 void Buzzer_Init(void);
 
+/* 静音开关: 由应用层在配置加载/变更时下发(驱动不读应用配置).
+ * 关闭时立即停止当前鸣叫, 并忽略后续一切蜂鸣(含报警). */
+void Buzzer_SetEnabled(bool en);
+
 /* 触发蜂鸣器事件 */
 void Buzzer_Beep(buzzer_event_t event);
 
