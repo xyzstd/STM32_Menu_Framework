@@ -2,11 +2,19 @@
 DebugConfig/
 Listings/
 Objects/
+obj/
 *.log
+*.o
+
+# 构建输出日志（根目录临时文件）
+build_*.txt
 
 # Keil 用户本地配置（不随工程分发）
 *.uvoptx
 *.uvguix.*
+
+# 本地工作目录（AI 助手记忆，不随工程分发）
+.workbuddy-ai/
 
 # 杂项
 NUL
