@@ -114,6 +114,14 @@ static bool     cal_suppress;
  * 标定完成或跳过后由 BootCalDone 清除. */
 static bool     tip_guide;
 
+/* 本次自检是否已由"型号不匹配(无害)"建立引导: HEAT_READ 置位, SELFTEST_VIN
+ * 据此跳过 boot_cal_eval() —— 否则会按"当前配置型号"重判并清掉 tip_guide,
+ * 使不匹配的烙铁头被加热. 每轮自检在 SELFTEST_THERMO 入口复位.
+ * 仅真机模式使用(自检状态机整体在 #if !HW_SIM_MODE 内, 模拟模式无引用). */
+#if !HW_SIM_MODE
+static bool     type_guide_boot;
+#endif
+
 /* 温度 ADC 一阶低通滤波系数 (定点): K = 192/256 ≈ 0.75.
  * 高频噪声已由 ADC 8 帧过采样抑制, 此低通仅保留中频平滑 → K 提高到 0.75,
  * 90% 阶跃响应从约 3.3 个 PID 周期降到约 1.7 个, 相位延迟减半、更跟手. */
@@ -755,6 +763,7 @@ static void selftest_advance(void)
     switch (work.selftest)
     {
     case SELFTEST_THERMO:
+        type_guide_boot = false;   /* 新一轮自检入口: 清除上一轮的型号引导标记 */
         /* 热电偶: 冷态读数应处于 [THERMO_ADC_MIN, THERMO_ADC_OPEN) 正常区间,
          * 短路(<50)或开路(≥4000)均为链路失效 → 锁存故障码 1 */
         {
@@ -823,8 +832,9 @@ static void selftest_advance(void)
                 work.boot_cal_pending = true;
                 tip_guide             = true;
                 work.tip_cur          = cur;
-                work.selftest         = SELFTEST_DONE;
-                return;
+                type_guide_boot       = true;
+                /* 不在此收尾: 继续走 SELFTEST_VIN 做供电范围判定 —— 原实现
+                 * 直接 SELFTEST_DONE+return, 会漏掉本次开机的 9~30V 检查. */
             }
         }
         work.selftest = SELFTEST_VIN;
@@ -846,8 +856,12 @@ static void selftest_advance(void)
             work.selftest_code  = SELFTEST_CODE_NONE;
 
             /* 自检天然处于冷态: 当前型号未标定 → 置首次引导标志,
-             * 由 UI 层自动进 Cur Cal 引导先冷态标定, 再进入正常加热 */
-            boot_cal_eval();
+             * 由 UI 层自动进 Cur Cal 引导先冷态标定, 再进入正常加热.
+             * 但若本轮 HEAT_READ 已判出"型号不匹配(无害)"并建立了引导, 则保留其
+             * boot_cal_pending/tip_guide, 不再 boot_cal_eval —— 否则会按"当前配置
+             * 型号"重判(可能判为已标定)并清掉引导, 使不匹配的烙铁头被加热. */
+            if (!type_guide_boot)
+                boot_cal_eval();
 
             /* 恢复加热使能: 上面 SELFTEST_HEAT_READ 已 Heater_Disable(), 若此处不恢复,
              * 则当前型号已标定(boot_cal_pending=false)的设备自检通过后仍不加热 ——
@@ -1032,20 +1046,32 @@ static void run_pid_cycle(void)
     power = PID_Controller_Compute();
 
     /* 5.5 开环前馈预置: 温差大时按查表直接给大占空比, 加速冷启动/大焊点回温.
-     * PID 只负责接近设定后的稳态微调; 温差<10°C 时前馈归零, 完全不干扰稳态.
+     * PID 只负责接近设定后的稳态微调; 温差≤0 时前馈归零, 完全不干扰稳态.
      * 取 max 而非线性叠加, 升温段前馈接管, 避免 PID 积分从零缓慢爬升.
      * setpoint 取 PID_Controller_GetEffectiveSetpoint()(含 Boost 抬升后的有效目标),
      * 温差反映"距有效目标还差多少", 与 Boost 不冲突.
-     * 表值为 0~1000 尺度(与 PID_OUTPUT_MAX / HEATER_POWER_MAX 一致): 90%/60%/35%/18%. */
+     * 查表改为**段内线性插值**(断点 (0,0)(10,180)(25,350)(50,600)(100,900)) —— 原实现
+     * 是硬阶跃, diff 跨过 10°C 时 ff 从 180 直接归零, 输出瞬间最多掉 18% 占空比,
+     * 温度会下陷再靠 PID 爬回, 在接近设定点处易形成小振荡. 表值 0~1000 尺度. */
     {
+        static const int16_t ff_d[5] = { 0, 10, 25, 50, 100 };
+        static const int16_t ff_v[5] = { 0, 180, 350, 600, 900 };
         int16_t setpoint = PID_Controller_GetEffectiveSetpoint();
-        int16_t diff     = setpoint - meas_temp;   /* >0 = 需要加热 */
+        int16_t diff     = (int16_t)(setpoint - meas_temp);   /* >0 = 需要加热 */
         int16_t ff       = 0;
 
-        if      (diff > 100)  ff = 900;
-        else if (diff > 50)   ff = 600;
-        else if (diff > 25)   ff = 350;
-        else if (diff > 10)   ff = 180;
+        if (diff >= ff_d[4])
+            ff = ff_v[4];
+        else if (diff > 0)
+        {
+            uint8_t k;
+            for (k = 0; k < 4; k++)
+                if (diff < ff_d[k + 1])
+                    break;   /* 落在 (ff_d[k], ff_d[k+1]) 段 */
+            ff = (int16_t)(ff_v[k] +
+                 (int32_t)(ff_v[k + 1] - ff_v[k]) * (diff - ff_d[k]) /
+                 (ff_d[k + 1] - ff_d[k]));
+        }
 
         if (power < ff)
             power = ff;
