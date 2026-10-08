@@ -87,7 +87,9 @@ static int16_t  runtime_temp;
 
 /* 冷端补偿基准: CPU 内部温度(°C×10). 上电瞬间冷端≈环境≈CPU,
  * 之后环境/冷端漂移用 CPU 温度相对变化量近似捕捉, 规避 V25 芯片间散布.
- * 基准在上电 2s、滤波收敛后延后重取 (避开开机瞬时值). */
+ * 基准在上电 2s、滤波收敛后延后重取 (避开开机瞬时值).
+ * 仅真机模式使用(模拟模式无真实 ADC, 一并编译掉, 免生"未使用"告警). */
+#if !HW_SIM_MODE
 static int16_t  cpu_temp_ref;
 
 /* CPU 温度一阶低通滤波值: 补偿只应携带慢变的环境/冷端漂移,
@@ -95,9 +97,13 @@ static int16_t  cpu_temp_ref;
 static int16_t  cpu_temp_filt;
 static uint32_t boot_tick;      /* 上电时刻 (冷端基准延后采样用) */
 static bool     cpu_ref_ready;  /* 冷端基准已就绪(延后采样完成) */
+#endif
 
-/* 休眠/关机计时抑制: 校准等长流程置位, 期间不入睡(整定期间同样抑制, 见下方) */
+/* 休眠/关机计时抑制: 校准等长流程置位, 期间不入睡(整定期间同样抑制, 见下方).
+ * 仅真机模式使用(模拟模式整体禁用休眠/关机计时). */
+#if !HW_SIM_MODE
 static bool     sleep_suppress;
+#endif
 
 /* 校准页(Cur Cal)加热抑制: 页面期间只维持温度读数供"Cooling"显示,
  * 断热不控热, 让热态烙铁头自然降温到冷态后完成标定. */
@@ -178,8 +184,10 @@ static bool     tip_guide;
  *   分级处置: 危险(T12 量级进 450°C 配置) → 锁 Err4; 无害(450°C 级互插、
  *   T12 配置插 450°C 头) → 引导 Tip Cal 校正不锁死. */
 
+#if !HW_SIM_MODE
 static uint8_t classify_tip_cur(uint16_t cur);
 static bool is_t12_scale(uint16_t cur);
+#endif
 static bool type_cur_match(uint16_t cur, uint8_t idx);
 
 #if !HW_SIM_MODE
@@ -188,10 +196,14 @@ static int16_t cal_offset_interp(int16_t temp_base);
 static int16_t adc_to_temp(uint16_t adc_val);
 #endif
 
+#if !HW_SIM_MODE
 static uint16_t calc_vin_x10(uint16_t adc);
+#endif
 static void read_input_voltage(void);
 static void read_motion_sensor(void);
+#if !HW_SIM_MODE
 static void remember_last_temp(void);
+#endif
 static void check_sleep_shutdown(uint32_t now);
 
 static void latch_fault(bool *fault_flag);
@@ -200,9 +212,8 @@ static void check_heater_diagnostic(uint32_t now);
 static void boost_reset(void);
 static void boost_advance(int16_t meas_temp);
 
-static void boot_cal_eval(void);
-
 #if !HW_SIM_MODE
+static void boot_cal_eval(void);
 static void selftest_advance(void);
 #endif
 
@@ -210,9 +221,12 @@ static void run_pid_cycle(void);
 
 static void WorkTask_Retry(void);
 
+#if !HW_SIM_MODE
 static uint16_t pulse_cur_raw(void);
+#endif
 
 
+#if !HW_SIM_MODE
 static uint8_t classify_tip_cur(uint16_t cur)
 {
     uint16_t ref = TypeCal_GetRef(HANDLE_T12);
@@ -235,6 +249,7 @@ static bool is_t12_scale(uint16_t cur)
         floor = TYPE_CUR_COARSE_T12_MAX;
     return floor != 0 && (uint32_t)cur < floor;
 }
+#endif
 
 static bool type_cur_match(uint16_t cur, uint8_t idx)
 {
@@ -451,12 +466,14 @@ static int16_t adc_to_temp(uint16_t adc_val)
 
 /* 计算输入电压 (分压比 11:1, 3.3V 参考) */
 /* Vin = ADC * 3.3 / 4095 * 11, 输出 *10 (如 240 = 24.0V) */
+#if !HW_SIM_MODE
 static uint16_t calc_vin_x10(uint16_t adc)
 {
     /* Vin *10 = adc * 33 * 11 / 4095 = adc * 363 / 4095 */
     /* 简化为: adc * 363 / 4095 */
     return (uint16_t)((uint32_t)adc * 363 / 4095);
 }
+#endif
 
 /* 读取输入电压 */
 static void read_input_voltage(void)
@@ -485,7 +502,9 @@ static void read_motion_sensor(void)
 
 /* 记忆上次使用温度: 进入休眠/自动关机(会话结束)时, 把 HOME 运行时目标温度
  * 回写配置"开机温度"(default_temp), 下次上电由 WorkTask_Init 自动恢复.
- * 仅数值变化才落盘, 避免每次休眠都产生无谓的 Flash 擦写损耗. */
+ * 仅数值变化才落盘, 避免每次休眠都产生无谓的 Flash 擦写损耗.
+ * 仅真机模式使用(模拟模式不进入休眠/关机). */
+#if !HW_SIM_MODE
 static void remember_last_temp(void)
 {
     int16_t temp = runtime_temp;
@@ -501,20 +520,21 @@ static void remember_last_temp(void)
         (void)Config_Save();
     }
 }
+#endif
 
 /* 检查休眠/关机计时 */
 static void check_sleep_shutdown(uint32_t now)
 {
+#if HW_SIM_MODE
+    /* 模拟联调: 禁用休眠/自动关机计时, 长时间挂机不切状态不落盘,
+     * 便于稳定复现/排查其他 bug (真机行为不变).
+     * 用 #else 分块而非提前 return: 提前 return 会让下方整段成为"不可达"告警(#111). */
+    (void)now;
+#else
     /* SHUTDOWN 为会话终态, 无需再计时; SLEEP 必须继续计时, 否则入睡后
      * 自动关机永不触发(原实现对"非 ACTIVE"一律返回, 休眠态即免疫关机)。 */
     if (work.state == WORK_STATE_SHUTDOWN)
         return;
-
-#if HW_SIM_MODE
-    /* 模拟联调: 禁用休眠/自动关机计时, 长时间挂机不切状态不落盘,
-     * 便于稳定复现/排查其他 bug (真机行为不变) */
-    return;
-#endif
 
     /* 整定/校准/负载评估等受控长流程期间不入睡: 整定通常不足 2 分钟且用户在场观察,
      * 校准需长时间等温稳定; 评估记录期间入睡会切走目标温度、毁掉温度曲线 */
@@ -549,6 +569,7 @@ static void check_sleep_shutdown(uint32_t now)
         Heater_Disable();
         return;
     }
+#endif
 }
 
 /* 锁存一类保护故障并立即断热告警 (热电偶短路/开路、过流、加热器失效共用):
@@ -716,7 +737,9 @@ static void boost_advance(int16_t meas_temp)
 
 /* 首次引导判定: 当前配置型号无冷态电流参考(未标定) → 置引导标志.
  * 调用时机: 自检全链路通过(real, 天然冷态) / WorkTask_Init(sim, 直接完成),
- * 即"即将进入正常加热"前一刻. 用户完成标定或明确跳过后经 BootCalDone 清除. */
+ * 即"即将进入正常加热"前一刻. 用户完成标定或明确跳过后经 BootCalDone 清除.
+ * 仅真机模式使用(模拟模式在 WorkTask_Init 里直接跳过引导). */
+#if !HW_SIM_MODE
 static void boot_cal_eval(void)
 {
     work.boot_cal_pending = (TypeCal_GetRef(Config_GetHandleIdx()) == 0);
@@ -724,6 +747,7 @@ static void boot_cal_eval(void)
      * (tip_guide) 残留而头已换回匹配型号, 会持续断热导致焊台不加热 */
     tip_guide = false;
 }
+#endif
 
 #if !HW_SIM_MODE
 static void selftest_advance(void)
@@ -1091,10 +1115,12 @@ void WorkTask_Init(void)
     work.thermo_fault  = false;
     work.overtemp_fault = false;
     work.diag_tick = Timer_GetTick();
+#if !HW_SIM_MODE
     cpu_temp_filt = AD_GetCpuTempC();   /* 滤波以首次读数初始化, 避免从 0 爬升 */
     cpu_temp_ref  = cpu_temp_filt;      /* 临时基准: 上电 2s 后由 Process 延后重取 */
     boot_tick     = Timer_GetTick();
     cpu_ref_ready = false;
+#endif
 
     PID_Controller_SetSetpoint((int16_t)g_config.default_temp);
     PID_Controller_Reset();
@@ -1225,10 +1251,15 @@ void WorkTask_MarkActivity(void)
     }
 }
 
-/* 设置休眠/关机计时抑制 (校准等长流程置位, 退出时清除) */
+/* 设置休眠/关机计时抑制 (校准等长流程置位, 退出时清除).
+ * 模拟模式休眠/关机整体禁用, 该标志无作用, 一并编译掉免生"未使用"告警. */
 void WorkTask_SetSleepSuppress(bool en)
 {
+#if !HW_SIM_MODE
     sleep_suppress = en;
+#else
+    (void)en;
+#endif
 }
 
 /* 校准页(Cur Cal)加热抑制: 置位断热不控热(热态烙铁头自然降温到冷态完成
@@ -1285,8 +1316,15 @@ void WorkTask_OnHandleChanged(void)
 
     /* 引导标志与新型号对齐: 目标型号已标定 → 清除首次引导(残留标志会在回
      * HOME 后被 UI 层误拉进 Tip Cal); 目标未标定 → 置位, 由 handle 页引导
-     * 进 Cur Cal 完成标定. 保持"pending == 当前型号未标定"恒成立. */
+     * 进 Cur Cal 完成标定. 保持"pending == 当前型号未标定"恒成立.
+     * 模拟模式恒清: TypeCal 不落盘、电流为桩值 → 参考值恒 0, 置位会让 UI 每次
+     * 回 HOME 都被拉进首次引导页; 而该页在 cal_lock 下有意忽略 UP/DOWN, 表现为
+     * "旋转编码器无反应/像卡死". 口径与 WorkTask_Init 的模拟模式跳过引导一致。 */
+#if HW_SIM_MODE
+    work.boot_cal_pending = false;
+#else
     work.boot_cal_pending = (TypeCal_GetRef(Config_GetHandleIdx()) == 0);
+#endif
 
     /* 先重载 PID(内部 Reset), 再用新型号上限钳位目标并复位 */
     PID_Controller_Reload();
@@ -1550,9 +1588,18 @@ bool WorkTask_CheckChain(uint8_t idx)
 }
 
 /* 施加热芯测量脉冲并读取导通电流 (不判热态, 供自检/切换链检/Cur Cal 复用).
- * 阻塞约 200ms 待 PWM 稳定后读注入组电流, 返回前断热. */
+ * 阻塞约 200ms 待 PWM 稳定后读注入组电流, 返回前断热.
+ * 仅真机模式使用(模拟模式由 WorkTask_MeasurePulseCur 直接返回模拟值). */
+#if !HW_SIM_MODE
 static uint16_t pulse_cur_raw(void)
 {
+    /* 故障门: 已锁存故障(热电偶/过温/加热器/自检)时不得再输出测量脉冲.
+     * 换头"确认切换"路径(WorkTask_CheckChain)不经 handle_exit 的 !HasFault 门,
+     * 此处兜底 —— 返回 0 会被调用方判为"电流异常"从而拒绝该次操作.
+     * 与代码库其余位置"所有使能都过 !HasFault()"的不变式保持一致. */
+    if (WorkTask_HasFault())
+        return 0;
+
     Heater_Enable();
     Heater_SetPower(SELFTEST_PULSE_POWER);
     {
@@ -1564,6 +1611,7 @@ static uint16_t pulse_cur_raw(void)
     Heater_Disable();
     return cur;
 }
+#endif
 
 uint16_t WorkTask_MeasurePulseCur(void)
 {
