@@ -16,8 +16,7 @@ static void ota_wait_enter(void *user_data);
 static void ota_wait_exit(void *user_data);
 
 /* 事件处理: 本页要"停留等待"上位机握手, 故 CLICK/UP/DOWN 一律不响应(返回 OK 留守),
- * 只有长按才退出。这与只读信息页(PASSIVE_VIEW, 任意键即退)语义相反 —— 本页已从
- * 菜单表移除该标志, 退出裁决权收归这里。 */
+ * 只有长按才退出. 与只读信息页(任意键即退)语义相反, 退出裁决权在本 handler. */
 static menu_result_t ota_wait_handler(const menu_cmd_t *cmd, void *user_data)
 {
     (void)user_data;

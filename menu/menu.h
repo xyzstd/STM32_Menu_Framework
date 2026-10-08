@@ -1,4 +1,4 @@
-﻿#ifndef __MENU_H
+#ifndef __MENU_H
 #define __MENU_H
 
 #include <stdint.h>
@@ -12,7 +12,6 @@
 #define MENU_LEAF    0U       /* child_num: 叶子项无子项个数 */
 
 #define MENU_FLAG_DIRECT_HANDLER  0x01U   /* 常驻页: 进入/返回时直接激活为 handler(如 HOME) */
-#define MENU_FLAG_PASSIVE_VIEW    0x08U   /* 只读信息页: 任意事件(CLICK/LPRESS)一律退出, 无需 handler 样板 */
 
 typedef enum{
     MENU_EVENT_UP=0,
@@ -39,7 +38,10 @@ typedef enum{
 typedef uint16_t menu_period_t;
 
 /* 页面回调: 内核经 Menu_GetUserData(item) 注入业务上下文(user_data).
- * 表内显式填了 .user_data 则用之, 否则默认指向节点自身. 回调可忽略. */
+ * 表内显式填了 .user_data 则用之, 否则默认指向节点自身. enter/exit 可忽略.
+ *
+ * 契约: 提供 display(即"可激活为页面")的项, 必须同时提供 handler ——
+ * 否则该页进入 HANDLER 态后无法响应任何事件, menu_activate 会拒绝激活. */
 typedef struct{
     void (*enter)(void *user_data);
     menu_result_t (*handler)(const menu_cmd_t *cmd, void *user_data);
@@ -67,7 +69,7 @@ void *Menu_GetUserData(const menu_item_t *item);
 
 
 void Menu_Init(void);
-void Menu_HandleEvent(const menu_cmd_t *cmd);
+void Menu_EventDispatch(const menu_cmd_t *cmd);
 
 
 uint8_t Menu_GetCurrentId(void);
@@ -75,7 +77,7 @@ menu_state_t Menu_GetState(void);
 
 /* 强制跳转到指定节点(设置当前 id):
  * 离开当前页面(若有 HANDLER 态则调 exit 回调) → 定位到目标节点;
- * 目标为可激活页面(常驻页 DIRECT_HANDLER, 或带 display 回调的叶子页如
+ * 目标为可激活页面(常驻页 DIRECT_HANDLER, 或带 display+handler 的叶子页如
  * Cur Cal 引导页)则直接激活进 handler, 否则落在其父列表。
  * 用于异常处理: 任意页面发生锁存故障时回到常驻页 HOME 统一处理;
  * 亦用于首次冷态标定引导自动进入 Cur Cal 页。 */

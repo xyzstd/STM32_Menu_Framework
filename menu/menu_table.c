@@ -81,11 +81,10 @@ const menu_item_t menu_table[] =
         .parent      = 1,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
-        /* 有意不加 MENU_FLAG_PASSIVE_VIEW: 本页不是只读信息页, 而要"停留驻留"
-         * 等待上位机(display 里每 250ms 轮询 OTA_GetAppRequest() 并播等待动画).
-         * 加了该标志后内核会在任意 CLICK/LPRESS 上立即退出且不派发 handler,
-         * 用户根本无法停在本页等握手 → 升级页形同虚设.
-         * 退出手势改由页面 handler 自行裁决(见 ota_wait.c). */
+        /* 本页要"停留驻留"等待上位机(display 里每 250ms 轮询 OTA_GetAppRequest()
+         * 并播等待动画): 若内核在任意 CLICK/LPRESS 上立即退出, 用户就无法停在
+         * 本页等握手 → 升级页形同虚设. 故退出手势由页面 handler 自行裁决
+         * (只有长按才退出, 见 ota_wait.c). */
         .ops         = &ota_wait_ops,
         .name        = "固件升级",
     },
@@ -152,7 +151,7 @@ const menu_item_t menu_table[] =
         .parent      = 7,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
-        .flags       = MENU_FLAG_PASSIVE_VIEW,   /* 只读信息页: 任意事件即退 */
+        /* 只读信息页: 退出手势由 version_handler 裁决(任意 CLICK/LPRESS 即退) */
         .ops         = &version_ops,
         .name        = "版本信息",
     },

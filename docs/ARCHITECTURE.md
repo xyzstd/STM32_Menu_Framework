@@ -29,7 +29,7 @@ main/           main.c 主循环: Input → Buzzer → WorkTask → UI_Task → 
 
 ## 关键机制
 
-- **菜单表驱动**：`menu_item_t` 含 parent/first_child/flags，`flags` 声明式控制行为——`DIRECT_HANDLER` 常驻页、`PASSIVE_VIEW` 只读页（任意事件退出，无需 handler 样板）。新增页面 = 表加一行 + 写 ops。
+- **菜单表驱动**：`menu_item_t` 含 parent/first_child/flags，`flags` 声明式控制行为——`DIRECT_HANDLER` 常驻页（上电即激活、返回时直接回它）。新增页面 = 表加一行 + 写 ops；页面事件行为一律由 ops 回调裁决。
 - **状态机**：NORMAL 态渲染列表，HANDLER 态调用页面 ops；离场方向由 child_num 决定（有子项→下钻，无→回父）。
 - **输入统一**：TIM2 1ms 中断内采样，事件经 SPSC 环形队列交主循环消费；编码器用"齿格锚定"模型（`enc_pos`/`enc_det_pos`，走满 4 计数出事件 + 反向重锚），菜单导航与参数调节共用同一消费逻辑，不丢步。
 - **渲染三层协同**（软 I2C 瓶颈）：输入逐格消费 → 渲染合并(2ms) → `OLED_UpdateDiff` 页校验和差量推送，静止零推送。

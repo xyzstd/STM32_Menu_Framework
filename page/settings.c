@@ -292,7 +292,15 @@ const menu_ops_t reset_ops = {
     .display = reset_display,
 };
 
-/* ==================== 版本信息 (只读页: 由 MENU_FLAG_PASSIVE_VIEW 内核裁决, 无需 handler) ==================== */
+/* ==================== 版本信息 (只读页: 任意 CLICK/LPRESS 退出, 由本页 handler 裁决) ==================== */
+static menu_result_t version_handler(const menu_cmd_t *cmd, void *ud)
+{
+    (void)ud;
+    if (cmd->event == MENU_EVENT_CLICK || cmd->event == MENU_EVENT_LPRESS)
+        return MENU_RET_DONE;   /* 结束本页(叶子项) → 回父列表 */
+    return MENU_RET_OK;         /* UP/DOWN: 只读页无内容可滚, 忽略留守 */
+}
+
 static menu_period_t version_display(void *ud)
 {
     char ver[24];
@@ -315,5 +323,6 @@ static menu_period_t version_display(void *ud)
 }
 
 const menu_ops_t version_ops = {
+    .handler = version_handler,
     .display = version_display,
 };

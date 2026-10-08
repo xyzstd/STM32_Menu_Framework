@@ -1,4 +1,4 @@
-﻿#include "menu.h"
+#include "menu.h"
 
 typedef struct{
     uint8_t current;
@@ -37,7 +37,7 @@ void *Menu_GetUserData(const menu_item_t *item)
 }
 
 
-void Menu_HandleEvent(const menu_cmd_t *cmd)
+void Menu_EventDispatch(const menu_cmd_t *cmd)
 {
     if(!cmd)
         return;
@@ -81,15 +81,10 @@ void Menu_SetCurrentId(uint8_t id)
 
     menu_ctrl.current = id;
 
-    /* 目标为可激活页面(常驻页 DIRECT_HANDLER, 或带 display 回调的叶子页如
-     * Cur Cal 引导页): 直接激活为 handler, 保持页面渲染. 判定与 menu_activate
-     * 自身一致(以 display 回调为准); 内联参数项(INLINE_PARAM)无调用
-     * 方会跳转至此, 不受影响. */
-    {
-        const menu_item_t *target = menu_current();
-        if(target && target->ops && target->ops->display)
-            menu_activate();
-    }
+    /* 目标是否为可激活页面(常驻页 DIRECT_HANDLER, 或带 display+handler 的叶子页
+     * 如 Cur Cal 引导页)统一交给 menu_activate 判定, 此处不再重复条件 ——
+     * 不可激活(无 ops / 缺 display / 缺 handler)时 menu_activate 保持列表态. */
+    menu_activate();
 }
 
 
@@ -118,7 +113,12 @@ static const menu_item_t *menu_current(void)
 
 
 /* 激活当前节点为处理页: 切 HANDLER + 调 enter。
- * 不修改 current, 不做事件路由 —— 事件统一由 menu_state_handler 分发。 */
+ * 不修改 current, 不做事件路由 —— 事件统一由 menu_state_handler 分发。
+ *
+ * 可激活契约(单点把关): 页面须同时提供 display(可渲染) 与 handler(可响应事件).
+ * 只有 display 而无 handler 的页面在 HANDLER 态无法响应任何事件(既不能长按退出,
+ * 也处理不了 CLICK/UP/DOWN), 属无效配置 —— 一律不激活, 回落列表态.
+ * menu_state_handler 与 Menu_SetCurrentId 都经本函数进入 HANDLER, 故契约在此唯一判定. */
 static void menu_activate(void)
 {
     const menu_item_t *item=menu_current();
@@ -126,7 +126,7 @@ static void menu_activate(void)
     if(!item||!item->ops)
         return;
 
-    if(!item->ops->display)
+    if(!item->ops->display || !item->ops->handler)
     {
         menu_ctrl.state=MENU_STATE_NORMAL;
         return;
@@ -163,15 +163,6 @@ static void menu_state_handler(const menu_cmd_t *cmd)
         return;
     }
 
-    /* 只读信息页: 内核统一裁决 —— CLICK/LPRESS 退出, UP/DOWN 忽略(页面无内容可滚)。
-     * 契约: 该标志仅用于叶子项(child_num==0), 无子列表下钻语义, 故直接退出回父列表. */
-    if(item->flags & MENU_FLAG_PASSIVE_VIEW)
-    {
-        if(cmd->event==MENU_EVENT_CLICK || cmd->event==MENU_EVENT_LPRESS)
-            menu_exit_handler();
-        return;
-    }
-
     acted_id = menu_ctrl.current;
 
     switch(cmd->event)
@@ -179,15 +170,11 @@ static void menu_state_handler(const menu_cmd_t *cmd)
         case MENU_EVENT_UP:
         case MENU_EVENT_DOWN:
         case MENU_EVENT_CLICK:
-            if(item->ops->handler)
-                ret=item->ops->handler(cmd, Menu_GetUserData(item));
-            break;
-
         case MENU_EVENT_LPRESS:
+            /* 契约(见 menu_activate): 能进 HANDLER 态的页面必有 handler,
+             * 故不再为"无 handler"留兜底分支(原 LPRESS 的 else 退出已移除). */
             if(item->ops->handler)
                 ret=item->ops->handler(cmd, Menu_GetUserData(item));
-            else
-                menu_exit_handler();
             break;
 
         default:
