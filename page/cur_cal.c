@@ -105,8 +105,7 @@ static menu_result_t cur_cal_handler(const menu_cmd_t *cmd, void *ud)
                 WorkTask_BootCalDone();
             if (cal_boot)
             {
-                /* 跳 HOME 前清输入事件: 防残留旋转事件被 HOME 错位消费(误调温) */
-                Input_ClearEvents();   /* 跳转前丢弃积压事件, 防目标页错位消费 */
+                /* 跳转后由内核重同步编码器相位(见 input.c 的 menu_ctx) */
                 Menu_SetCurrentId(MENU_HOME_ID);   /* 引导模式: 标定完成回 HOME (exit 清标志) */
             }
         }
@@ -122,8 +121,7 @@ static menu_result_t cur_cal_handler(const menu_cmd_t *cmd, void *ud)
              * 未生效(细匹配无效 + 粗保护退化), 避免用户无感知降级 */
             if (TypeCal_GetRef(Config_GetHandleIdx()) == 0)
                 Buzzer_Beep(BUZZER_EVENT_ALARM);
-            /* 跳 HOME 前清输入事件: 防残留旋转事件被 HOME 错位消费(误调温) */
-            Input_ClearEvents();   /* 跳转前丢弃积压事件, 防目标页错位消费 */
+            /* 跳转后由内核重同步编码器相位(见 input.c 的 menu_ctx) */
             Menu_SetCurrentId(MENU_HOME_ID);   /* 跳过引导: 回 HOME (exit 清标志) */
             return MENU_RET_OK;
         }
@@ -246,6 +244,7 @@ void CurCal_BootEnter(void)
         cal_idx  = WorkTask_MatchTipType(WorkTask_GetTipCur());
     }
     Input_ClearEvents();   /* 跳转前丢弃积压事件, 防目标页错位消费 */
+    Input_ResyncEncoder(); /* 非事件触发跳转: 一并重同步编码器相位 */
     Menu_SetCurrentId(CUR_CAL_MENU_ID);
 }
 

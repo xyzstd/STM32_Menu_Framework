@@ -1,4 +1,4 @@
-﻿#include "stm32f10x.h"
+#include "stm32f10x.h"
 #include "key.h"
 #include "encoder.h"
 #include "input.h"
@@ -7,37 +7,27 @@
 #include "work_task.h"
 #include "timer.h"
 
-/* 一组 = 4 个硬件计数 = 1 个齿格 = 1 次菜单步. 菜单导航与参数编辑共用同一套消费逻辑. */
-#define ENC_GROUP_TICKS  4
+/* 单次轮询最多出的事件数: 编码器受扰(毛刺/电气噪声)时可能一次累积很多步,
+ * 若不设上限, 下方 for 会在一次轮询里入队上千次(耗时数毫秒), 期间主循环停摆、
+ * 队列被瞬间灌满并丢弃大量事件. 超限部分直接丢弃(正交计数已由 TIM4 硬件滤波
+ * 去毛刺, 正常旋转每 4ms 不过几步, 只有异常干扰才会触发上限). */
+#define ENC_MAX_EVENTS_PER_POLL  20
 
-/* 采样分频(ms): 定时器节拍 1ms. 注意与上面的"4 个硬件计数"量纲不同 ——
- * 前者是编码器计数, 后者是毫秒, 只是数值巧合相同. */
+/* 采样分频(ms): 定时器节拍 1ms. */
 #define KEY_SCAN_MS      5   /* 按键扫描间隔 */
-#define ENC_POLL_MS      4   /* 编码器轮询间隔 */
+#define ENC_POLL_MS      4   /* 编码器步数取走间隔 */
 
 /* 事件队列容量: 中断(生产者)入队, 主循环(消费者)出队.
- * 12ms 轮询内极速旋转的事件数远小于此, 满则丢弃最新, 可接受. */
+ * 4ms 轮询内极速旋转的事件数远小于此, 满则丢弃最新, 可接受. */
 #define INPUT_EVT_QUEUE_SIZE  32
 
 static key_info_t key;
-
-/* 位置锚定齿格消费: enc_pos 为累计计数(相对开机), 锚点 enc_det_pos 只在位置
- * 真正走过一个完整齿格(±4 计数)后才推进, 每次推进消费对应方向的一个事件:
- *   - 正反对称: 前进/后退各满 4 计数出一事件, 行程一致, 快速往返事件密度稳定;
- *   - 抖动免疫: 停在齿格边界附近时位置小幅回摆(±2 计数)不跨锚点, 不会产生
- *     "零位移消费一格再弹回"的伪事件对(中点触发模型在该场景的固有缺陷);
- *   - 转向重锚: 残留相位中突然反向时, 方向翻转确认即贴锚, 消除"还清残留"死区. */
-static int32_t enc_pos = 0;
-static int32_t enc_det_pos = 0;
-static int32_t enc_last_pos = 0;   /* 上一轮位置, 判运动方向 */
-static int8_t  enc_dir = 0;        /* 上一轮运动方向: 1=正, -1=反, 0=静止 */
-static uint8_t enc_static_cnt = 0; /* 位置连续静止的轮询轮数(静止吸合用) */
 
 /* 1ms 节拍与分频计数: 仅由 input_scan 在 TIM2 中断内读写(单上下文, 故无需 volatile).
  * scan_tick 为自由运行的毫秒节拍, 差值比较天然抗 2^32 回绕. */
 static uint32_t scan_tick = 0;   /* 1ms 节拍 */
 static uint32_t key_tick  = 0;   /* 上次按键扫描时刻 */
-static uint32_t enc_tick  = 0;   /* 上次编码器轮询时刻 */
+static uint32_t enc_tick  = 0;   /* 上次编码器取样时刻 */
 
 
 /* ==================== 事件队列 (SPSC 环形缓冲) ====================
@@ -51,10 +41,13 @@ static struct{
     volatile uint8_t tail;
 }evt_q;
 
-static bool evt_enqueue(uint8_t event, int16_t step);
+static void evt_enqueue(uint8_t event, int16_t step);
 static bool evt_dequeue(menu_cmd_t *out);
 
 static void menu_notify(menu_cmd_t *cmd);
+
+static uint16_t menu_ctx(void);
+
 static void on_key_event(key_event_t evt);
 
 static void encoder_process(void);
@@ -62,7 +55,7 @@ static void encoder_process(void);
 static void input_scan(void);
 
 
-static bool evt_enqueue(uint8_t event, int16_t step)
+static void evt_enqueue(uint8_t event, int16_t step)
 {
     uint8_t next = (uint8_t)((evt_q.tail + 1) % INPUT_EVT_QUEUE_SIZE);
 
@@ -79,16 +72,14 @@ static bool evt_enqueue(uint8_t event, int16_t step)
             {
                 evt_q.buf[last].event = (menu_event_t)event;
                 evt_q.buf[last].step  = step;
-                return true;
             }
         }
-        return false;   /* 仍满: 极端高速旋转或按键自身积压, 丢弃 */
+        return;   /* 满槽已按上述策略处理, 不再追加 */
     }
 
     evt_q.buf[evt_q.tail].event = (menu_event_t)event;
     evt_q.buf[evt_q.tail].step  = step;
     evt_q.tail = next;
-    return true;
 }
 
 static bool evt_dequeue(menu_cmd_t *out)
@@ -116,7 +107,7 @@ static void menu_notify(menu_cmd_t *cmd)
        (event == MENU_EVENT_UP || event == MENU_EVENT_DOWN))
         cmd->event = (event == MENU_EVENT_UP) ? MENU_EVENT_DOWN : MENU_EVENT_UP;
 
-    Menu_HandleEvent(cmd);
+    Menu_EventDispatch(cmd);
     UI_RequestRefresh();
 }
 
@@ -130,85 +121,49 @@ static void on_key_event(key_event_t evt)
 }
 
 
-/* 编码器采样(中断内): 位置超出锚点一个完整齿格(4 计数)才出方向事件入队, 方向映射在消费端.
- * 转向重锚: 位置在残留相位(未满 4 计数)中突然反向时, 若仍等满 4 计数才触发,
- * 需先"还清"残留(最多 3 计数)再凑满 4 → 最坏 7 计数死区(≈1.75 齿格无响应, 即"突然转向卡").
- * 方向翻转确认(反向 ≥1 计数)立即把锚点贴到当前位置, 反向从零起计, 死区压缩到 ≤1.25 齿格.
- * 贴锚只置 delta=0 不触发事件, 慢速防抖(伪事件对吸收)保持不变.
- * 入队语义: 正向=UP(增大), 反向=DOWN; 具体去向(列表下移/参数增减)由消费时状态决定. */
+/* 菜单"上下文"指纹: 高字节 = 内核状态(列表/页面), 低字节 = 页面或列表身份.
+ *   - HANDLER 态: 身份 = 当前页面 id;
+ *   - NORMAL  态: 身份 = 当前选中项的父级(同一列表内移动选择项, 身份不变).
+ * 指纹变化即代表发生了跨页/跨列表跳转, 此时让编码器重同步(丢弃未满一格的残留
+ * 相位), 避免旧上下文的相位被带入新页面 —— 否则残留与新转向反号时会吃掉新页面
+ * 第一格(表现为"进子菜单/返回后第一格不动, 要再转一格"). */
+static uint16_t menu_ctx(void)
+{
+    uint8_t id = Menu_GetCurrentId();
+
+    if (Menu_GetState() == MENU_STATE_NORMAL)
+    {
+        const menu_item_t *item = Menu_GetItem(id);
+        id = (item != NULL) ? item->parent : 0xFFU;   /* 同一列表 = 共同父级 */
+        return (uint16_t)((uint16_t)MENU_STATE_NORMAL << 8 | id);
+    }
+
+    return (uint16_t)((uint16_t)MENU_STATE_HANDLER << 8 | id);
+}
+
+
+/* 编码器取样(1ms 中断内, 每 4ms 真正取一次): 取走 bsp/encoder.c 累计的步数, 每步入队
+ * 一个方向事件. 正交计数、硬件去毛刺、以及"每格一步"的折算都在 encoder.c 完成,
+ * 此处只做"步 → 事件"的摊平, 不再持有任何位置/相位状态.
+ * 入队语义: 正向=UP(增大), 反向=DOWN; 具体去向(列表下移/参数增减)由消费端状态决定. */
 static void encoder_process(void)
 {
-    int32_t delta, n;
-    int8_t  dir;
+    int16_t n = Encoder_GetSteps();
+    int16_t i;
 
-    enc_pos += Encoder_GetDiff();                /* 硬件计数持续累计(差分读取无丢失) */
-    delta = enc_pos - enc_det_pos;
+    if (n == 0)
+        return;
 
-    dir = (enc_pos > enc_last_pos) ? 1 : (enc_pos < enc_last_pos) ? -1 : 0;
-    if (dir != 0 && enc_dir != 0 && dir != enc_dir &&
-        !(delta >= ENC_GROUP_TICKS || delta <= -ENC_GROUP_TICKS))
-    {
-        /* 转向: 残留相位预支 —— 锚点沿原方向再推残留量(带符号),
-         * 反向计数从 -|残留| 起计, 再走 4-|残留| 计数即出事件,
-         * 死区由 1 齿格压到 ≤半格(残留≥2 时生效).
-         * 注意: 残留必须经 enc_det_pos 偏移带入后续轮次, 不能只改本轮
-         * delta (delta 每轮由 enc_pos-enc_det_pos 重算, 单轮取反会被覆盖).
-         * 边界回摆(≤2 计数不跨新锚点 4 计数)仍无事件, 抖动免疫不变;
-         * 残留=0 的转向(转满一格后立刻反向)无残留可预支, 死区保持 1 齿格
-         * (满 4 计数锚定模型的固有下限, 突破需接受回摆伪事件, 不做). */
-        enc_det_pos = enc_pos + delta;
-        delta = -delta;
-    }
-    enc_dir = dir;
-    enc_last_pos = enc_pos;
+    /* 异常干扰保护: 单次取样步数封顶, 防止一次入队过多而阻塞中断 */
+    if (n > ENC_MAX_EVENTS_PER_POLL)
+        n = ENC_MAX_EVENTS_PER_POLL;
+    else if (n < -ENC_MAX_EVENTS_PER_POLL)
+        n = -ENC_MAX_EVENTS_PER_POLL;
 
-    /* 静止吸合(齿格吸附): 位置连续 2 个轮询周期(8ms)无变化即视为静止.
-     * 若残留相位已走满大半齿格(|delta|==3, 即 3/4 格)停住, 立即兑现 1 个方向
-     * 事件并贴锚, 消除"转了大半格停住但 UI 未动"的攒格延迟(用户"卡格"来源).
-     * 阈值取 3 而非 2 的权衡:
-     *   - |delta|<=2 的残留(≤半格)保留不动: 慢速逐格点动(每次 1~2 计数停)若被
-     *     清零会永不触发(更卡); 编码器回摆抖动(±2 计数)若被吸合会放大成伪事件
-     *     (破坏锚定模型抖动免疫);
-     *   - 连续旋转(dir!=0)不触发吸合, 正常满 4 计数出事件路径不变. */
-    if (dir == 0)
-    {
-        if (enc_static_cnt < 250)
-            enc_static_cnt++;
-        if (enc_static_cnt >= 2)
-        {
-            if (delta >= 3)
-            {
-                evt_enqueue(MENU_EVENT_UP, 1);
-                enc_det_pos = enc_pos;
-                delta = 0;
-            }
-            else if (delta <= -3)
-            {
-                evt_enqueue(MENU_EVENT_DOWN, 1);
-                enc_det_pos = enc_pos;
-                delta = 0;
-            }
-        }
-    }
-    else
-    {
-        enc_static_cnt = 0;
-    }
-
-    if (delta >= ENC_GROUP_TICKS)
-    {
-        n = delta / ENC_GROUP_TICKS;             /* 正向跨过的完整齿格数 */
-        enc_det_pos += n * ENC_GROUP_TICKS;
-        while (n-- > 0)
-            evt_enqueue(MENU_EVENT_UP, 1);
-    }
-    else if (delta <= -ENC_GROUP_TICKS)
-    {
-        n = delta / ENC_GROUP_TICKS;             /* 反向跨过的完整齿格数(负, 向零截断) */
-        enc_det_pos += n * ENC_GROUP_TICKS;
-        while (n++ < 0)
-            evt_enqueue(MENU_EVENT_DOWN, 1);
-    }
+    for (i = 0; i < n; i++)
+        evt_enqueue(MENU_EVENT_UP, 1);
+    for (i = 0; i > n; i--)
+        evt_enqueue(MENU_EVENT_DOWN, 1);
 }
 
 
@@ -246,7 +201,10 @@ static void input_scan(void)
  * 快速旋转时事件批量到达, 若 while 一次清空, 渲染合并窗口内会一次反映 N 格
  * (视觉"先不动后连续跳格"); 限流后事件按到达顺序摊平到后续各帧, 每帧 ≤2 格,
  * 跟手且吞吐(≈800/s)仍高于编码器物理事件率, 队列不积压不丢事件.
- * 菜单逻辑/Flash 落盘等耗时操作全部在主循环上下文执行, 不阻塞 1ms 输入节拍. */
+ * 菜单逻辑/Flash 落盘等耗时操作全部在主循环上下文执行, 不阻塞 1ms 输入节拍.
+ * 跳转重同步: 任一事件若使菜单上下文变化(跨页/跨列表), 让编码器丢弃当前半格残留
+ * (见 Encoder_RequestResync), 防旧上下文相位带入新页面吃掉新方向第一格.
+ * 注意: 队列里剩余的事件都是"本事件之后入队"的(FIFO), 属跳转后的有效输入, 不丢弃. */
 void Input_Process(void)
 {
     menu_cmd_t cmd;
@@ -254,9 +212,23 @@ void Input_Process(void)
 
     while (n < 2 && evt_dequeue(&cmd))
     {
+        uint16_t ctx_before = menu_ctx();
+
         n++;
         menu_notify(&cmd);
+
+        if (menu_ctx() != ctx_before)
+            Input_ResyncEncoder();   /* 上下文已变: 重同步编码器相位(不清队列) */
     }
+}
+
+
+/* 重同步编码器相位(丢弃未满一格的残留计数), 供菜单跳转后调用.
+ * 与 Input_ClearEvents 同层暴露: 页面/调度层(如 page/cur_cal.c、main/ui_task.c)
+ * 只依赖 input.h, 不直接触碰 bsp/encoder.h. */
+void Input_ResyncEncoder(void)
+{
+    Encoder_RequestResync();
 }
 
 

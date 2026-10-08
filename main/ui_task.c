@@ -60,6 +60,7 @@ void UI_Task_Process(void)
             /* 调节态的清理不必在此手工做: 若当前停在单参数页上, Menu_SetCurrentId
              * 会经 menu_exit_handler 调该页 ops->exit(内含 param_exit 落盘)。 */
             Input_ClearEvents(); /* 丢弃原页面积压事件, 防 HOME 错位消费(误下钻/恢复/调温) */
+            Input_ResyncEncoder(); /* 故障跳转非事件触发: 一并重同步编码器相位, 防跳转后第一格被残留吃掉 */
             Menu_SetCurrentId(MENU_HOME_ID);
             UI_RequestRefresh();
         }
@@ -77,6 +78,7 @@ void UI_Task_Process(void)
          * 防止引导切页后残留 UP/DOWN 意外切换 Tip Cal 预选型号(cal_lock=false)。
          * (调节态清理同故障路径, 由 Menu_SetCurrentId → menu_exit_handler 完成。) */
         Input_ClearEvents();
+        Input_ResyncEncoder(); /* 引导跳转非事件触发: 一并重同步编码器相位 */
         CurCal_BootEnter();
         UI_RequestRefresh();
     }

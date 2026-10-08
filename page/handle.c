@@ -1,5 +1,4 @@
 ﻿#include "menu.h"
-#include "input.h"
 #include "oled.h"
 #include "handle.h"
 #include "config.h"
@@ -99,16 +98,20 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
              * 冷态标定, 之后细匹配保护才对新型号生效; 3 种型号均已标定则
              * 无需跳转, 正常返回. 引导页已抑制加热, 热态头先显示 Cooling
              * 等降温; 与安全自检状态机无冲突: 自检仅上电阶段运行, 切换
-             * 检测脉冲与标定测量脉冲同源且顺序执行, 不会并发. */
+             * 检测脉冲与标定测量脉冲同源且顺序执行, 不会并发.
+             * 模拟模式跳过: TypeCal 不落盘、参考值恒 0, 照此每次切型号都会被
+             * 送进 Cur Cal 首次引导页; 而该页 cal_lock 有意忽略 UP/DOWN, 表现为
+             * "旋转编码器无反应". 口径与 WorkTask_Init/OnHandleChanged 一致。 */
+#if !HW_SIM_MODE
             if (cur_idx != prev_handle && TypeCal_GetRef(cur_idx) == 0)
             {
-                /* 进 Cur Cal 前清输入事件: 防残留 UP/DOWN 切掉 Tip Cal 预选型号.
-                 * 注意 CurCal_BootEnter() 内部自己调 Menu_SetCurrentId, 不经过
-                 * 本处, 故这行必须留在调用之前. */
-                Input_ClearEvents();
+                /* 跳转由内核统一收尾: 本处在事件分发中, 跳转后内核会重同步
+                 * 编码器相位(见 input.c 的 menu_ctx), 防旧相位带入新页面吃掉
+                 * 第一格. CurCal_BootEnter 内部另自带一次清理+重同步, 双保险. */
                 CurCal_BootEnter();
                 return MENU_RET_OK;
             }
+#endif
 
             /* 切换成功(与当前型号不同)直接回 HOME: 切换是"完成态"(断热/PID
              * 重载/目标钳位/Err4 自动重检均已收敛), 回 HOME 看温度继续焊接是
@@ -117,8 +120,7 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
              * 返回上一层. */
             if (cur_idx != prev_handle)
             {
-                /* 跳 HOME 前清输入事件: 防残留旋转事件被 HOME 错位消费(误调温) */
-                Input_ClearEvents();   /* 跳转前丢弃积压事件, 防目标页错位消费 */
+                /* 跳转后由内核重同步编码器相位(见 input.c 的 menu_ctx) */
                 Menu_SetCurrentId(MENU_HOME_ID);
                 return MENU_RET_OK;
             }
