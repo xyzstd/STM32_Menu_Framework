@@ -39,6 +39,7 @@ static struct {
     int16_t boost_offset;   /* 大焊点自动加温抬升量 °C (0~+, 叠加到有效设定值) */
 
     int32_t integral;       /* 积分累加值 *100 */
+    int32_t i_rem;          /* 积分增量的整除余数(±<100), 见 Compute 的"余数累加" */
     int16_t last_measured;  /* 上次实测温度, 微分先行用 */
     int32_t d_filter;       /* 微分低通滤波值 */
     bool     d_first;       /* 首次计算标志, 跳过首帧微分 */
@@ -75,6 +76,7 @@ void PID_Controller_Reset(void)
 {
     pid.output = 0;
     pid.integral = 0;
+    pid.i_rem = 0;
     pid.d_filter = 0;
     pid.last_measured = 0;
     pid.d_first = true;   /* 下次计算跳过首帧微分, 避免冷启动冲击 */
@@ -174,7 +176,15 @@ int16_t PID_Controller_Compute(void)
      * 全速区(ΔT>50°C)上方已清零积分, 不累计. */
     {
         int16_t lim = (error > 30 || error < -30) ? PID_INTEGRAL_LIMIT_AGG : PID_INTEGRAL_LIMIT;
-        pid.integral += (int32_t)cur_ki * error / PID_SCALE;
+        int32_t raw, inc;
+
+        /* 余数累加: 直接写 (ki*error)/100 会在 |error| < 100/ki 时整除截断为 0
+         * (ki 存 ×100, 保守组 0.60→60, 故 |error|<2 时积分完全停走), 稳态消不掉最后
+         * 1~2°C 偏差. 这里把未除尽的余数留到下一周期, 使小误差也能缓慢累积. */
+        raw = (int32_t)cur_ki * error + pid.i_rem;
+        inc = raw / PID_SCALE;
+        pid.i_rem = raw - inc * PID_SCALE;   /* 余数(与 raw 同号, 范围 ±<100) */
+        pid.integral += inc;
         if (pid.integral > lim)
             pid.integral = lim;
         else if (pid.integral < -lim)
