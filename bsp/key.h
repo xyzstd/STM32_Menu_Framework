@@ -1,4 +1,4 @@
-﻿#ifndef __KEY_H
+#ifndef __KEY_H
 #define __KEY_H
 
 #include "stm32f10x.h"
@@ -10,8 +10,8 @@
 enum{
     KEY_DELAY_TIME     = 4,    /* 20ms: 按下/松手确认门槛 */
     KEY_DOUBLE_TIME    = 0,    /* 双击判定窗口(ENABLE_DCLICK=0 时不用) */
-    KEY_LONG_TIME      = 120,  /* 600ms: 长按判定 */
-    KEY_ARM_LEVEL_TIME = 50    /* 250ms: 上电装填需连续见到的稳定高电平次数 */
+    KEY_LONG_TIME      = 80,  /* 400ms: 长按判定 */
+    KEY_ARM_LEVEL_TIME = 40    /* 200ms: 上电装填需连续见到的稳定高电平次数 */
 };
 
 /* 按键事件类型 */
