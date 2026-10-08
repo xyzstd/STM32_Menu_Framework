@@ -10,7 +10,9 @@
 #define HW_SIM_MODE           1
 
 #define CONFIG_MAGIC      0x5AA55AA5UL
-#define CONFIG_VERSION    11
+#define CONFIG_VERSION    12   /* 11→12: 修正 CRC 覆盖范围(原实现把 crc 字段自身纳入计算,
+                                * 见 config.c 的 *_calc_crc 注释). 旧数据 CRC 校验必失败,
+                                * 首启回落默认后即恢复正常持久化. */
 
 /* 配置 Flash 存储地址 (使用 App Flash 最后一页, 0x0803F800) */
 #define CONFIG_FLASH_ADDR  0x0803F800UL

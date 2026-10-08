@@ -1,6 +1,7 @@
 ﻿#include "config.h"
 #include "flash.h"
 #include <string.h>
+#include <stddef.h>   /* offsetof: CRC 覆盖范围与布局守卫 */
 
 config_t g_config;
 cal_t    g_cal;
@@ -119,20 +120,37 @@ static uint16_t crc16(const uint8_t *p, uint16_t len)
     return crc;
 }
 
+/* CRC 覆盖范围: 只算 crc 字段之前的字节.
+ * 必须用 offsetof(T, crc) 而非 sizeof(T) - sizeof(crc) —— 后者仅在"crc 恰为最后
+ * 2 字节且结构体尾部无对齐填充"时才等价. 本组结构体尾部都有填充(config_t 72/crc@68,
+ * cal_t 64/60, type_cal_t 16/12), 用 sizeof-2 会越过 crc、把 crc 字段自身也纳入计算,
+ * 使"保存写入的 crc"与"校验时算出的 crc"必然不等 → 每次上电都判数据损坏并回落默认
+ * (用户设置/校准全丢, 且每次开机多一轮 Flash 擦写). */
 static uint16_t config_calc_crc(const config_t *cfg)
 {
-    return crc16((const uint8_t *)cfg, sizeof(config_t) - sizeof(cfg->crc));
+    return crc16((const uint8_t *)cfg, (uint16_t)offsetof(config_t, crc));
 }
 
 static uint16_t cal_calc_crc(const cal_t *c)
 {
-    return crc16((const uint8_t *)c, sizeof(cal_t) - sizeof(c->crc));
+    return crc16((const uint8_t *)c, (uint16_t)offsetof(cal_t, crc));
 }
 
 static uint16_t typecal_calc_crc(const type_cal_t *c)
 {
-    return crc16((const uint8_t *)c, sizeof(type_cal_t) - sizeof(c->crc));
+    return crc16((const uint8_t *)c, (uint16_t)offsetof(type_cal_t, crc));
 }
+
+/* ===== 编译期布局守卫: cal_t 内 6 个校准数组必须"无填充连续" =====
+ * Cal_GetOff/Cal_GetAdc 用 ((T*)&cal_xxx_100)[idx*HANDLE_NUM + h] 跨数组线性寻址,
+ * 依赖数组之间没有对齐填充; 一旦编译器插入填充, 寻址会静默越界. 在此编译期拦下
+ * (违反即负数组长度 = 编译失败), 与 config.h 的数据页守卫同一手法. */
+typedef char guard_cal_off_contiguous[
+    (offsetof(cal_t, cal_adc_100) - offsetof(cal_t, cal_off_100)
+        == sizeof(int8_t) * CAL_POINT_NUM * HANDLE_NUM) ? 1 : -1];
+typedef char guard_cal_adc_contiguous[
+    (offsetof(cal_t, crc) - offsetof(cal_t, cal_adc_100)
+        == sizeof(uint16_t) * CAL_POINT_NUM * HANDLE_NUM) ? 1 : -1];
 
 /* 落盘一个数据页: 真机擦页后写入; 模拟模式仅保留 RAM 状态(仿真器擦写可能死等).
  * 三个 Save 共用, 避免各写一份 #if 分支导致规则漂移.
@@ -229,7 +247,9 @@ void Config_Load(void)
     else if (version == 10)
     {
         /* v10 旧布局: 逐字段迁移用户设置, 旧校准字段一并迁入独立校准页 (升级不丢校准).
-         * v10 CRC 已覆盖全结构, 含校准数据, 通过校验即视为数据可信. */
+         * 注: 校验沿用 sizeof-2 的覆盖范围(与旧固件一致). 旧固件同样存在"覆盖范围含
+         * crc 自身"的缺陷, 其写出的 v10 数据本就不可能通过校验 —— 即本迁移路径实际
+         * 不会命中; 保留原覆盖范围以免"修正后反而认下按旧缺陷写出的数据". */
         config_v10_t old;
         Flash_Read(CONFIG_FLASH_ADDR, &old, sizeof(old));
 
@@ -256,7 +276,7 @@ void Config_Load(void)
         g_config.brightness    = old.brightness;
 
         cal_migrate_v10(&old);   /* 旧校准迁入独立页 (校验通过, 数据可信) */
-        (void)Config_Save();   /* 回写 v11 布局 */
+        (void)Config_Save();   /* 回写当前版本布局 */
     }
     else
     {
