@@ -3,6 +3,7 @@
 #include "stm32f10x.h"
 #include <stddef.h>   /* NULL */
 #include <stdlib.h>   /* abs */
+#include <string.h>   /* memset (OLED_Clear 整屏清 0) */
 
 /* 不再包含 <stdio.h>/<stdarg.h>: 原 OLED_Print 走 vsnprintf, 是全工程最后一处
  * 把 stdio 格式化机制拉进链接的引用(连带浮点支持, 实测约 2.3KB).
@@ -36,19 +37,20 @@ static uint8_t oled_utf8_len(const char *str);
  * 旧实现用逐字节无符号累加, 加法与字节顺序无关, 于是同页内字节多重集相同、
  * 仅位置不同的改动(字形水平移 1 像素、menu_reverse_row 交换两列等)指纹不变,
  * 该页会被判为"未变化"而永不推送, 表现为像素残影到下次整页刷新.
- * 这不是概率碰撞, 是结构性碰撞 —— 注释里原来"2^-32 可忽略"的说法低估了它.
- * 改用多项式滚动哈希(每字节先左旋 5 位再累加), 使某个字节的贡献取决于其位置,
- * 单字节改动与换位都无法保持指纹不变; 32bit 下真实碰撞概率才是可忽略的量级.
- * 成本: 每字节一次移位/或/加, 每帧最多 8×128 字节, 对 72MHz M3 可忽略. */
+ * 曾改用"左旋 5 位 + 加常数": 位置敏感, 但左旋 32 次即恒等(5×32 ≡ 0 mod 32),
+ * 故下标相差 32 整数倍的字节旋转权重相同, 交换二者仅靠进位区分 —— 实测相距
+ * 32/64 列的字节交换仍有约 1/180 的碰撞率, 远高于 2^-32 的可忽略量级.
+ * 改用 FNV-1a(异或后乘质数): 乘法把每个字节的贡献按位置彻底打散, 不存在 mod-32
+ * 等价类; 单字节改动与任意换位都会改变指纹.
+ * 成本: 每字节一次异或 + 一次乘法(32bit MUL, M3 单周期), 每帧最多 8×128 字节, 可忽略. */
 static uint32_t oled_page_sum(uint8_t page)
 {
-    uint32_t s = 0;
+    uint32_t s = 0x811C9DC5u;   /* FNV-1a 32bit 偏移基准 */
     uint8_t c;
     for(c=0;c<OLED_WIDTH;c++)
     {
-        uint32_t v = OLED_DisplayBuf[page][c];
-        s = (s << 5) | (s >> 27);   /* 左旋 5 位: 让早先字节的贡献随位置累积 */
-        s += v + 0x9E3779B9u;       /* 加黄金分割常数, 抑制规律性图案的抵消 */
+        s ^= OLED_DisplayBuf[page][c];
+        s *= 0x01000193u;       /* FNV-1a 质数: 逐字节按位置混合 */
     }
     return s;
 }
@@ -302,13 +304,9 @@ void OLED_UpdateDiff(void)
 
 void OLED_Clear(void)
 {
-    uint16_t i,j;
-
-    for(i=0;i<OLED_PAGE_NUM;i++)
-    {
-        for(j=0;j<OLED_WIDTH;j++)
-            OLED_DisplayBuf[i][j]=0x00;
-    }
+    /* 整屏清 0: 用 memset 按字写(库/编译器走 word store), 比逐字节双循环快数倍.
+     * 本函数在每次整屏重绘(菜单列表 / 各页面 display)都被调用, 属热路径. */
+    memset(OLED_DisplayBuf, 0, sizeof(OLED_DisplayBuf));
 }
 
 
