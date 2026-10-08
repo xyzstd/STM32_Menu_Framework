@@ -190,8 +190,8 @@ uint16_t AD_GetValue(uint8_t channel_adc)
             break;
     }
 
-    /* 去极值平均: 丢弃一帧最大、一帧最小(偶发毛刺/PWM 开关沿), 对剩余帧求平均,
-     * 再按比例放大回满采样数, 避免被单帧毛刺拉偏。 */
+    /* 去极值平均: 丢弃一帧最大、一帧最小(偶发毛刺/PWM 开关沿), 对剩余 N-2 帧求均值
+     * (四舍五入), 避免被单帧毛刺拉偏。 */
     sum -= (uint32_t)vmin + vmax;
     return (uint16_t)((sum + TEMP_OVERSAMPLE / 2) / (TEMP_OVERSAMPLE - 2));
 }
@@ -235,9 +235,16 @@ int16_t AD_GetCpuTempC(void)
 uint16_t AD_GetCurrent(void)
 {
     uint16_t i_off, i_on;
-    bool fresh = adc_cur_fresh;
+    bool     fresh;
+    uint32_t primask;
 
+    /* 读-清须原子: 若注入中断恰在"读标志"与"清标志"之间置位(新导通采样到达),
+     * 会把该次置位误清掉 → 本次读成"无电流". 关中断仅数条指令, 主循环上下文可忽略. */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    fresh = adc_cur_fresh;
     adc_cur_fresh = false;
+    __set_PRIMASK(primask);
 
     if (!fresh)
         return 0;
