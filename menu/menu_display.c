@@ -6,13 +6,6 @@
 #define MENU_LINES_PER_PAGE (OLED_HEIGHT / OLED_8X16)
 #define MENU_ITEM_HEIGHT OLED_8X16
 
-#if MENU_ANIM_ENABLE
-static int16_t menu_item_y(uint8_t id, uint8_t first, uint8_t page_start)
-{
-    return (int16_t)((id - page_start) * MENU_ITEM_HEIGHT);
-}
-#endif
-
 /* 环形滚动窗口状态: 窗口顶行项(相对 first 的下标) + 高亮所在行(0..lines-1)。
  * 高亮在窗口内逐格移动; 到达窗口边缘时才整体滚动一行; 首↔末由取模保证连续。
  * 不变量: 静止时 (win_top + win_cursor) % count == index。 */
@@ -23,7 +16,8 @@ static uint8_t win_cursor = 0;   /* 高亮所在行(0..lines-1) */
 static uint8_t win_prev   = 0;   /* 上一帧选中下标, 用于判定移动方向(含环回) */
 static bool    win_entry_pending = false;   /* 刚离开列表态(渲染过页面): 下次进入列表按"新进入"复位窗口 */
 
-static bool menu_list_advance(uint8_t index, uint8_t first, uint8_t count);
+static void menu_window_reset(uint8_t index, uint8_t first, uint8_t count);
+static void menu_list_advance(uint8_t index, uint8_t first, uint8_t count);
 
 static void menu_draw_dot(int16_t yc);
 static void menu_draw_chevron(int16_t y);
@@ -34,24 +28,29 @@ static menu_period_t menu_list_display(void);
 static menu_period_t menu_page_display(void);
 
 
-/* 环形窗口状态推进: 依当前选中下标(index)与上一帧(win_prev)更新 win_top/win_cursor。
- * 返回 true 为进入新列表/选中跳变(需全量重绘); false 为窗口内正常移动。 */
-static bool menu_list_advance(uint8_t index, uint8_t first, uint8_t count)
+/* 窗口复位: 顶行定格选中项, 高亮落在首行.
+ * 进入新列表 / 列表结构变化 / 从页面态返回首项时调用 ——
+ * 保证高亮必在可见窗口内(从子列表返回时选中项 index 可能 ≥ 每页行数,
+ * 若仍定格 0 会滚出可见窗口而丢失反显). */
+static void menu_window_reset(uint8_t index, uint8_t first, uint8_t count)
+{
+    win_first  = first;
+    win_count  = count;
+    win_top    = index;
+    win_cursor = 0;
+    win_prev   = index;
+}
+
+/* 环形窗口状态推进: 依当前选中下标(index)与上一帧(win_prev)更新 win_top/win_cursor。 */
+static void menu_list_advance(uint8_t index, uint8_t first, uint8_t count)
 {
     uint8_t lines_per_page = MENU_LINES_PER_PAGE;
 
     /* 进入新列表(或列表结构变化): 窗口顶行定格选中项, 高亮末行首行 */
     if (first != win_first || count != win_count)
     {
-        /* 列表切换: 窗口顶行落到选中项, 保证高亮第一行必在可见窗口内。
-         * 首次进入列表 index=0, 行为与 win_top=0 一致; 但"从子列表返回"时
-         * 选中项 index 可能 ≥ 每页行数, 若仍定格 0 会滚出可见窗口而丢失反显。 */
-        win_first  = first;
-        win_count  = count;
-        win_top    = index;
-        win_cursor = 0;
-        win_prev   = index;
-        return true;
+        menu_window_reset(index, first, count);
+        return;
     }
 
     if (count > 1)
@@ -71,7 +70,7 @@ static bool menu_list_advance(uint8_t index, uint8_t first, uint8_t count)
                     top += (int16_t)count;
                 win_top    = (uint8_t)(top % (int16_t)count);
                 win_prev   = index;
-                return true;
+                return;
             }
         }
 
@@ -114,10 +113,7 @@ static bool menu_list_advance(uint8_t index, uint8_t first, uint8_t count)
     {
         win_top    = index;
         win_cursor = 0;
-        return true;
     }
-
-    return false;
 }
 
 
@@ -266,11 +262,7 @@ static menu_period_t menu_list_display(void)
         win_entry_pending = false;
         if (index == 0)
         {
-            win_first  = first;
-            win_count  = count;
-            win_top    = index;
-            win_cursor = 0;
-            win_prev   = index;
+            menu_window_reset(index, first, count);
             menu_list_render(first, count, index);
             return 0;
         }
