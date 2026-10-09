@@ -2,13 +2,16 @@
 #include "serial.h"
 #include "misc.h"
 
-#define SERIAL_RX_BUF_SIZE  512U
 #define UART_BAUDRATE       115200U   /* OTA 通信固定波特率 */
-static volatile uint8_t  rx_buf[SERIAL_RX_BUF_SIZE];
-static volatile uint16_t rx_head;
-static volatile uint16_t rx_tail;
 
-/* 接收回调(注册者: ota_boot). volatile: 主循环注册, 中断随时读取 */
+/* 接收回调(注册者: ota_boot). volatile: 主循环注册, 中断随时读取.
+ *
+ * 本驱动只做"把每个收到的字节派发给注册者"——不维护接收缓冲、不识别协议.
+ * 历史: 曾内置 512B 环形缓冲(rx_buf/head/tail)与 Serial_Available/ReadByte、
+ * 以及 Serial_SendByte/SendBuf, 但全工程零调用(OTA 只需识别 3 字节请求序列,
+ * 走本回调即可). 该缓冲只写不读: map 实证 rx_buf 常驻 .bss 512 字节
+ * (占 ZI 约 16%), 每收一字节还白做一次入环/判满. 已整段移除, 接收路径
+ * 收敛为"ISR 直接派发回调". 若日后需要通用 TX/RX 接口, 再按需加回. */
 static volatile serial_rx_fn rx_cb = NULL;
 
 void Serial_SetRxCallback(serial_rx_fn fn)
@@ -49,45 +52,16 @@ void Serial_Init(void)
     nvic.NVIC_IRQChannelCmd                = ENABLE;
     NVIC_Init(&nvic);
 
-    rx_head = rx_tail = 0;
     USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
     USART_Cmd(USART1, ENABLE);
-}
-
-void Serial_SendByte(uint8_t Byte)
-{
-    USART_SendData(USART1, Byte);
-    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET) {}
-}
-
-void Serial_SendBuf(const uint8_t *buf, uint16_t len)
-{
-    while (len--) Serial_SendByte(*buf++);
-}
-
-uint16_t Serial_Available(void)
-{
-    return (uint16_t)((rx_head - rx_tail + SERIAL_RX_BUF_SIZE) % SERIAL_RX_BUF_SIZE);
-}
-
-uint8_t Serial_ReadByte(void)
-{
-    uint8_t b = rx_buf[rx_tail];
-    rx_tail = (rx_tail + 1) % SERIAL_RX_BUF_SIZE;
-    return b;
 }
 
 void Serial_RxIRQHandler(void)
 {
     if (USART_GetITStatus(USART1, USART_IT_RXNE) != RESET) {
         uint8_t b = (uint8_t)USART_ReceiveData(USART1);
-        uint16_t next = (rx_head + 1) % SERIAL_RX_BUF_SIZE;
-        if (next != rx_tail) {
-            rx_buf[rx_head] = b;
-            rx_head = next;
-        }
-        /* 额外派发一份给注册者(OTA 请求序列识别). 经回调而非直接调用:
-         * 本驱动不认识 OTA 协议, 也不再依赖 ota/ 的头文件. */
+        /* 直接派发给注册者(OTA 请求序列识别). 经回调而非直接调用:
+         * 本驱动不认识 OTA 协议, 也不依赖 ota/ 的头文件. */
         if (rx_cb)
             rx_cb(b);
     }
