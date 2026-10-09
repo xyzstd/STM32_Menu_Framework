@@ -678,6 +678,12 @@ static void boost_advance(int16_t meas_temp)
         if (diff_eff <= BOOST_RECOVER_HYS)
         {
             boost_target   = 0;
+            /* 正常恢复也必须清零"本次持续计时": 步进门(见 run_pid_cycle 第8步
+             * `if (boost_rt == 0) check_heater_diagnostic`)以 boost_rt==0 判
+             * "非抬升期". 只清 boost_target 会让 boost_rt 停在恢复时的正值,
+             * 于是加热器故障诊断在本次开机剩余时间里被永久抑制 ——
+             * 加热丝真实失效(尤其 T245/T210 热电偶独立于加热丝)将既不加热也不报警. */
+            boost_rt       = 0;
             /* 正常恢复也给短冷却: 否则连续大负载(焊点一个接一个)会在回落瞬间
              * 再次触发, 使抬升量长期贴着上限、功率被反复抢占 */
             boost_cooldown = BOOST_RECOVER_COOLDOWN_MS;
@@ -1140,6 +1146,12 @@ void WorkTask_Init(void)
     work.diag_temp_last = work.measured_temp;
     work.thermo_fault  = false;
     work.overtemp_fault = false;
+    /* 以下三项原先依赖"文件级 static 结构零初始化"碰巧成立(state=0=ACTIVE,
+     * heater_fault/tip_cur=0); 显式写出, 与相邻字段一致, 免枚举顺序/存储类
+     * 变化时读到脏值. */
+    work.state         = WORK_STATE_ACTIVE;
+    work.heater_fault  = false;
+    work.tip_cur       = 0;
     work.diag_tick = Timer_GetTick();
 #if !HW_SIM_MODE
     cpu_temp_filt = AD_GetCpuTempC();   /* 滤波以首次读数初始化, 避免从 0 爬升 */
