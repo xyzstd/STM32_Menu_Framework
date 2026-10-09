@@ -1,4 +1,4 @@
-#include "menu.h"
+﻿#include "menu.h"
 
 typedef struct{
     uint8_t current;
@@ -7,7 +7,7 @@ typedef struct{
 
 static menu_ctrl_t menu_ctrl;
 
-static const menu_item_t *menu_current(void);
+static const menu_item_t *menu_current_item(void);
 
 static void menu_activate(void);
 static void menu_exit_handler(void);
@@ -25,14 +25,12 @@ void Menu_Init(void)
 {
     menu_ctrl.current=MENU_HOME_ID;
     menu_ctrl.state=MENU_STATE_NORMAL;
-    menu_activate();   /* 上电即激活常驻页(HOME)进入 handler */
+    menu_activate();  
 }
 
 
 void *Menu_GetUserData(const menu_item_t *item)
 {
-    /* 表内显式填了 user_data 用之, 否则默认指向节点自身,
-     * 使回调无需在表中填写也能获得非空且可用的上下文 */
     return (item->user_data) ? item->user_data : (void *)item;
 }
 
@@ -65,7 +63,10 @@ menu_state_t Menu_GetState(void)
  * 不改动列表滚动/差量渲染等既有逻辑; 渲染层经 GetCurrentId/GetState 自动适配. */
 void Menu_SetCurrentId(uint8_t id)
 {
-    if(id >= menu_max_num)
+    /* 0 = 占位虚拟根(ops=NULL, 且不属于任何列表): 若置为 current, 渲染层
+     * Menu_GetSiblingRange(0) 返回 false → menu_list_display 不渲染, 画面冻结在
+     * 上一帧. 连同越界一并拦截. (MENU_NO_PARENT/MENU_NO_CHILD 同为 0, 是哨兵值.) */
+    if(id == 0 || id >= menu_max_num)
         return;
 
     /* 真无操作才提前返回: 仅当"已在目标节点 且 该节点已是活动 handler 态".
@@ -78,6 +79,12 @@ void Menu_SetCurrentId(uint8_t id)
 
     if(menu_ctrl.state == MENU_STATE_HANDLER)
         menu_exit_handler();   /* 离开当前页面: 调 exit 回调, 回落 NORMAL */
+
+    /* exit 回调内若自行跳页(重入 Menu_SetCurrentId), 会重新激活为 HANDLER;
+     * 此时当前节点已被它接管, 不再覆盖 —— 否则会把内层跳转的目标冲掉.
+     * (menu_exit_handler 已先置 NORMAL, 故非重入时此处 state 必为 NORMAL.) */
+    if(menu_ctrl.state == MENU_STATE_HANDLER)
+        return;
 
     menu_ctrl.current = id;
 
@@ -97,13 +104,7 @@ const menu_item_t *Menu_GetItem(uint8_t id)
 }
 
 
-const menu_item_t *Menu_GetCurrent(void)
-{
-    return menu_current();
-}
-
-
-static const menu_item_t *menu_current(void)
+static const menu_item_t *menu_current_item(void)
 {
     if(menu_ctrl.current>=menu_max_num)
         return NULL;
@@ -121,7 +122,7 @@ static const menu_item_t *menu_current(void)
  * menu_state_handler 与 Menu_SetCurrentId 都经本函数进入 HANDLER, 故契约在此唯一判定. */
 static void menu_activate(void)
 {
-    const menu_item_t *item=menu_current();
+    const menu_item_t *item=menu_current_item();
 
     if(!item||!item->ops)
         return;
@@ -141,18 +142,21 @@ static void menu_activate(void)
 
 static void menu_exit_handler(void)
 {
-    const menu_item_t *item=menu_current();
+    const menu_item_t *item=menu_current_item();
+
+    /* 先落地 NORMAL 再调 exit: exit 回调内若(将来)调用 Menu_SetCurrentId, 会因
+     * state 已是 NORMAL 而走正常路径, 不会再次进入本函数(重复调 exit / 递归).
+     * 回调期间 current 仍指向本页, 故回调里读 Menu_GetCurrentId() 仍是离开前的页面. */
+    menu_ctrl.state=MENU_STATE_NORMAL;
 
     if(item&&item->ops&&item->ops->exit)
         item->ops->exit(Menu_GetUserData(item));
-
-    menu_ctrl.state=MENU_STATE_NORMAL;
 }
 
 
 static void menu_state_handler(const menu_cmd_t *cmd)
 {
-    const menu_item_t *item=menu_current();
+    const menu_item_t *item=menu_current_item();
     menu_result_t ret=MENU_RET_OK;
     bool has_children;   /* 是否下钻子列表: 先取, 避免依赖"退出 handler 后 current 不变"的隐式约定 */
     uint8_t acted_id;    /* 派发时所在节点 id, 供下面判断 handler 是否已经自行跳页 */
@@ -171,8 +175,6 @@ static void menu_state_handler(const menu_cmd_t *cmd)
         case MENU_EVENT_DOWN:
         case MENU_EVENT_CLICK:
         case MENU_EVENT_LPRESS:
-            /* 契约(见 menu_activate): 能进 HANDLER 态的页面必有 handler,
-             * 故不再为"无 handler"留兜底分支(原 LPRESS 的 else 退出已移除). */
             if(item->ops->handler)
                 ret=item->ops->handler(cmd, Menu_GetUserData(item));
             break;
@@ -228,20 +230,17 @@ static void menu_state_normal(const menu_cmd_t *cmd)
 
 static void menu_enter(void)
 {
-    const menu_item_t *item=menu_current();
+    const menu_item_t *item=menu_current_item();
 
     if(!item)
         return;
 
     if(item->child_num)
     {
-        /* 进入子菜单: 落在首项; 防御菜单表配置, 校验半开区间 [first_child, end) 不越界,
-         * 与 Menu_GetSiblingRange 的判据保持一致, 防误配 child_num 把 current 设为表外节点 */
         uint16_t end = (uint16_t)item->first_child + item->child_num;
         if(item->first_child >= menu_max_num || end > menu_max_num)
             return;
-        /* 不变式: 容器下钻后必为列表态。当前两个调用路径(列表 CLICK / 常驻页 DONE)本就
-         * 处于 NORMAL, 此处显式落地, 防未来在 HANDLER 态误触容器下钻导致列表被当页面渲染 */
+
         menu_ctrl.state = MENU_STATE_NORMAL;
         menu_ctrl.current = item->first_child;
     }
@@ -254,7 +253,7 @@ static void menu_enter(void)
 
 static void menu_back(void)
 {
-    const menu_item_t *item=menu_current();
+    const menu_item_t *item=menu_current_item();
     const menu_item_t *target;
 
     if(!item)
@@ -272,7 +271,7 @@ static void menu_back(void)
     
 
     /* 回到常驻页(如 HOME): 直接激活为 handler, 保持常驻显示 */
-    target=menu_current();
+    target=menu_current_item();
     if(target && (target->flags & MENU_FLAG_DIRECT_HANDLER))
         menu_activate();
 }

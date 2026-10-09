@@ -1,4 +1,4 @@
-#ifndef __MENU_H
+﻿#ifndef __MENU_H
 #define __MENU_H
 
 #include <stdint.h>
@@ -37,11 +37,6 @@ typedef enum{
 
 typedef uint16_t menu_period_t;
 
-/* 页面回调: 内核经 Menu_GetUserData(item) 注入业务上下文(user_data).
- * 表内显式填了 .user_data 则用之, 否则默认指向节点自身. enter/exit 可忽略.
- *
- * 契约: 提供 display(即"可激活为页面")的项, 必须同时提供 handler ——
- * 否则该页进入 HANDLER 态后无法响应任何事件, menu_activate 会拒绝激活. */
 typedef struct{
     void (*enter)(void *user_data);
     menu_result_t (*handler)(const menu_cmd_t *cmd, void *user_data);
@@ -64,7 +59,6 @@ typedef struct{
 extern const menu_item_t menu_table[];
 extern const uint8_t menu_max_num;
 
-/* 取节点回调的业务上下文: 显式填 .user_data 用之, 否则默认指向节点自身 */
 void *Menu_GetUserData(const menu_item_t *item);
 
 
@@ -84,7 +78,6 @@ menu_state_t Menu_GetState(void);
 void Menu_SetCurrentId(uint8_t id);
 
 const menu_item_t *Menu_GetItem(uint8_t id);
-const menu_item_t *Menu_GetCurrent(void);
 
 bool Menu_GetSiblingRange(uint8_t id,uint8_t *first,uint8_t *last);
 
