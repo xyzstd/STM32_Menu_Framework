@@ -147,11 +147,6 @@ void OLED_ShowNum(int16_t x,int16_t y,
                   int32_t num,
                   uint8_t len);
 
-/* Right-aligned integer padded with spaces (printf "%*d"); OLED_ShowNum pads '0'. */
-void OLED_ShowNumPad(int16_t x,int16_t y,
-                     int32_t num,
-                     uint8_t len);
-
 
 /*================ 16x32 =================*/
 

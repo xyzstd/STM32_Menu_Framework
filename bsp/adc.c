@@ -22,9 +22,7 @@
 typedef struct
 {
     uint8_t  adc_ch;      /* ADC 通道号 */
-    uint8_t  chan_index;  /* ADC_Channel_x */
     uint16_t gpio_pin;    /* 对应 GPIO */
-    uint8_t  report_slot; /* 在报告数组中的下标 */
 } adc_chan_cfg_t;
 
 #define ADC_CHANNEL_COUNT   3
@@ -55,9 +53,9 @@ static volatile bool adc_cur_fresh;
 
 static const adc_chan_cfg_t chan_cfgs[ADC_CHANNEL_COUNT] =
 {
-    { 0,  ADC_Channel_0,  GPIO_Pin_0, 0 }, /* 热电偶 T12 */
-    { 2,  ADC_Channel_2,  GPIO_Pin_2, 2 }, /* 输入电压    */
-    { 16, ADC_Channel_16, 0,          3 }, /* CPU 内部温度(冷端补偿参考, 无外部引脚) */
+    { 0,  GPIO_Pin_0 }, /* 热电偶 T12 */
+    { 2,  GPIO_Pin_2 }, /* 输入电压    */
+    { 16, 0          }, /* CPU 内部温度(冷端补偿参考, 无外部引脚) */
 };
 
 void AD_Init(void)

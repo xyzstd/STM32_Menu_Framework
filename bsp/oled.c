@@ -7,7 +7,7 @@
 
 /* 不再包含 <stdio.h>/<stdarg.h>: 原 OLED_Print 走 vsnprintf, 是全工程最后一处
  * 把 stdio 格式化机制拉进链接的引用(连带浮点支持, 实测约 2.3KB).
- * 文案拼接改用 oled_pair_cat, 数值显示改用 OLED_ShowNum/OLED_ShowNumPad. */
+ * 文案拼接改用 oled_pair_cat, 数值显示改用 OLED_ShowNum. */
 
 uint8_t OLED_DisplayBuf[OLED_PAGE_NUM][OLED_WIDTH];
 
@@ -1103,28 +1103,6 @@ void oled_pair_cat(char *dst, uint8_t cap, const char *head, const char *tail)
         dst[n++] = *tail++;
 
     dst[n] = '\0';
-}
-
-
-/* 右对齐整数, 不足位补空格: 等价于固定宽度的 printf("%*d").
- * 与 OLED_ShowNum 的区别: 后者补 '0'(007), 本函数补空格(  7) —— 菜单内联调节行
- * 原本走 OLED_Print("%3d") 的空格填充, 本函数保持同样的观感且不引入 stdio.
- * 位数超 len 时由 OLED_ShowNum 自行向右溢出(与 printf 固定宽度语义一致). */
-void OLED_ShowNumPad(int16_t x, int16_t y, int32_t num, uint8_t len)
-{
-    int32_t mag = (num < 0) ? -num : num;
-    uint8_t digits = 1;
-    uint8_t i;
-
-    while (mag >= 10) { mag /= 10; digits++; }   /* 十进制位数(不含符号) */
-
-    for (i = digits; i < len; i++)
-        OLED_ShowChar(x, y, ' ', OLED_8X16);
-
-    if (i > digits)                              /* 补过空格, 数字整体右移 */
-        OLED_ShowNum((int16_t)(x + (uint8_t)(i - digits) * 8), y, num, digits);
-    else
-        OLED_ShowNum(x, y, num, digits);
 }
 
 
