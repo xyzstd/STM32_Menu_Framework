@@ -1,4 +1,4 @@
-#include "stm32f10x.h"
+﻿#include "stm32f10x.h"
 #include "key.h"
 #include "encoder.h"
 #include "input.h"

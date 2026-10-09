@@ -1,4 +1,4 @@
-#include "stm32f10x.h"
+﻿#include "stm32f10x.h"
 #include "key.h"
 
 static uint8_t is_key_pressed(key_info_t *key);
