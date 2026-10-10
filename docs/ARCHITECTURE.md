@@ -14,13 +14,12 @@ main/           main.c 主循环: Input → Buzzer → WorkTask → UI_Task → 
   │
   ├─ page/      页面层: 每个页面 = ops 回调集合, 挂到 menu_table 节点
   │     home(常驻) / temp / handle / ota_wait / calibrate / settings /
-  │     pid(快/慢) / autotune(自整定) / eval_page(负载评估) / cur_cal(电流标定) /
+  │     pid(快/慢) / autotune(自整定) / cur_cal(电流标定) /
   │     param / confirm(模板) / toast(保存提示框)
   │
   ├─ ctrl/      控制层: 与 UI 完全解耦的纯算法
   │     pid_controller.c   分段 PID (激进/保守) + Boost 抬升 + 继电自整定
   │     heater.c           加热器功率输出 (功率→CCR, 90% 上限)
-  │     eval.c             负载响应评估状态机
   │
   └─ bsp/       板级: oled / oled_data / adc / pwm / encoder / key / buzzer / serial / config / flash
 ```
