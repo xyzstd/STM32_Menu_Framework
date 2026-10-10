@@ -144,9 +144,6 @@ static void menu_exit_handler(void)
 {
     const menu_item_t *item=menu_current_item();
 
-    /* 先落地 NORMAL 再调 exit: exit 回调内若(将来)调用 Menu_SetCurrentId, 会因
-     * state 已是 NORMAL 而走正常路径, 不会再次进入本函数(重复调 exit / 递归).
-     * 回调期间 current 仍指向本页, 故回调里读 Menu_GetCurrentId() 仍是离开前的页面. */
     menu_ctrl.state=MENU_STATE_NORMAL;
 
     if(item&&item->ops&&item->ops->exit)
@@ -259,7 +256,8 @@ static void menu_back(void)
     if(!item)
         return;
 
-    menu_ctrl.state=MENU_STATE_NORMAL;
+    /* 契约: menu_back 仅由 menu_state_normal(LPRESS) 调用, 进入时 state 必为 NORMAL,
+     * 故此处无需再置位 (若将来新增调用点, 需自行保证前置状态为 NORMAL). */
 
     /* 防御菜单表 parent 越界配置: 越界则保持原节点(显示层 GetSiblingRange 兜底), 不写入非法 current */
     if(item->parent >= menu_max_num)
@@ -270,9 +268,11 @@ static void menu_back(void)
     menu_ctrl.current=item->parent;
     
 
-    /* 回到常驻页(如 HOME): 直接激活为 handler, 保持常驻显示 */
+    /* 回到常驻页(如 HOME): 直接激活为 handler, 保持常驻显示。
+     * 上一步已校验 parent < menu_max_num, 故 menu_current_item() 的越界分支
+     * 不会命中, target 必非空 —— 无需再判空. */
     target=menu_current_item();
-    if(target && (target->flags & MENU_FLAG_DIRECT_HANDLER))
+    if(target->flags & MENU_FLAG_DIRECT_HANDLER)
         menu_activate();
 }
 
