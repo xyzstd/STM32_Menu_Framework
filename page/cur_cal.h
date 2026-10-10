@@ -3,8 +3,8 @@
 
 #include "menu.h"
 
-/* 本页在菜单表中的 ID (menu_table.c 索引 19, PID 子菜单末项) */
-#define CUR_CAL_MENU_ID  19
+/* 本页在菜单表中的 ID (menu_table.c 索引 18, PID 子菜单末项) */
+#define CUR_CAL_MENU_ID  18
 
 extern const menu_ops_t cur_cal_ops;
 

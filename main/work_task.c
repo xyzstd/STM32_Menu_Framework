@@ -5,7 +5,6 @@
 #include "heater.h"
 #include "config.h"
 #include "buzzer.h"
-#include "eval.h"
 #include "stm32f10x.h"
 
 /*
@@ -544,9 +543,9 @@ static void check_sleep_shutdown(uint32_t now)
     if (work.state == WORK_STATE_SHUTDOWN)
         return;
 
-    /* 整定/校准/负载评估等受控长流程期间不入睡: 整定通常不足 2 分钟且用户在场观察,
-     * 校准需长时间等温稳定; 评估记录期间入睡会切走目标温度、毁掉温度曲线 */
-    if (PID_TuneActive() || sleep_suppress || Eval_IsActive())
+    /* 整定/校准等受控长流程期间不入睡: 整定通常不足 2 分钟且用户在场观察,
+     * 校准需长时间等温稳定 */
+    if (PID_TuneActive() || sleep_suppress)
         return;
 
     /* 检测到运动 → 重置计时 */
@@ -973,9 +972,6 @@ static void run_pid_cycle(void)
         work.power = 0;
         return;
     }
-
-    /* 3.5 负载响应评估采样: 每 PID 周期喂实测温度 (仅记录中采样, 其余 no-op) */
-    eval_advance(meas_temp);
 
     /* 3. 过温保护 (锁存: 直到手动清除才恢复, 防读数抖动在阈值附近反复开断) */
     if (meas_temp > OVER_TEMP_LIMIT)

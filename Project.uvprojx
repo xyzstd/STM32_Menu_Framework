@@ -871,16 +871,6 @@
               <FilePath>.\ctrl\heater.h</FilePath>
             </File>
             <File>
-              <FileName>eval.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\ctrl\eval.c</FilePath>
-            </File>
-            <File>
-              <FileName>eval.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\ctrl\eval.h</FilePath>
-            </File>
-            <File>
               <FileName>temp.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\page\temp.c</FilePath>
@@ -929,16 +919,6 @@
               <FileName>autotune.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\page\autotune.h</FilePath>
-            </File>
-            <File>
-              <FileName>eval_page.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\page\eval_page.c</FilePath>
-            </File>
-            <File>
-              <FileName>eval_page.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\page\eval_page.h</FilePath>
             </File>
             <File>
               <FileName>cur_cal.c</FileName>

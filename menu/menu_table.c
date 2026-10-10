@@ -7,7 +7,6 @@
 #include "ota_wait.h"
 #include "handle.h"
 #include "autotune.h"
-#include "eval_page.h"
 #include "cur_cal.h"
 
 /*
@@ -16,13 +15,13 @@
  * ID  0 = 虚拟根  (占位容器, MENU_NO_PARENT; 唯一子项即 HOME: first_child=1, child_num=1)
  * ID  1 = HOME    (常驻页, parent=0; 顶层列表: first_child=2, child_num=6)
  * ID  2 = 温度设置
- * ID  3 = PID参数 (子菜单容器, first_child=15, child_num=5)
+ * ID  3 = PID参数 (子菜单容器, first_child=15, child_num=4)
  * ID  4 = 温度校准
  * ID  5 = 手柄型号
  * ID  6 = 固件升级
  * ID  7 = 系统设置 (子菜单容器, first_child=8, child_num=7)
  * ID  8-14 = 系统设置子菜单
- * ID 15-19 = PID子菜单
+ * ID 15-18 = PID子菜单
  *
  * 编码: 本文件为 UTF-8, 中文名与 bsp/oled_data.c 字库 Index(UTF-8) 逐字节匹配.
  */
@@ -56,7 +55,7 @@ const menu_item_t menu_table[] =
     [3]={
         .parent      = 1,
         .first_child = 15,
-        .child_num   = 5,
+        .child_num   = 4,
         .ops         = NULL,
         .name        = "PID参数",
     },
@@ -183,14 +182,6 @@ const menu_item_t menu_table[] =
     },
 
     [18]={
-        .parent      = 3,
-        .first_child = MENU_NO_CHILD,
-        .child_num   = MENU_LEAF,
-        .ops         = &eval_ops,          /* 负载响应评估: 恒温焊焊点看恢复曲线 */
-        .name        = "负载评估",
-    },
-
-    [19]={
         .parent      = 3,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
