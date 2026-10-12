@@ -13,7 +13,7 @@
  * 手柄型号页: T12 / T245 / T210
  *
  * 用途: 切换当前烙铁手柄型号. 不同型号对应不同参数表
- * (校准曲线 / 温度上限 / Boost 上限 / PID 参数), 切换后自动保存.
+ * (校准曲线 / 温度上限 / PID 参数), 切换后自动保存.
  *
  * 交互 (单一项, 不做多选目录):
  *   - UP/DOWN : 循环切换当前型号 (仅预览, 不落地)
@@ -26,25 +26,31 @@
  *   - LPRESS  : 取消, 返回重选
  *
  * 安全: 切换通过 WorkTask_OnHandleChanged() 收敛运行状态——
- *       重载 PID、目标重新钳位到新型号上限、清 Boost 抬升.
+ *       重载 PID、目标重新钳位到新型号上限.
  */
 
 #define HANDLE_LABEL_NUM  3
 static const char *handle_labels[HANDLE_LABEL_NUM] = {"T12", "T245", "T210"};
 
+/* 链检进行中的轮询周期 (ms): 非阻塞链检需页面周期驱动取结论 */
+#define HANDLE_CHK_PERIOD  50
+
 static uint8_t   cur_idx = HANDLE_T12;   /* 当前预览/待选中的型号 */
 static confirm_t cf;                 /* 确认页子状态机 */
+static bool      chk_active;         /* 换头链检进行中(非阻塞) */
 
 static void handle_enter(void *ud);
 static void handle_exit(void *ud);
 static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud);
 static menu_period_t handle_display(void *ud);
+static void handle_apply_switch(void);
 
 static void handle_enter(void *ud)
 {
     (void)ud;
     cur_idx       = Config_GetHandleIdx();   /* 以当前型号为初始选中 */
     cf.active = false;                   /* 初始不在确认态 */
+    chk_active = false;                  /* 清残留链检状态 */
 
     /* 门1前移: 进入换头界面即断热(对齐鲍鱼焊台做法), 防止用户握着
      * 滚烫手柄停留在换头页. 取消/确认切换后由 handle_exit 恢复加热使能,
@@ -55,16 +61,61 @@ static void handle_enter(void *ud)
 static void handle_exit(void *ud)
 {
     (void)ud;
+    /* 链检未完成就离开本页: 中止脉冲并清测量占空比, 防随后 Heater_Enable 重放 */
+    chk_active = false;
+    WorkTask_PulseAbort();
+
     /* 离开换头页恢复加热使能: 进入页时已断热(门1), 取消/确认切换/引导进
      * Cur Cal 后由 PID 周期或校准页加热抑制接管. 存在锁存故障时不使能
      * (故障门在下一 PID 周期也强制断热, 这里避免残差功率输出窗口). */
     if (!WorkTask_HasFault())
+    {
+        Heater_SetPower(0);
         Heater_Enable();
+    }
+}
+
+
+/* 链检通过后落地切换: 写配置 → 安全闭合 → 必要时引导标定 / 回 HOME.
+ * 由 display 在轮询到结论后调用(链检期间已丢弃输入, cur_idx 不会被改). */
+static void handle_apply_switch(void)
+{
+    bool saved;
+
+    /* 确认切换: 写配置 + 触发安全闭合 */
+    g_config.handle_type = cur_idx;
+    saved = Config_Save();
+    WorkTask_OnHandleChanged();
+    if (saved)
+        Toast_Saved();   /* 仅在确实落盘成功时弹框 */
+
+#if !HW_SIM_MODE
+    /* 切换到尚无冷态电流参考(未标定)的型号: 直接引导进 Cur Cal 完成冷态标定,
+     * 之后细匹配保护才对新型号生效; 引导页已抑制加热, 热态头先显示 Cooling
+     * 等降温. 模拟模式跳过: TypeCal 不落盘、参考值恒 0, 照此每次切型号都会被
+     * 送进 Cur Cal 首次引导页(该页 cal_lock 有意忽略 UP/DOWN), 表现为旋转无反应. */
+    if (TypeCal_GetRef(cur_idx) == 0)
+    {
+        CurCal_BootEnter();
+        return;
+    }
+#endif
+
+    /* 切换成功直接回 HOME: 切换是"完成态"(断热/PID 重载/目标钳位/Err4 自动重检
+     * 均已收敛), 回 HOME 看温度继续焊接是用户自然下一步, 省一步导航.
+     * Menu_SetCurrentId 自动 exit 本页(handle_exit 恢复加热使能). */
+    Menu_SetCurrentId(MENU_HOME_ID);
 }
 
 static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
 {
     (void)ud;
+
+    /* ---- 链检进行中: 丢弃一切输入 ---- */
+    /* 结论由 display 轮询取回. 此处忽略事件, 防止 cur_idx 在检测期间被改,
+     * 造成"检测的是 A 型号、落地的是 B 型号". 链检约一个 PID 周期(200ms). */
+    if (chk_active)
+        return MENU_RET_OK;
 
     /* ---- 确认页处理 (优先) ---- */
     if (cf.active)
@@ -73,57 +124,24 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
         (void)confirm_handle(cmd, &cf, &confirmed);
         if (confirmed)
         {
-            bool    saved;
-            uint8_t prev_handle = Config_GetHandleIdx();   /* 切换前型号, 判定是否真切换 */
-            /* 安全检测 (目标型号 ≠ 当前型号时): 链路(热电偶/发热芯/供电) +
-             * 目标型号冷态阻值匹配, 异常则拒绝切换并蜂鸣告警, 返回预览态供
-             * 重选; 链路正常才落地. 按目标型号 cur_idx 判定: 换头场景下插入的
-             * 正是目标头, 匹配通过才允许切换; 防止"选了型号却插着别的头"的
-             * 误操作(如 T12 头被选成 T245 烧 450°C). */
-            if (cur_idx != prev_handle && !WorkTask_CheckChain(cur_idx))
+            /* 目标型号 ≠ 当前型号: 启动非阻塞链路检测(热电偶 → 发热芯测量脉冲
+             * → 供电 + 目标型号冷态阻值匹配), 结论由 display 轮询后落地.
+             * 按目标型号 cur_idx 判定: 换头场景下插入的正是目标头, 匹配通过才
+             * 允许切换; 防止"选了型号却插着别的头"的误操作(如 T12 头被选成
+             * T245 烧 450°C). */
+            if (cur_idx != Config_GetHandleIdx())
             {
-                Buzzer_Beep(BUZZER_EVENT_ALARM);
-                cf.active = false;   /* 退回单型号视图重选 */
+                if (!WorkTask_CheckChainStart(cur_idx))
+                {
+                    Buzzer_Beep(BUZZER_EVENT_ALARM);
+                    cf.active = false;   /* 未受理(故障/自检中/已有测量): 退回重选 */
+                    return MENU_RET_OK;
+                }
+                chk_active = true;       /* 进入链检: 结果由 display 轮询 */
                 return MENU_RET_OK;
             }
 
-            /* 确认切换: 写配置 + 触发安全闭合 */
-            g_config.handle_type = cur_idx;
-            saved = Config_Save();
-            WorkTask_OnHandleChanged();
-            if (saved)
-                Toast_Saved();   /* 仅在确实落盘成功时弹框 */
-
-            /* 切换到尚无冷态电流参考(未标定)的型号: 直接引导进 Cur Cal 完成
-             * 冷态标定, 之后细匹配保护才对新型号生效; 3 种型号均已标定则
-             * 无需跳转, 正常返回. 引导页已抑制加热, 热态头先显示 Cooling
-             * 等降温; 与安全自检状态机无冲突: 自检仅上电阶段运行, 切换
-             * 检测脉冲与标定测量脉冲同源且顺序执行, 不会并发.
-             * 模拟模式跳过: TypeCal 不落盘、参考值恒 0, 照此每次切型号都会被
-             * 送进 Cur Cal 首次引导页; 而该页 cal_lock 有意忽略 UP/DOWN, 表现为
-             * "旋转编码器无反应". 口径与 WorkTask_Init/OnHandleChanged 一致。 */
-#if !HW_SIM_MODE
-            if (cur_idx != prev_handle && TypeCal_GetRef(cur_idx) == 0)
-            {
-                /* 跳转由内核统一收尾: 本处在事件分发中, 跳转后内核会重同步
-                 * 编码器相位(见 input.c 的 menu_ctx), 防旧相位带入新页面吃掉
-                 * 第一格. CurCal_BootEnter 内部另自带一次清理+重同步, 双保险. */
-                CurCal_BootEnter();
-                return MENU_RET_OK;
-            }
-#endif
-
-            /* 切换成功(与当前型号不同)直接回 HOME: 切换是"完成态"(断热/PID
-             * 重载/目标钳位/Err4 自动重检均已收敛), 回 HOME 看温度继续焊接是
-             * 用户自然下一步, 省一步导航. Menu_SetCurrentId 自动 exit 本页
-             * (handle_exit 恢复加热使能). 同型号确认(未真正切换)走 MENU_RET_DONE
-             * 返回上一层. */
-            if (cur_idx != prev_handle)
-            {
-                /* 跳转后由内核重同步编码器相位(见 input.c 的 menu_ctx) */
-                Menu_SetCurrentId(MENU_HOME_ID);
-                return MENU_RET_OK;
-            }
+            /* 同型号确认(未真正切换): 返回上一层 */
             return MENU_RET_DONE;
         }
         /* 选"否"/长按: 取消, 返回单型号视图重选; 其余仍在确认态 */
@@ -157,6 +175,43 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
 static menu_period_t handle_display(void *ud)
 {
     (void)ud;
+    menu_period_t period = 0;
+
+    /* ---- 链检进行中: 轮询结论 ---- */
+    /* 非阻塞链检的结果只能由周期渲染驱动取回(handler 仅在事件时被调用).
+     * 期间保持确认页画面, 每 HANDLE_CHK_PERIOD 复询一次.
+     * 结论就绪后在此落地: 本页 display 由 menu_page_display 调用, 后者已在调用
+     * 前取好 item、调用后立即返回, 故此处发起跳转不会破坏渲染路径. */
+    if (chk_active)
+    {
+        bool ok = false;
+        work_pulse_t st = WorkTask_CheckChainPoll(&ok);
+
+        if (st == WORK_PULSE_BUSY)
+        {
+            period = HANDLE_CHK_PERIOD;   /* 结果未就绪: 保持画面, 稍后再轮询 */
+        }
+        else
+        {
+            /* 必须同时处理 READY 与 IDLE: 后者表示脉冲被中止(锁存故障/关机等),
+             * 若只认 READY, chk_active 将永远为真 —— 而 handler 在 chk_active 时
+             * 丢弃一切输入, 用户会卡在确认页无法退出(需断电). */
+            chk_active = false;
+            if (st != WORK_PULSE_READY || !ok)
+            {
+                Buzzer_Beep(BUZZER_EVENT_ALARM);
+                cf.active = false;        /* 未通过/被中止: 退回单型号视图重选 */
+            }
+            else
+            {
+                handle_apply_switch();    /* 通过: 落地切换(可能跳 Cur Cal / HOME) */
+                /* 本跳转由 display 发起, 不在事件路径上(无人替本页调
+                 * UI_RequestRefresh), 故返回一个短周期, 保证下一帧渲染新页面. */
+                return HANDLE_CHK_PERIOD;
+            }
+        }
+    }
+
     OLED_Clear();
 
     /* ---- 确认页显示 (标题带当前型号) ---- */
@@ -170,7 +225,7 @@ static menu_period_t handle_display(void *ud)
         oled_pair_cat(title, sizeof(title), title, "?");
         confirm_display(&cf, title);
         OLED_UpdateDiff();
-        return 0;
+        return period;
     }
 
     /* ---- 单个型号视图: 显示当前选中, 切换预览 ---- */
@@ -188,7 +243,7 @@ static menu_period_t handle_display(void *ud)
     OLED_ShowString(29, 56, "HLD: Exit", OLED_6X8);     /* 9 字 70px x29..99 */
 
     OLED_UpdateDiff();
-    return 0;
+    return period;
 }
 
 const menu_ops_t handle_ops = {

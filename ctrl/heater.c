@@ -12,8 +12,8 @@
  *   PWM 层是 1000 级分辨率, 全功率窗内粒度完整。
  */
 
-#define HEATER_MAX_POWER_PCT   90
-#define HEATER_POWER_LIMIT     (HEATER_POWER_MAX * HEATER_MAX_POWER_PCT / 100) /* 900 */
+/* 90% 上限(HEATER_POWER_LIMIT)由 heater.h 统一定义, 此处不再重复 ——
+ * 让"对外报告的百分比"与"实际写入 PWM 的占空比"共用同一常量, 不会各自漂移. */
 
 static struct {
     int16_t power;      /* 当前功率 0~1000 */
@@ -68,9 +68,4 @@ void Heater_Disable(void)
 {
     heater.enabled = false;
     PWM_SetCompare1(0);
-}
-
-bool Heater_IsEnabled(void)
-{
-    return heater.enabled;
 }

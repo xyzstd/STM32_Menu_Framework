@@ -6,7 +6,9 @@ typedef struct{
 }menu_ctrl_t;
 
 static menu_ctrl_t menu_ctrl;
+static bool menu_table_valid;
 
+static bool menu_validate_table(void);
 static const menu_item_t *menu_current_item(void);
 
 static void menu_activate(void);
@@ -23,9 +25,17 @@ static void menu_back(void);
 
 void Menu_Init(void)
 {
-    menu_ctrl.current=MENU_HOME_ID;
-    menu_ctrl.state=MENU_STATE_NORMAL;
-    menu_activate();  
+    menu_ctrl.current = MENU_NO_PARENT;
+    menu_ctrl.state   = MENU_STATE_NORMAL;
+    menu_table_valid  = menu_validate_table();
+
+    /* 菜单表损坏时保持虚拟根+列表态: 所有导航入口停用, 避免按错误 parent/child
+     * 范围访问表或调用错误页面回调. 调试时可在此检查 menu_table_valid. */
+    if (!menu_table_valid)
+        return;
+
+    menu_ctrl.current = MENU_HOME_ID;
+    menu_activate();
 }
 
 
@@ -37,7 +47,7 @@ void *Menu_GetUserData(const menu_item_t *item)
 
 void Menu_EventDispatch(const menu_cmd_t *cmd)
 {
-    if(!cmd)
+    if (!menu_table_valid || !cmd)
         return;
 
     if(menu_ctrl.state==MENU_STATE_HANDLER)
@@ -63,6 +73,9 @@ menu_state_t Menu_GetState(void)
  * 不改动列表滚动/差量渲染等既有逻辑; 渲染层经 GetCurrentId/GetState 自动适配. */
 void Menu_SetCurrentId(uint8_t id)
 {
+    if (!menu_table_valid)
+        return;
+
     /* 0 = 占位虚拟根(ops=NULL, 且不属于任何列表): 若置为 current, 渲染层
      * Menu_GetSiblingRange(0) 返回 false → menu_list_display 不渲染, 画面冻结在
      * 上一帧. 连同越界一并拦截. (MENU_NO_PARENT/MENU_NO_CHILD 同为 0, 是哨兵值.) */
@@ -101,6 +114,98 @@ const menu_item_t *Menu_GetItem(uint8_t id)
         return NULL;
 
     return &menu_table[id];
+}
+
+
+/* 启动期验证只读菜单表, 不调用页面回调、不依赖 UI。
+ * 校验父->子与子->父双向一致、半开范围不越界、树无孤岛/环, 并检查可激活 ops 契约.
+ * 返回 false 时 Menu_Init 留在虚拟根, 且拒绝所有事件/强制跳转(安全失败). */
+static bool menu_validate_table(void)
+{
+    const menu_item_t *item;
+    const menu_item_t *parent;
+    uint16_t id, child, end, walk, hops;
+    uint8_t known_flags = MENU_FLAG_DIRECT_HANDLER;
+
+    if (menu_max_num <= MENU_HOME_ID)
+        return false;
+
+    /* 根节点是占位容器, 必须覆盖 HOME 节点. */
+    item = &menu_table[MENU_NO_PARENT];
+    end = (uint16_t)item->first_child + item->child_num;
+    if (item->parent != MENU_NO_PARENT || item->ops != NULL ||
+        item->child_num == 0 || item->first_child == MENU_NO_CHILD ||
+        end > menu_max_num || MENU_HOME_ID < item->first_child || MENU_HOME_ID >= end)
+        return false;
+
+    /* HOME 是内核启动目标, 必须是挂在虚拟根下的可激活常驻页. */
+    item = &menu_table[MENU_HOME_ID];
+    if (item->parent != MENU_NO_PARENT ||
+        (item->flags & MENU_FLAG_DIRECT_HANDLER) == 0 ||
+        item->ops == NULL || item->ops->display == NULL || item->ops->handler == NULL)
+        return false;
+
+    for (id = 0; id < menu_max_num; id++)
+    {
+        item = &menu_table[id];
+
+        if (item->flags & (uint8_t)~known_flags)
+            return false;
+
+        /* 一旦提供 ops, 必须同时具备渲染与事件处理, 否则 HANDLER 页无法完整工作. */
+        if (item->ops != NULL &&
+            (item->ops->display == NULL || item->ops->handler == NULL))
+            return false;
+
+        if ((item->flags & MENU_FLAG_DIRECT_HANDLER) && item->ops == NULL)
+            return false;
+
+        if (item->child_num == 0)
+        {
+            if (item->first_child != MENU_NO_CHILD)
+                return false;
+        }
+        else
+        {
+            if (item->first_child == MENU_NO_CHILD)
+                return false;
+
+            end = (uint16_t)item->first_child + item->child_num;
+            if (item->first_child >= menu_max_num || end > menu_max_num)
+                return false;
+
+            /* 子节点声明的 parent 必须反向指回当前节点. */
+            for (child = item->first_child; child < end; child++)
+            {
+                if (child == MENU_NO_PARENT || menu_table[child].parent != id)
+                    return false;
+            }
+        }
+
+        if (id == MENU_NO_PARENT)
+            continue;
+
+        if (item->parent >= menu_max_num || item->parent == id)
+            return false;
+
+        parent = &menu_table[item->parent];
+        end = (uint16_t)parent->first_child + parent->child_num;
+        if (parent->child_num == 0 || parent->first_child == MENU_NO_CHILD ||
+            end > menu_max_num || id < parent->first_child || id >= end)
+            return false;
+    }
+
+    /* 每个真实节点沿 parent 链必须在有限步内到达虚拟根, 防孤岛和父级环. */
+    for (id = 1; id < menu_max_num; id++)
+    {
+        walk = id;
+        for (hops = 0; walk != MENU_NO_PARENT && hops < menu_max_num; hops++)
+            walk = menu_table[walk].parent;
+        if (walk != MENU_NO_PARENT)
+            return false;
+    }
+
+    return true;
 }
 
 

@@ -117,9 +117,9 @@ static menu_period_t home_display(void *user_data)
 
     /* 主状态行 (8x16, 单行互斥显示, 避免覆盖残留像素):
      * 优先级阶梯即索引顺序: 自检故障码 > 传感器故障 > 关机 > 休眠 >
-     * 大焊点加温(Boost) > 温度到达 > 加热. 查表取文本, 分支只裁决索引. */
+     * 温度到达 > 加热. 查表取文本, 分支只裁决索引. */
     {
-        static const char *const state_text[] = {"NoHnd", "OFF", "Sleep", "Boost", "OK", "Heat"};
+        static const char *const state_text[] = {"NoHnd", "OFF", "Sleep", "OK", "Heat"};
         uint8_t state_idx = 0;
 
         uint8_t st_code = WorkTask_GetFaultCode();
@@ -138,12 +138,10 @@ static menu_period_t home_display(void *user_data)
                 state_idx = 1;
             else if (state == WORK_STATE_SLEEP)
                 state_idx = 2;
-            else if (WorkTask_IsBoostActive())
-                state_idx = 3;
             else if (WorkTask_IsTempReached())
-                state_idx = 4;
+                state_idx = 3;
             else
-                state_idx = 5;
+                state_idx = 4;
 
             OLED_ShowString(2, 48, state_text[state_idx], OLED_8X16);
         }

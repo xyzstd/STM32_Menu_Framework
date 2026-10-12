@@ -2,8 +2,10 @@
 #include "oled_data.h"
 #include "stm32f10x.h"
 #include <stddef.h>   /* NULL */
+#include <stdbool.h>
 #include <stdlib.h>   /* abs */
 #include <string.h>   /* memset (OLED_Clear 整屏清 0) */
+#include "timer.h"    /* Timer_GetTick (兜底整屏重推计时) */
 
 /* 不再包含 <stdio.h>/<stdarg.h>: 原 OLED_Print 走 vsnprintf, 是全工程最后一处
  * 把 stdio 格式化机制拉进链接的引用(连带浮点支持, 实测约 2.3KB).
@@ -16,6 +18,24 @@ uint8_t OLED_DisplayBuf[OLED_PAGE_NUM][OLED_WIDTH];
  * 保证混合调用一致不错漏. */
 static uint32_t oled_snap_sum[OLED_PAGE_NUM];
 
+/* 待推送脏页位图(bit n = 第 n 页缓冲已变化、等待推送) + 轮转起点.
+ * OLED_UpdateDiff 只做"比较指纹 + 置位", 真正的 I2C 推送由主循环每轮
+ * OLED_FlushStep 推一页完成 —— 把"一次整屏 8 页 ≈13~16ms 的同步阻塞"拆成
+ * "每轮 ≤ 一页 ≈1.7ms", 让 Input_Process 在两次推送之间得到执行.
+ * 否则整屏推送期间主循环停摆, 每轮只能消费 2 个输入事件, 事件消费速率掉到
+ * ~140/s(低于编码器 250/s) → 队列积压 → 表现为"转了不动、过一会才恢复". */
+static uint8_t oled_dirty = 0;
+static uint8_t oled_flush_next = 0;
+
+/* 兜底整屏重推周期 (ms). 即便 ACK 可检测瞬时丢写, 周期全推仍可覆盖上电瞬间
+ * 的总线异常/控制器复位等状态失步. 内容不变则视觉无差异(不闪), 代价约
+ * 8 页×1.7ms / 10s ≈ 0.14% 的 I2C 占用. */
+#define OLED_FULL_REFRESH_MS  10000u
+#define OLED_WRITE_RETRY_MS   50u     /* NACK 后退避, OLED 缺失时不在主循环每轮忙重试 */
+static uint32_t oled_full_tick = 0;
+static uint32_t oled_retry_tick = 0;
+static bool oled_retry_wait = false;
+
 static uint32_t oled_page_sum(uint8_t page);
 static void oled_snap_sync(uint8_t page);
 
@@ -23,11 +43,11 @@ static void oled_w_scl(uint8_t bit);
 static void oled_w_sda(uint8_t bit);
 static void oled_i2c_start(void);
 static void oled_i2c_stop(void);
-static void oled_i2c_send_byte(uint8_t byte);
+static bool oled_i2c_send_byte(uint8_t byte);
 
 static void oled_gpio_init(void);
 
-static void oled_set_cursor(uint8_t page,uint8_t x);
+static bool oled_set_cursor(uint8_t page,uint8_t x);
 
 static void oled_draw_quarter_circle(int16_t cx,int16_t cy,uint8_t r,uint8_t corner,uint8_t color);
 static uint32_t oled_pow10(uint8_t n);
@@ -103,9 +123,10 @@ static void oled_i2c_stop(void)
 }
 
 
-static void oled_i2c_send_byte(uint8_t byte)
+static bool oled_i2c_send_byte(uint8_t byte)
 {
     uint8_t i;
+    bool ack;
     volatile uint32_t delay;
 
     for(i=0;i<8;i++)
@@ -116,38 +137,49 @@ static void oled_i2c_send_byte(uint8_t byte)
         oled_w_scl(0);
     }
 
+    /* 第9个时钟采 ACK: 开漏输出写 1 即释放 SDA, 从机应拉低应答.
+     * 旧实现固定发时钟但不采样, 所以即使 NACK/屏幕掉线也被当作写成功. */
+    oled_w_sda(1);
+    for(delay=0;delay<4;delay++);
     oled_w_scl(1);
+    for(delay=0;delay<12;delay++);
+    ack = (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_9) == Bit_RESET);
     oled_w_scl(0);
+    return ack;
 }
 
 
 /*================ SSD1315 =================*/
 
-void OLED_WriteCommand(uint8_t command)
+bool OLED_WriteCommand(uint8_t command)
 {
+    bool ack;
     oled_i2c_start();
 
-    oled_i2c_send_byte(0x78);
-    oled_i2c_send_byte(0x00);
-    oled_i2c_send_byte(command);
+    ack = oled_i2c_send_byte(0x78);
+    if (ack) ack = oled_i2c_send_byte(0x00);
+    if (ack) ack = oled_i2c_send_byte(command);
 
     oled_i2c_stop();
+    return ack;
 }
 
 
-void OLED_WriteData(uint8_t *data,uint8_t count)
+bool OLED_WriteData(uint8_t *data,uint8_t count)
 {
     uint8_t i;
+    bool ack;
 
     oled_i2c_start();
 
-    oled_i2c_send_byte(0x78);
-    oled_i2c_send_byte(0x40);
+    ack = oled_i2c_send_byte(0x78);
+    if (ack) ack = oled_i2c_send_byte(0x40);
 
-    for(i=0;i<count;i++)
-        oled_i2c_send_byte(data[i]);
+    for(i=0; ack && i<count; i++)
+        ack = oled_i2c_send_byte(data[i]);
 
     oled_i2c_stop();
+    return ack;
 }
 
 
@@ -176,7 +208,7 @@ static void oled_gpio_init(void)
 
 
 
-/*================ ��ʼ�� =================*/
+/*================ 初始化 =================*/
 
 void OLED_Init(void)
 {
@@ -259,11 +291,13 @@ void OLED_SetContrast(uint8_t val)
 
 /*================ Cursor =================*/
 
-static void oled_set_cursor(uint8_t page,uint8_t x)
+static bool oled_set_cursor(uint8_t page,uint8_t x)
 {
-    OLED_WriteCommand(0xB0|page);
-    OLED_WriteCommand(0x10|(x>>4));
-    OLED_WriteCommand(0x00|(x&0x0F));
+    if (!OLED_WriteCommand((uint8_t)(0xB0 | page)))
+        return false;
+    if (!OLED_WriteCommand((uint8_t)(0x10 | (x >> 4))))
+        return false;
+    return OLED_WriteCommand((uint8_t)(0x00 | (x & 0x0F)));
 }
 
 
@@ -273,34 +307,106 @@ void OLED_Update(void)
 
     for(page=0;page<OLED_PAGE_NUM;page++)
     {
-        oled_set_cursor(page,0);
-        OLED_WriteData(OLED_DisplayBuf[page],OLED_WIDTH);
-        oled_snap_sync(page);
+        uint8_t mask = (uint8_t)(1u << page);
+        if (oled_set_cursor(page, 0) &&
+            OLED_WriteData(OLED_DisplayBuf[page], OLED_WIDTH))
+        {
+            oled_snap_sync(page);
+            oled_dirty &= (uint8_t)~mask;
+        }
+        else
+        {
+            /* NACK: 快照不得前移, 保留脏位交给主循环重试. */
+            oled_dirty |= mask;
+        }
     }
+
+    oled_full_tick = Timer_GetTick();   /* 兜底计时一并重启 */
 }
 
-/* 页级差量推送: 按页指纹与快照比对, 只把内容变化的页整页推送到屏幕并更新快照.
- * 菜单/参数页每帧往往只改少数几页(高亮行、数值、功率条), 其余页一致则跳过,
- * 大幅减少软 I2C 刷屏量, 消除连续旋转时 UI 卡顿. 静止时逐页指纹全等 -> 零推送零闪烁.
- * 指纹(32bit 位置敏感哈希)代替整帧比较, 节省 ~1KB RAM. */
+/* 页级差量"标记": 按页指纹与快照比对, 把内容变化的页记入脏页位图.
+ * 菜单/参数页每帧往往只改少数几页(高亮行、数值、功率条), 其余页一致则跳过;
+ * 静止时逐页指纹全等 -> 无脏页 -> 零推送零闪烁. 指纹(32bit FNV-1a)代替整帧
+ * 比较, 节省 ~1KB RAM.
+ * 注意: 本函数**不再直接推送 I2C** —— 真正推送由主循环 OLED_FlushStep 每轮一页
+ * 完成(见下). 调用方语义不变: 仍在"渲染完缓冲"后调用. */
 void OLED_UpdateDiff(void)
 {
-    uint8_t page;
+    uint8_t  page;
+    uint32_t now = Timer_GetTick();
+
+    /* 周期兜底: 到期则整屏标脏(理由见 OLED_FULL_REFRESH_MS 说明).
+     * 与下方指纹比较是"或"关系 —— 兜底只加推送, 不影响原有差量语义. */
+    if ((uint32_t)(now - oled_full_tick) >= OLED_FULL_REFRESH_MS)
+    {
+        oled_full_tick = now;
+        oled_dirty |= (uint8_t)((1u << OLED_PAGE_NUM) - 1u);
+    }
 
     for(page=0;page<OLED_PAGE_NUM;page++)
     {
         if (oled_page_sum(page) != oled_snap_sum[page])
+            oled_dirty |= (uint8_t)(1u << page);
+    }
+}
+
+
+/* 主循环每轮调用: 若仍有待推页, 自轮转起点向后找一页推送.
+ * 每轮最多推一页 = 单次阻塞 ≤ 一页 I2C 时间(≈1.5ms), 输入节拍不受影响.
+ * 只有 cursor 命令与整页数据均收到 ACK 才同步快照/清脏位；NACK 时快照保持旧值,
+ * 脏页保留并轮转到下一页，50ms 后再重试，避免屏幕掉线时每轮都忙等.
+ * 周期全刷仍保留, 兜住上电/复位导致的总线状态失步. */
+void OLED_FlushStep(void)
+{
+    uint8_t i, page;
+    uint32_t now = Timer_GetTick();
+
+    if (oled_retry_wait)
+    {
+        if ((uint32_t)(now - oled_retry_tick) < OLED_WRITE_RETRY_MS)
+            return;
+        oled_retry_wait = false;
+    }
+
+    if (oled_dirty == 0)
+        return;
+
+    for (i = 0; i < OLED_PAGE_NUM; i++)
+    {
+        uint8_t mask;
+        bool ok;
+
+        page = (uint8_t)((oled_flush_next + i) % OLED_PAGE_NUM);
+        mask = (uint8_t)(1u << page);
+        if (!(oled_dirty & mask))
+            continue;
+
+        ok = oled_set_cursor(page, 0);
+        if (ok)
+            ok = OLED_WriteData(OLED_DisplayBuf[page], OLED_WIDTH);
+
+        if (ok)
         {
-            oled_set_cursor(page,0);
-            OLED_WriteData(OLED_DisplayBuf[page],OLED_WIDTH);
             oled_snap_sync(page);
+            oled_dirty &= (uint8_t)~mask;
+            oled_flush_next = (uint8_t)((page + 1) % OLED_PAGE_NUM);
+            oled_retry_wait = false;
         }
+        else
+        {
+            /* ACK 缺失: 不提交快照、不清脏位; 给总线恢复/屏幕重连留时间. */
+            oled_dirty |= mask;
+            oled_flush_next = (uint8_t)((page + 1) % OLED_PAGE_NUM);
+            oled_retry_tick = now;
+            oled_retry_wait = true;
+        }
+        return;   /* 每轮最多推一页 */
     }
 }
 
 
 
-/*================ ��� =================*/
+/*================ 清屏 =================*/
 
 void OLED_Clear(void)
 {
@@ -330,16 +436,16 @@ void OLED_FillArea(int16_t x,int16_t y,uint8_t width,uint8_t height,uint8_t colo
 
 
 
-/*================ λ�������� =================*/
+/*================ 像素操作 =================*/
 
 /*
- * SSD1315ҳģʽ:
+ * SSD1315 页模式:
  *
  * page = y / 8
  *
  * bit  = y % 8
  *
- * һ��byte����8����������
+ * 一个 byte 代表纵向 8 个像素
  */
 void OLED_DrawPixel(int16_t x,int16_t y,uint8_t color)
 {
@@ -404,7 +510,7 @@ void OLED_ReverseArea(int16_t x,int16_t y,uint8_t width,uint8_t height)
     }
 }
 
-/*================ ͼ�� =================*/
+/*================ 图形 =================*/
 
 void OLED_DrawLine(int16_t x0,int16_t y0,int16_t x1,int16_t y1,uint8_t color)
 {
@@ -496,7 +602,7 @@ void OLED_FillRect(int16_t x,int16_t y,uint8_t width,uint8_t height,uint8_t colo
 
 
 
-/*================ Բ�Ǿ��� =================*/
+/*================ 圆角矩形 =================*/
 
 static void oled_draw_quarter_circle(int16_t cx,int16_t cy,uint8_t r,uint8_t corner,uint8_t color)
 {
@@ -671,7 +777,7 @@ void OLED_FillRoundRect(int16_t x,int16_t y,
 
         if(yy<radius)
         {
-            /* ���ϡ�����Բ�� */
+            /* 左上、右上圆角 */
             int16_t dy=radius-1-yy;
             int16_t dx=0;
 
@@ -683,7 +789,7 @@ void OLED_FillRoundRect(int16_t x,int16_t y,
         }
         else if(yy>=height-radius)
         {
-            /* ���¡�����Բ�� */
+            /* 左下、右下圆角 */
             int16_t dy=yy-(height-radius);
             int16_t dx=0;
 
@@ -714,7 +820,7 @@ void OLED_ReverseRoundRect(int16_t x,int16_t y,
                        OLED_COLOR_XOR);
 }
 
-/*================ ͼƬ =================*/
+/*================ 图片 =================*/
 
 void OLED_ShowImage(int16_t x,int16_t y,uint8_t width,uint8_t height,const uint8_t *image)
 {
@@ -739,7 +845,7 @@ void OLED_ShowImage(int16_t x,int16_t y,uint8_t width,uint8_t height,const uint8
 
 
 
-/*================ �ַ� =================*/
+/*================ 字符 =================*/
 
 void OLED_ShowChar(int16_t x,int16_t y,char ch,uint8_t font)
 {
@@ -805,7 +911,7 @@ void OLED_ShowDegree(int16_t x,int16_t y)
 
 
 
-/*================ ���� =================*/
+/*================ 数值 =================*/
 
 static uint32_t oled_pow10(uint8_t n)
 {

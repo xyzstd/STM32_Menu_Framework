@@ -3,9 +3,14 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "heater.h"   /* HEATER_POWER_LIMIT: PID 输出满量程须与之相等 */
 
-/* PID 输出范围: 0 ~ PID_OUTPUT_MAX (对应 0% ~ 100% 加热功率) */
-#define PID_OUTPUT_MAX  1000
+/* PID 输出范围: 0 ~ PID_OUTPUT_MAX, 即 0 ~ 加热层实际可达的最大功率.
+ * 必须等于 HEATER_POWER_LIMIT(900) 而不是 HEATER_POWER_MAX(1000):
+ * 加热层为保留 ≥10% 关断窗(供温度采样)会把功率钳到 900; 若 PID 仍以 1000 为
+ * 满量程, 抗饱和就按"不可达的上限"计算 —— 积分可比实际出力多累积约 10% 占空比,
+ * 退出饱和时需额外泄放, 表现为过冲. 本定义强制二者一致, 改一处即同步. */
+#define PID_OUTPUT_MAX  HEATER_POWER_LIMIT
 
 /* 积分限幅 (内置固定值, 不提供页面调节):
  *   保守区(ΔT≤30°C): PID 输出满量程的 30%
@@ -17,7 +22,7 @@
 #define PID_SCALE       100
 
 /* 温度下限固定 100°C; 上限按型号在运行时由 Config_GetTempMax() 提供
- * (T12=400, T245/T210=450), 不再使用固定宏, 保证切型号后目标不越标称上限 */
+ * (T12/T245/T210 均为 450), 不再使用固定宏, 保证切型号后目标不越标称上限 */
 #define TEMP_MIN        100
 
 void PID_Controller_Init(void);
@@ -27,9 +32,6 @@ void PID_Controller_Reset(void);
 /* 设置目标温度 (单位: °C) */
 void PID_Controller_SetSetpoint(int16_t setpoint);
 int16_t PID_Controller_GetSetpoint(void);
-
-/* 获取有效设定值 (用户设定 + 自动加温抬升, 参与 PID 计算) */
-int16_t PID_Controller_GetEffectiveSetpoint(void);
 
 /* 设置当前实测温度 */
 void PID_Controller_SetMeasured(int16_t measured);
@@ -56,15 +58,10 @@ void PID_Controller_SetConsKd(int16_t kd);
 /* 获取上次输出值 */
 int16_t PID_Controller_GetOutput(void);
 
-/* 大焊点自动加温: 在设定值基础上叠加抬升量 (0~+, 单位 °C)
- * 抬升量只影响有效设定值(参与 PID/温度到达计算), 不修改用户原设定值 */
-void PID_Controller_SetBoostOffset(int16_t offset);
-int16_t PID_Controller_GetBoostOffset(void);
-
 /* ============ 继电反馈自整定 (Aström–Hägglund) ============
  * 启动后, run_pid_cycle 每周期调用 PID_TuneAdvance(meas) 取得继电输出,
  * 温度围绕设定点等幅振荡, 4 个完整周期后由描述函数法 + Ziegler-Nichols
- * 得出保守组(稳态段) PID 参数. 整定期间跳过 PID/Boost/前馈/加热诊断.
+ * 得出保守组(稳态段) PID 参数. 整定期间跳过 PID/前馈/加热诊断.
  *
  * 进度单位: PID_TuneAdvance 内部按"半周期"计数(TUNE_HALF_REQUIRED 8 = 4 个
  * 完整周期). PID_TuneProgressCycles() 返回完整周期数(0~4), 页面的 "N/4"

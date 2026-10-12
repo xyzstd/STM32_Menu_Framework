@@ -36,8 +36,6 @@ static struct {
     int16_t setpoint;       /* 目标温度 °C */
     int16_t measured;       /* 实测温度 °C */
 
-    int16_t boost_offset;   /* 大焊点自动加温抬升量 °C (0~+, 叠加到有效设定值) */
-
     int32_t integral;       /* 积分累加值 *100 */
     int32_t i_rem;          /* 积分增量的整除余数(±<100), 见 Compute 的"余数累加" */
     int16_t last_measured;  /* 上次实测温度, 微分先行用 */
@@ -46,8 +44,6 @@ static struct {
 
     int16_t output;         /* 上次输出值 */
 } pid;
-
-static int16_t effective_setpoint(void);
 
 static int16_t tune_gain_sat(int64_t v);
 
@@ -87,8 +83,6 @@ void PID_Controller_Reset(void)
 
 void PID_Controller_SetSetpoint(int16_t setpoint)
 {
-    /* 用户手动设定目标时清除自动加温抬升, 避免异常叠加 */
-    pid.boost_offset = 0;
     /* 统一钳位到合法温度范围, 纵深防御: 即便某调用方漏钳/配置异常,
      * 也不会设出越界目标导致持续过热. 上限按当前型号运行时取值. */
     if (setpoint > (int16_t)Config_GetTempMax())
@@ -113,21 +107,6 @@ int16_t PID_Controller_GetMeasured(void)
     return pid.measured;
 }
 
-/* 有效设定值 = 用户设定 + Boost 抬升, 按 Boost 上限钳位.
- * 对外读数与 Compute() 判据共用一份, 保证两者口径一致(如不读出 T12 的 460°C). */
-static int16_t effective_setpoint(void)
-{
-    int16_t eff = (int16_t)(pid.setpoint + pid.boost_offset);
-    if (eff > (int16_t)Config_GetBoostMax())
-        eff = (int16_t)Config_GetBoostMax();
-    return eff;
-}
-
-int16_t PID_Controller_GetEffectiveSetpoint(void)
-{
-    return effective_setpoint();
-}
-
 int16_t PID_Controller_Compute(void)
 {
     int16_t error;
@@ -135,10 +114,8 @@ int16_t PID_Controller_Compute(void)
     int32_t output;
     int16_t cur_kp, cur_ki, cur_kd;
 
-    /* 计算误差: 使用有效设定值(用户设定 + 自动加温抬升), 抬升不越 Boost 上限.
-     * 注意: 钳位用 Boost 上限而非 temp_max, 否则用户设到接近 temp_max 时
-     * Boost 抬升会被压死、T12(400/+450)在大焊点下无法继续抬温. */
-    error = (int16_t)(effective_setpoint() - pid.measured);
+    /* 计算误差: 目标温度已在 SetSetpoint 中统一钳位到 [TEMP_MIN, 型号 temp_max] */
+    error = (int16_t)(pid.setpoint - pid.measured);
 
     /* 分段控制 */
     if (error > 50)
@@ -265,17 +242,6 @@ void PID_Controller_SetConsKd(int16_t kd)
     pid.cons_kd = kd;
 }
 
-void PID_Controller_SetBoostOffset(int16_t offset)
-{
-    if (offset < 0) offset = 0;
-    pid.boost_offset = offset;
-}
-
-int16_t PID_Controller_GetBoostOffset(void)
-{
-    return pid.boost_offset;
-}
-
 int16_t PID_Controller_GetOutput(void)
 {
     return pid.output;
@@ -297,6 +263,8 @@ int16_t PID_Controller_GetOutput(void)
  *   - 拐点检测: 温度差分变号 + 最小半周期迟滞(MIN_HALF)滤除噪声小振荡.
  */
 #define TUNE_DUTY_ON        (PID_OUTPUT_MAX * 70 / 100)   /* 继电加热段输出 70% */
+#define TUNE_T12_MAX        400      /* T12 整定温度上限: 比加热上限(450)低一档,
+                                      * 给继电振荡峰值(设定点上方约 ±30°C)留安全余量 */
 #define TUNE_HALF_REQUIRED  8        /* 8 个半周期 = 4 个完整周期 */
 #define TUNE_CYCLES_REQUIRED (TUNE_HALF_REQUIRED / 2)     /* 对外汇报的完整周期数 */
 #define TUNE_MIN_HALF       5        /* 半周期最短 5 周期(1s), 更短视为噪声 */
@@ -316,6 +284,7 @@ static struct {
     uint16_t timer;          /* 当前半周期计时, 每接受一个半周期清零(用于量取半周期长度) */
     uint32_t total_timer;    /* 整定总计时(周期数), 全程不清零, 用于总时长超时 */
     int16_t  last_x10;       /* 上帧温度 °C×10 */
+    int16_t  ext_x10;        /* 本半周期内跟踪到的极值 °C×10 (升段取最大/降段取最小) */
     int8_t   direction;      /* +1 升 / -1 降 / 0 未知 */
     bool     tracking;       /* 已捕获首个有效拐点 */
     bool     finished;
@@ -327,10 +296,18 @@ static struct {
 void PID_TuneStart(int16_t setpoint)
 {
     /* 钳位到合法温度范围, 保证继电振荡安全。
-     * 上限用型号温度上限(而非 Boost 上限): 振荡会在设定点上再叠 ±30°C 左右,
-     * 若按 Boost 上限(如 T12 的 450)钳位, 峰值可达约 480°C, 远超标称上限。 */
-    if (setpoint > (int16_t)Config_GetTempMax())
-        setpoint = (int16_t)Config_GetTempMax();
+     * 上限用型号温度上限: 振荡会在设定点上再叠 ±30°C 左右,
+     * 若按更宽的上限钳位, 峰值会远超标称上限。
+     * T12 再收紧一档到 TUNE_T12_MAX: T12 头按 450 整定时振荡峰值可达 ~480°C,
+     * 已超出多数 T12 头的标称范围; 整定所得增益对全温区同样适用, 故用略低的
+     * 激励温度换安全余量(加热上限仍是 450, 不受影响)。 */
+    int16_t cap = (int16_t)Config_GetTempMax();
+
+    if (Config_GetHandleIdx() == HANDLE_T12 && cap > TUNE_T12_MAX)
+        cap = TUNE_T12_MAX;
+
+    if (setpoint > cap)
+        setpoint = cap;
     else if (setpoint < TEMP_MIN)
         setpoint = TEMP_MIN;
 
@@ -343,6 +320,7 @@ void PID_TuneStart(int16_t setpoint)
     tune.timer      = 0;
     tune.total_timer = 0;
     tune.last_x10   = 0;
+    tune.ext_x10    = 0;
     tune.direction  = 0;
     tune.tracking   = false;
     tune.finished   = false;
@@ -417,19 +395,28 @@ int16_t PID_TuneAdvance(int16_t measured)
 
         if (dir != tune.direction && dir != 0 && tune.direction != 0)
         {
-            /* 方向翻转: 记录刚结束那段的极值(用翻转帧近似), 且要求间隔够长 */
+            /* 方向翻转: 结算刚结束那一段的**跟踪极值**(而不是翻转帧温度).
+             * 真实峰谷落在两次采样之间, 用翻转帧温度会低估振荡幅值 a; 而
+             * Ku = 4h/(πa) 与 a 成反比 —— 低估 a 会让 Ku 偏大, 整定出的增益偏激进. */
             if (tune.tracking && tune.timer >= TUNE_MIN_HALF)
             {
                 if (tune.direction > 0)
-                    tune.peak_sum += cur_x10;
+                    tune.peak_sum   += tune.ext_x10;
                 else
-                    tune.valley_sum += cur_x10;
+                    tune.valley_sum += tune.ext_x10;
 
                 tune.half_len_sum += tune.timer;
                 tune.half_count++;
                 tune.timer = 0;
             }
             tune.tracking = true;
+            tune.ext_x10  = cur_x10;   /* 新半周期: 极值从翻转点重新跟踪 */
+        }
+        else if (tune.tracking && dir != 0)
+        {
+            /* 同向推进: 继续跟踪本半周期极值(升段取最大 / 降段取最小) */
+            if (dir > 0) { if (cur_x10 > tune.ext_x10) tune.ext_x10 = cur_x10; }
+            else         { if (cur_x10 < tune.ext_x10) tune.ext_x10 = cur_x10; }
         }
     }
 
@@ -453,9 +440,11 @@ int16_t PID_TuneAdvance(int16_t measured)
 
         if (amp_x10 >= TUNE_AMP_MIN_X10 && tu_cycles > 0 && avg_peak > tune.setpoint * 10 && avg_valley < tune.setpoint * 10)
         {
-            /* Ku_x1000 = 4h×1000/(π·a_deg); h=350(0~700 方波幅值), a_deg=amp_x10/10
-             *          = 14000×1000/(π·amp_x10) */
-            ku_x1000 = (int64_t)14000000 * 1000 / (3142 * amp_x10);
+            /* Ku_x1000 = 4h×1000/(π·a_deg), a_deg = amp_x10/10
+             *          = 4h×10000/(π·amp_x10)
+             * 其中 h = 继电方波幅值(相对均值) = TUNE_DUTY_ON/2. 由 TUNE_DUTY_ON
+             * 推导而非写死常数 —— 否则改 PID_OUTPUT_MAX 时此处不会同步, Ku 会整体偏移. */
+            ku_x1000 = (int64_t)(4 * (TUNE_DUTY_ON / 2) * 10000) * 1000 / (3142 * amp_x10);
             tune.gain.kp = tune_gain_sat(60 * ku_x1000 / 1000);
             /* 控制器每 200ms 周期积分/微分一次, Z-N 连续公式需换算成"每周期"增益:
              *   Ki_cycle = Kp/(0.5·Tu_sec)×0.2 = 2·Kp_stored/tu_cycles

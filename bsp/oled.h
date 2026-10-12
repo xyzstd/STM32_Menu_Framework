@@ -5,35 +5,35 @@
 #include "oled_data.h"
 
 
-/* OLED�ֱ���
- * �޸�OLED_HEIGHT����֧��128x64 / 128x32
+/* OLED 分辨率
+ * 修改 OLED_HEIGHT 即可支持 128x64 / 128x32
  */
 #define OLED_WIDTH          128U
 #define OLED_HEIGHT         64U
 
-/* SSD1315ҳ�߶� */
+/* SSD1315 页高度 */
 #define OLED_PAGE_HEIGHT    8U
 
-/* ҳ���� */
+/* 页数量 */
 #define OLED_PAGE_NUM       (OLED_HEIGHT/OLED_PAGE_HEIGHT)
 
 
-/* ��ͼ��ɫ */
+/* 绘图颜色 */
 #define OLED_COLOR_CLEAR    0U
 #define OLED_COLOR_SET      1U
 #define OLED_COLOR_XOR      2U
 
 
-/* ����ߴ� */
+/* 字体尺寸 */
 #define OLED_8X16            16U
 #define OLED_6X8             6U
 
 
-/* OLED�Դ�
+/* OLED 显存
  *
- * SSD1306/SSD1315ҳģʽ:
+ * SSD1306/SSD1315 页模式:
  *
- * һ��byte��������8������
+ * 一个 byte 代表纵向 8 个像素
  *
  * OLED_DisplayBuf[page][x]
  *
@@ -42,17 +42,21 @@ extern uint8_t OLED_DisplayBuf[OLED_PAGE_NUM][OLED_WIDTH];
 
 
 
-/*================ ��ʼ�� =================*/
+/*================ 初始化 =================*/
 
 void OLED_Init(void);
 
 
 
-/*================ ˢ�� =================*/
+/*================ 刷新 =================*/
 
 void OLED_Update(void);
 
+/* 页级差量标记: 比较指纹, 把内容变化的页记入脏页位图(不推送 I2C) */
 void OLED_UpdateDiff(void);
+
+/* 主循环每轮调用: 推送一页待推脏页(分帧推送, 单次阻塞 ≤1.5ms, 不卡输入) */
+void OLED_FlushStep(void);
 
 
 
@@ -70,10 +74,10 @@ void OLED_FillArea(int16_t x,int16_t y,
 
 
 
-/*================ ���� =================*/
+/*================ 像素操作 =================*/
 
 /*
- * ����ͼ�κ������յ��ô˽ӿ�
+ * 所有图形函数最终调用此接口
  *
  * page = y >> 3
  * bit  = y & 0x07
@@ -83,7 +87,7 @@ void OLED_DrawPixel(int16_t x,int16_t y,
 
 
 
-/*================ ͼ�� =================*/
+/*================ 图形 =================*/
 
 void OLED_DrawLine(int16_t x0,int16_t y0,
                    int16_t x1,int16_t y1,
@@ -107,7 +111,7 @@ void OLED_DrawRoundRect(int16_t x,int16_t y,
 
 
 
-/*================ ��Ч =================*/
+/*================ 特效 =================*/
 
 void OLED_ReverseArea(int16_t x,int16_t y,
                       uint8_t width,uint8_t height);
@@ -122,7 +126,7 @@ void OLED_ReverseRoundRect(int16_t x,int16_t y,
                            uint8_t radius);
 
 
-/*================ ͼƬ =================*/
+/*================ 图片 =================*/
 
 void OLED_ShowImage(int16_t x,int16_t y,
                     uint8_t width,uint8_t height,
@@ -130,7 +134,7 @@ void OLED_ShowImage(int16_t x,int16_t y,
 
 
 
-/*================ =================*/
+/*================ 字符 =================*/
 
 void OLED_ShowChar(int16_t x,int16_t y,
                    char ch,uint8_t font);
@@ -157,7 +161,7 @@ void OLED_ShowLargeChar(int16_t x,int16_t y,char ch);
 void OLED_ShowLargeNum(int16_t x,int16_t y,int32_t num);
 
 
-/*================ =================*/
+/*================ 进度条 =================*/
 
 void OLED_DrawProgressBar(int16_t x,int16_t y,
                           uint8_t width,uint8_t height,

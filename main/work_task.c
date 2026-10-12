@@ -1,4 +1,4 @@
-﻿#include "work_task.h"
+#include "work_task.h"
 #include "timer.h"
 #include "adc.h"
 #include "pid_controller.h"
@@ -26,6 +26,11 @@
 
 #define PID_INTERVAL_MS          200    /* PID 控制周期 (ms) */
 #define TEMP_REACHED_THRESHOLD   5      /* 温度到达阈值 */
+/* 到达判定去抖: 需连续 N 个 PID 周期都落在阈值内才置"到达"(200ms/周期).
+ * 单帧判定在阈值附近会被滤波残余抖动反复翻转 —— 虽已用 prev 去重避免重复鸣叫,
+ * 但偶发的单帧越界仍会打断"已到达"状态并再触发一次蜂鸣. 取 2 个周期(400ms)
+ * 既滤掉单帧毛刺, 又保持提示及时. */
+#define TEMP_REACHED_CNT         2
 #define OVER_TEMP_LIMIT          500    /* 过温保护阈值 (°C) */
 /* 温度换算合理上界: 必须高于 OVER_TEMP_LIMIT. 否则 adc_to_temp 把读数钳到
  * OVER_TEMP_LIMIT 后, run_pid_cycle 的 `meas_temp > OVER_TEMP_LIMIT` 永不成立,
@@ -55,31 +60,6 @@
 #define DIAG_CHECK_MS            20000
 #define DIAG_TEMP_RISE_THRESHOLD 5
 
-/* 大焊点自动加温 (Boost): 实测温度连续大幅低于设定值判定烙铁头热量不足
- * (压在大焊点/地平面/大面积铜箔上吸热), 自动抬升设定温度, 恢复后回落.
- *
- * 触发前提(防误判):
- *   - 该目标温度下曾真正"到达"(boost_enabled 锁存), 冷启动/调温/唤醒不算;
- *   - 只在工作态且加热器正常、供电充足时生效;
- *   - 持续 1.5s 才触发; 抬升量按"曲线"平滑爬升/回落, 不一次性跳满;
- *   - 单次最长 6s, 超时判定异常强制结束并进入冷却, 防反复抢功率. */
-#define BOOST_SAG_THRESHOLD      30     /* 温差超过 30°C 判定为"压住大焊点" */
-#define BOOST_SAG_MS             1500   /* 温差须持续 1.5s, 避免冷启动/温度到达误触发 */
-#define BOOST_RISE_DEG           50     /* 抬升幅度 °C */
-#define BOOST_RAMP_RATE          8      /* 每 PID 周期(200ms)抬升/回落 °C, 形成平滑升温曲线 */
-#define BOOST_RECOVER_HYS        10     /* 回到设定值上方 10°C 内即认为已恢复 */
-#define BOOST_MAX_MS             6000   /* 单次 Boost 最长 6s, 超时判定为异常强制结束 */
-#define BOOST_COOLDOWN_MS        10000  /* 异常结束后至少冷却 10s 才允许再次触发 */
-#define BOOST_RECOVER_COOLDOWN_MS 5000  /* 正常恢复后短冷却 5s, 防连续大负载反复抬温 */
-#define BOOST_VIN_MIN_x10        180    /* 供电低于 18.0V 不 Boost, 防止供电不足时误判加功率 */
-
-static int16_t  last_setpoint;   /* 上一周期设定值, 检测调温/唤醒重置 */
-static int16_t  boost_target;    /* 抬升后的有效目标温度 */
-static bool     boost_enabled;   /* 该目标温度下曾真正到达过(锁存) */
-static uint32_t boost_cooldown;  /* 冷却倒计时剩余 ms, 0=允许触发 */
-static uint32_t boost_sag;       /* 触发前: 实测连续大幅低于设定值的持续时间 ms */
-static uint32_t boost_rt;        /* 触发后: 本次 Boost 已持续 ms */
-
 /* 运行时目标温度 (RAM, 不落 flash): HOME 页临时调解的温度保存在此,
  * 整个运行期间持续生效, 休眠唤醒时恢复到该值而非默认值. 掉电丢失. */
 static int16_t  runtime_temp;
@@ -108,8 +88,8 @@ static bool     sleep_suppress;
  * 断热不控热, 让热态烙铁头自然降温到冷态后完成标定. */
 static bool     cal_suppress;
 
-/* 插头不匹配引导断热: 自检发现当前型号(T12, 上限400°C)已标定但插入头电流
- * 不符(插了 450°C 量级头)时置位, 引导用户进 Cur Cal 标定新头前持续断热,
+/* 插头不匹配引导断热: 自检发现当前配置型号已标定、但插入头电流不符
+ * (插了另一量级的头)时置位, 引导用户进 Cur Cal 标定新头前持续断热,
  * 标定完成或跳过后由 BootCalDone 清除. */
 static bool     tip_guide;
 
@@ -165,10 +145,11 @@ static bool     type_guide_boot;
 #define SELFTEST_VIN_MIN_x10     90     /* 供电低于 9.0V 判电源异常 */
 #define SELFTEST_VIN_MAX_x10     300    /* 供电高于 30.0V 判电源异常 */
 
-/* 出厂经验门限: 450°C 型号配置下, 实测脉冲电流低于此值按"T12 量级"拒加热.
+/* 出厂经验门限(最后兜底): 非 T12 型号配置下, 实测脉冲电流低于此值按"T12 量级"拒加热.
  * T12 冷阻(≈8Ω)远高于 T245/T210(≈2/3Ω), 同占空比下导通电流仅约其 1/4.
- * 与"T12 参考 ×1.8"推导门限互为冗余, 覆盖 T12 也未标定的首次使用场景.
- * 0 = 出厂占位(不拦截), 待真机标定后填入经验值. */
+ * 仅在"T12 与参与比对的型号都未标定"时才会用到(见 is_t12_scale); 那种状态 UI 会先
+ * 引导 Cur Cal 标定, 正常使用到不了这里. 0 = 不拦截.
+ * 注意: 它不再是"T12 未标定"时的唯一门限 —— 那会让粗保护退化为放行(已修). */
 #define TYPE_CUR_COARSE_T12_MAX  0
 
 /* ========== 发热芯型号匹配 (两级保护) ==========
@@ -177,23 +158,33 @@ static bool     type_guide_boot;
  *
  * 第1级 细匹配: 当前型号已标定(参考值≠0)时, 实测须落在 参考值±30% 区间,
  *               裕量覆盖批次差异与手柄接口接触电阻; 不匹配 → 拒加热.
- * 第2级 粗保护: 防最危险场景"T12 头被 450°C 型号(T245/T210)配置加热烧毁".
+ * 第2级 粗保护: 防最危险场景"T12 头插进非 T12 型号(T245/T210)配置".
  *               T12 冷阻最高 → 同脉冲电流量级仅约 450°C 型号的 1/4, 故对
- *               temp_max>400 的型号, 实测电流低于"T12 量级上限"即拒.
+ *               非 T12 配置, 实测电流低于"T12 量级上限"即拒.
  *               门限取 T12 参考 ×1.8 (T12 头实测≤1.3×ref, 450°C 型号实测
  *               ≥2.8×ref, 1.8 落在两量级之间留足裕量); T12 未标定时退化为
  *               出厂经验门限 TYPE_CUR_COARSE_T12_MAX (0=待真机标定前不拦截).
+ *
+ * 保护依据(与温度上限无关): 温度换算曲线(cal_t)与 PID 增益都是按**配置型号**
+ *               标定的; 插错头后读数与实际温度不再对应、增益也失配, 实际温度
+ *               可能明显偏离目标. 三型号上限统一为 450 后这一点**并未改变** ——
+ *               该保护依然有效, 只是不再以"450 超过 T12 额定"为由.
+ *               另有实际收益: 及时告知"插错头", 而不是静默用错误曲线控温
+ *               (那会让用户按错误读数焊接).
+ *
+ * 注: 三型号温度上限已统一为 450°C, 判据一律按"配置型号是否为 T12", 不再用
+ *     原来的 "temp_max>400" —— 统一上限后该式恒真, 会让 T12 头在任何配置下被拒.
  *
  * [2026-09-22 升级] 三档判型取代单参考 ±30% 细匹配:
  *   以 T12 冷态参考为锚, 两个边界把 T12/T210/T245 三档切开, 判型结果与
  *   配置型号比对. 解决旧 ±30% 窗口对 T245/T210(阻值仅差 1.5 倍)裕量仅
  *   ~4.6% 不可靠的问题. 边界裕量: T12 侧 15%+, T210/T245 侧 20%+.
- *   分级处置: 危险(T12 量级进 450°C 配置) → 锁 Err4; 无害(450°C 级互插、
+ *   分级处置: 危险(T12 量级进非 T12 配置) → 锁 Err4; 无害(450°C 级互插、
  *   T12 配置插 450°C 头) → 引导 Tip Cal 校正不锁死. */
 
 #if !HW_SIM_MODE
 static uint8_t classify_tip_cur(uint16_t cur);
-static bool is_t12_scale(uint16_t cur);
+static bool is_t12_scale(uint16_t cur, uint8_t idx);
 #endif
 static bool type_cur_match(uint16_t cur, uint8_t idx);
 
@@ -216,21 +207,17 @@ static void check_sleep_shutdown(uint32_t now);
 static void latch_fault(bool *fault_flag);
 static void check_heater_diagnostic(uint32_t now);
 
-static void boost_reset(void);
-static void boost_advance(int16_t meas_temp);
+static void run_pid_cycle(void);
 
 #if !HW_SIM_MODE
 static void boot_cal_eval(void);
 static void selftest_advance(void);
 #endif
 
-static void run_pid_cycle(void);
-
 static void WorkTask_Retry(void);
 
-#if !HW_SIM_MODE
-static uint16_t pulse_cur_raw(void);
-#endif
+/* 非阻塞测量脉冲推进: 两种模式都有实现(模拟模式在 Start 里直接置就绪) */
+static bool pulse_step(void);
 
 
 #if !HW_SIM_MODE
@@ -248,12 +235,25 @@ static uint8_t classify_tip_cur(uint16_t cur)
 
 /* "T12 量级"判定 (冷态/热态通用): 危险分流专用 —— 热态下 T245/T210 电流
  * 衰减不可判型, 但 T12 头电流仍远低于门限, 故该判定在热态依然可靠.
- * T12 参考已标定 → 电流 <1.5×ref; 未标定 → 退回出厂经验门限(0=待真机标定). */
-static bool is_t12_scale(uint16_t cur)
+ * idx = 参与比对的 450°C 型号(用它的参考值反推门限).
+ *   ① T12 自身已标定 → 门限 = 1.5×ref_T12 (T12 头实测 ≤1.3×ref, 留 15% 裕量).
+ *   ② T12 未标定 → 改用 idx 自身参考反推: T12 冷阻(≈8Ω) 约为 T245(≈2Ω) 的 4 倍、
+ *      T210(≈3Ω) 的 2.7 倍, 故同脉冲下电流仅约其 1/4 与 0.37. 取 idx 参考的 1/2
+ *      作分界: T245 配置下 T12(0.25) 被判出、T210(0.67) 不误伤; T210 配置下
+ *      T12(0.37) 被判出、T245(1.5) 不误伤 —— 两侧裕量均 ≥1.3 倍.
+ *      (原实现在此直接返回 false, 使 T12 未标定时粗保护完全失效, 属"失败开放".)
+ *   ③ idx 也未标定 → 退回出厂经验门限 TYPE_CUR_COARSE_T12_MAX(0=不拦截;
+ *      该场景 UI 会先引导 Cur Cal 标定, 正常使用不会停留在这里). */
+static bool is_t12_scale(uint16_t cur, uint8_t idx)
 {
     uint32_t floor = (uint32_t)TypeCal_GetRef(HANDLE_T12) * 15 / 10;
+
     if (floor == 0)
-        floor = TYPE_CUR_COARSE_T12_MAX;
+    {
+        uint32_t self = TypeCal_GetRef(idx);
+        floor = (self != 0) ? (self / 2) : TYPE_CUR_COARSE_T12_MAX;
+    }
+
     return floor != 0 && (uint32_t)cur < floor;
 }
 #endif
@@ -265,8 +265,10 @@ static bool type_cur_match(uint16_t cur, uint8_t idx)
     uint8_t cls = classify_tip_cur(cur);
     if (cls != 0xFF)
     {
-        /* 危险: 450°C 型号配置下判为 T12 量级 → 必锁 (烧 T12 头) */
-        if (cls == HANDLE_T12 && g_config.temp_max[idx] > 400)
+        /* 危险: 非 T12 型号配置下判为 T12 量级 → 必锁 (烧 T12 头).
+         * 判据按"型号"而非温度上限 —— 三型号上限已统一为 450, 原 "temp_max>400"
+         * 会恒真, 导致连 T12 配置也被拒(无法使用 T12 头). */
+        if (cls == HANDLE_T12 && idx != HANDLE_T12)
             return false;
         /* 判型与配置型号不一致: 含 T12 配置插 450°C 头、T245/T210 互插
          * (无害但需校正) → 上层分流引导, 本层统一判不匹配 */
@@ -274,8 +276,8 @@ static bool type_cur_match(uint16_t cur, uint8_t idx)
             return false;
         return true;
     }
-    /* T12 未标定: 退化为粗保护出厂门限 (0=待真机标定前不拦截) */
-    if (g_config.temp_max[idx] > 400 && is_t12_scale(cur))
+    /* T12 未标定: 仍用 idx 自身参考反推粗门限 (详见 is_t12_scale) */
+    if (idx != HANDLE_T12 && is_t12_scale(cur, idx))
         return false;
 #endif
     return true;
@@ -307,6 +309,7 @@ static struct {
     int16_t      power;
     bool         temp_reached;
     bool         temp_reached_prev;
+    uint8_t      reached_cnt;        /* 到达判定去抖: 连续满足阈值的周期数 */
 
     /* 输入电压 */
     uint16_t     vin_adc;            /* 最新输入电压 ADC 值 */
@@ -626,122 +629,6 @@ static void check_heater_diagnostic(uint32_t now)
     work.diag_tick = now;   /* 检测完成复位计时: 缺失会导致诊断间隔退化为 200ms 误判故障 */
 }
 
-/* 清除 Boost 自动加温状态: 设定值变化/型号切换/手柄断开/异常结束后调用,
- * 防止残留抬升量跨状态叠加到有效设定值. */
-static void boost_reset(void)
-{
-    boost_sag       = 0;       /* 触发前计时清零 */
-    boost_rt        = 0;       /* 本次持续计时清零 */
-    boost_enabled   = false;   /* 需重新"到达"才允许触发 */
-    boost_target    = 0;       /* 抬升目标归零, offset 由斜坡自然回落 */
-}
-
-/* Boost 状态机单步推进 (每 PID 周期调用一次):
- * 仅在"该目标温度下曾真正到达"且处于工作态、加热器正常、供电充足时,
- * 若实测连续大幅低于设定值(压在大面积焊点/铜箔上吸热), 自动抬升有效
- * 设定值扩大加热; 抬升按曲线平滑爬升, 恢复/超时后平滑回落.
- * 纯计算无副作用, 只依赖 Boost 静态状态与 PID 控制器. */
-static void boost_advance(int16_t meas_temp)
-{
-    int16_t setpoint = PID_Controller_GetSetpoint();
-    int16_t cur_off  = PID_Controller_GetBoostOffset();
-    int16_t diff     = (int16_t)(setpoint - meas_temp);
-
-    /* 0. 设定值变化(用户调温/休眠/唤醒) → 必须重新"到达"才允许 Boost,
-     *    清除残留抬升(需要时由下方斜坡自然回落到 0) */
-    if (setpoint != last_setpoint)
-    {
-        last_setpoint  = setpoint;
-        boost_sag      = 0;
-        boost_rt       = 0;
-        boost_enabled  = false;
-        boost_target   = 0;
-    }
-
-    /* 冷却倒计时递减 */
-    if (boost_cooldown > 0)
-    {
-        if (boost_cooldown >= PID_INTERVAL_MS)
-            boost_cooldown -= PID_INTERVAL_MS;
-        else
-            boost_cooldown = 0;
-    }
-
-    if (boost_target > 0)
-    {
-        /* 加温中: 用有效设定值(含抬升)判断恢复 —— 温度追到抬升目标附近
-         * 才算真正恢复, 避免大焊点尚未融化、温度只回到基础设定值就提前回落.
-         * 恢复后目标归零, 下方斜坡平滑回落抬升量. */
-        int16_t eff_set  = PID_Controller_GetEffectiveSetpoint();
-        int16_t diff_eff = (int16_t)(eff_set - meas_temp);
-        if (diff_eff <= BOOST_RECOVER_HYS)
-        {
-            boost_target   = 0;
-            /* 正常恢复也必须清零"本次持续计时": 步进门(见 run_pid_cycle 第8步
-             * `if (boost_rt == 0) check_heater_diagnostic`)以 boost_rt==0 判
-             * "非抬升期". 只清 boost_target 会让 boost_rt 停在恢复时的正值,
-             * 于是加热器故障诊断在本次开机剩余时间里被永久抑制 ——
-             * 加热丝真实失效(尤其 T245/T210 热电偶独立于加热丝)将既不加热也不报警. */
-            boost_rt       = 0;
-            /* 正常恢复也给短冷却: 否则连续大负载(焊点一个接一个)会在回落瞬间
-             * 再次触发, 使抬升量长期贴着上限、功率被反复抢占 */
-            boost_cooldown = BOOST_RECOVER_COOLDOWN_MS;
-        }
-        else
-        {
-            /* 时长限制: 长时间仍回不了温 → 判定为异常(非焊点), 强制结束进冷却 */
-            boost_rt += PID_INTERVAL_MS;
-            if (boost_rt >= BOOST_MAX_MS)
-            {
-                boost_target   = 0;
-                boost_rt       = 0;
-                boost_enabled  = false;
-                boost_cooldown = BOOST_COOLDOWN_MS;
-            }
-        }
-    }
-
-    /* 需要升降斜坡 (正在抬升或 offset 未归零): 向目标抬升量逼近,
-     * 恢复/超时后目标为 0 → 自然沿斜坡回落, 避免 offset 残留.
-     * 抬升/回落期间不累计低温计时, 防止升到一半被重复触发 */
-    if (boost_target > 0 || cur_off > 0)
-    {
-        int16_t rise_target = (int16_t)(boost_target - setpoint);
-        int16_t delta;
-
-        if (rise_target < 0) rise_target = 0;
-        delta = (int16_t)(rise_target - cur_off);
-        if (delta >  BOOST_RAMP_RATE) delta =  BOOST_RAMP_RATE;
-        else if (delta < -BOOST_RAMP_RATE) delta = -BOOST_RAMP_RATE;
-        PID_Controller_SetBoostOffset((int16_t)(cur_off + delta));
-        boost_sag = 0;
-    }
-    else if (boost_enabled
-             && diff >= BOOST_SAG_THRESHOLD
-             && work.state == WORK_STATE_ACTIVE
-             && !work.heater_fault
-             && Heater_IsEnabled()
-             && work.vin_voltage_x10 >= BOOST_VIN_MIN_x10
-             && boost_cooldown == 0)
-    {
-        /* 实测连续大幅低于设定值(压住大焊点吸热): 累计低温时长,
-         * 持续 1.5s 才触发, 避免冷启动/温度到达瞬间误触发 */
-        boost_sag += PID_INTERVAL_MS;
-        if (boost_sag >= BOOST_SAG_MS)
-        {
-            boost_target = (int16_t)(setpoint + BOOST_RISE_DEG);
-            if (boost_target > (int16_t)Config_GetBoostMax())
-                boost_target = (int16_t)Config_GetBoostMax();
-            boost_sag = 0;
-            boost_rt  = 0;
-        }
-    }
-    else
-    {
-        boost_sag = 0;
-    }
-}
-
 /* 上电硬件链路自检 (每 PID 周期推进一步, 仅真实硬件模式):
  * 依次判定 热电偶短路/开路 → 发热芯断芯/短路(测量脉冲+注入组电流) → 输入电压范围.
  * 任一失败置 selftest_fault 锁存断热并记录故障码(UI 显示), 故障码保留至
@@ -808,7 +695,7 @@ static void selftest_advance(void)
 
             /* 型号匹配: 冷态脉冲电流三档判型须与当前配置型号一致 (T12 未标定
              * 退化粗保护); 不匹配时按危险度分流:
-             *   危险(T12 量级头进 450°C 配置) → 锁 Err4 拒绝;
+             *   危险(T12 量级头进非 T12 配置) → 锁 Err4 拒绝;
              *   无害(T12 配置插 450°C 头、T245/T210 互插) → 引导 Tip Cal 校正.
              * 仅冷态权威判定 (与 CheckChain 冷态分支一致): 热态(掉电重启或
              * Recover 重检时头未冷)下 450°C 头电流随温升衰减, 会被 is_t12_scale
@@ -819,10 +706,12 @@ static void selftest_advance(void)
                 !type_cur_match(cur, Config_GetHandleIdx()))
             {
                 uint8_t idx = Config_GetHandleIdx();
-                /* 危险场景: 450°C 型号配置下实测为 T12 量级 → 锁 Err4, 必须换头
-                 * 或切换型号, 不引导标定(标定 T12 参考也无法在 450°C 下安全加热).
-                 * is_t12_scale 冷态/热态均可靠 (T12 头电流量级远低于门限). */
-                if (g_config.temp_max[idx] > 400 && is_t12_scale(cur))
+                /* 危险场景: 非 T12 配置下实测为 T12 量级 → 锁 Err4, 必须换头或切换
+                 * 型号, 不引导标定 —— 该配置的温度曲线与 PID 增益都按 T245/T210
+                 * 标定, 插 T12 头时读数与实际不符且增益失配, 实际温度可能偏离到
+                 * 危险区间; 此风险与温度上限是否 450 无关(三型号已统一), 故仍按
+                 * "必须换头"处理. is_t12_scale 冷态/热态均可靠(电流量级远低于门限). */
+                if (idx != HANDLE_T12 && is_t12_scale(cur, idx))
                 {
                     work.selftest_code  = SELFTEST_CODE_TYPE;
                     work.selftest_fault = true;
@@ -954,7 +843,7 @@ static void run_pid_cycle(void)
      * 单位: AD_GetCpuTempC 返回 °C×10(cpu_temp_ref 亦为同尺度), 而 meas_temp
      * 为整数 °C —— 故差值必须 /10 后才可叠加, 否则补偿被放大 10 倍:
      * 例如 MCU 自热 +5.0°C 会给实测温度凭空加上 +50°C, 进而污染 PID、
-     * 显示、Boost 判据、加热器诊断与 500°C 过温锁存. */
+     * 显示、加热器诊断与 500°C 过温锁存. */
     {
         int16_t cpu_now = AD_GetCpuTempC();
         cpu_temp_filt += ((int32_t)(cpu_now - cpu_temp_filt) * CPU_TEMP_FILT_K) >> 10;
@@ -1002,7 +891,7 @@ static void run_pid_cycle(void)
     PID_Controller_SetMeasured(meas_temp);
 
     /* 4.5 自整定模式: 继电反馈. 过温/过流保护已在上方执行; 整定中跳过
-     * PID/Boost/前馈(由继电输出接管)与加热诊断(振荡温升会误报诊断). */
+     * PID/前馈(由继电输出接管)与加热诊断(振荡温升会误报诊断). */
     if (PID_TuneActive())
     {
         work.power = PID_TuneAdvance(meas_temp);
@@ -1041,24 +930,20 @@ static void run_pid_cycle(void)
         return;
     }
 
-    /* 4.6 大焊点自动加温 (Boost): 见 boost_advance() 注释 */
-    boost_advance(meas_temp);
-
     /* 5. 执行分段 PID 计算 */
     power = PID_Controller_Compute();
 
     /* 5.5 开环前馈预置: 温差大时按查表直接给大占空比, 加速冷启动/大焊点回温.
      * PID 只负责接近设定后的稳态微调; 温差≤0 时前馈归零, 完全不干扰稳态.
      * 取 max 而非线性叠加, 升温段前馈接管, 避免 PID 积分从零缓慢爬升.
-     * setpoint 取 PID_Controller_GetEffectiveSetpoint()(含 Boost 抬升后的有效目标),
-     * 温差反映"距有效目标还差多少", 与 Boost 不冲突.
+     * setpoint 取 PID_Controller_GetSetpoint()(已在 SetSetpoint 中按型号 temp_max 钳位).
      * 查表改为**段内线性插值**(断点 (0,0)(10,180)(25,350)(50,600)(100,900)) —— 原实现
      * 是硬阶跃, diff 跨过 10°C 时 ff 从 180 直接归零, 输出瞬间最多掉 18% 占空比,
      * 温度会下陷再靠 PID 爬回, 在接近设定点处易形成小振荡. 表值 0~1000 尺度. */
     {
         static const int16_t ff_d[5] = { 0, 10, 25, 50, 100 };
         static const int16_t ff_v[5] = { 0, 180, 350, 600, 900 };
-        int16_t setpoint = PID_Controller_GetEffectiveSetpoint();
+        int16_t setpoint = PID_Controller_GetSetpoint();
         int16_t diff     = (int16_t)(setpoint - meas_temp);   /* >0 = 需要加热 */
         int16_t ff       = 0;
 
@@ -1090,11 +975,18 @@ static void run_pid_cycle(void)
         if (diff < 0)
             diff = (int16_t)(-diff);
 
-        work.temp_reached = (diff <= TEMP_REACHED_THRESHOLD);
-
-        /* 曾真正到达过 → 允许本目标温度下后续触发 Boost (冷启动升温中不武装) */
-        if (work.temp_reached)
-            boost_enabled = true;
+        /* 去抖: 连续 TEMP_REACHED_CNT 个周期在阈值内才置位; 一旦越界立即清零
+         * (置位慢、清除快 —— 提示要稳, 退出要及时) */
+        if (diff <= TEMP_REACHED_THRESHOLD)
+        {
+            if (work.reached_cnt < TEMP_REACHED_CNT)
+                work.reached_cnt++;
+        }
+        else
+        {
+            work.reached_cnt = 0;
+        }
+        work.temp_reached = (work.reached_cnt >= TEMP_REACHED_CNT);
 
         if (work.temp_reached && !work.temp_reached_prev)
         {
@@ -1103,10 +995,8 @@ static void run_pid_cycle(void)
         work.temp_reached_prev = work.temp_reached;
     }
 
-    /* 8. 加热器故障检测 (Boost 抬升期间抑制: 大焊点吸热极强, 抬升目标后
-     * 10s 温升可能 <5°C, 会误锁存 heater_fault; 与自整定跳过诊断同构) */
-    if (boost_rt == 0)
-        check_heater_diagnostic(Timer_GetTick());
+    /* 8. 加热器故障检测 (自整定期间已在上方提前返回, 不在此列) */
+    check_heater_diagnostic(Timer_GetTick());
 }
 
 
@@ -1130,6 +1020,7 @@ void WorkTask_Init(void)
     work.power = 0;
     work.temp_reached = false;
     work.temp_reached_prev = false;
+    work.reached_cnt = 0;
     work.vin_adc = 0;
     work.vin_voltage_x10 = 0;
     work.temp_filt = (int32_t)AD_GetT12();   /* 首次滤波以当前读数初始化, 避免从 0 爬升 */
@@ -1158,14 +1049,6 @@ void WorkTask_Init(void)
 
     PID_Controller_SetSetpoint((int16_t)g_config.default_temp);
     PID_Controller_Reset();
-
-    /* Boost 状态初值 */
-    boost_sag       = 0;
-    boost_rt        = 0;
-    boost_enabled   = false;
-    boost_cooldown  = 0;
-    boost_target    = 0;
-    last_setpoint   = (int16_t)g_config.default_temp;
 
     /* 运行时目标温度初值 = 默认温度 (RAM, 掉电丢失) */
     runtime_temp = (int16_t)g_config.default_temp;
@@ -1217,6 +1100,13 @@ void WorkTask_Process(void)
     }
 #endif
 
+    /* 非阻塞测量脉冲推进(换头链检 / Cur Cal 共用): 置于闭环准入门之前 ——
+     * 换头链检常用于"目标型号尚未标定"场景, 不能依赖 Cal_IsHandleValid 放行.
+     * 返回 true = 脉冲进行中并独占加热器, 本轮跳过闭环/诊断,
+     * 防止 PID 输出覆盖测量占空比. 完成即断热并置 READY, 由页面轮询取走. */
+    if (pulse_step())
+        return;
+
     if (work.state == WORK_STATE_SHUTDOWN)
     {
         Heater_Disable();
@@ -1248,7 +1138,6 @@ void WorkTask_Process(void)
         Heater_Disable();
         work.power = 0;
         PID_Controller_Reset();
-        boost_reset();
         return;
     }
 
@@ -1263,11 +1152,10 @@ void WorkTask_MarkActivity(void)
     {
         /* 唤醒必须显式恢复 ACTIVE: 本函数是唯一的唤醒入口, 而 work.state
          * 只在 check_sleep_shutdown 里被置为 SLEEP/SHUTDOWN. 若此处不落地,
-         * state 将永久停留在 SLEEP —— 后果是三重的:
+         * state 将永久停留在 SLEEP —— 后果是两重的:
          *   1) 入睡判定要求 state==ACTIVE, 故自动关机从此永不触发(休眠变成单次);
-         *   2) Boost 要求 state==ACTIVE, 故大焊点自动加温永久失效;
-         *   3) HOME 状态行里 SLEEP 优先级高于 Boost/OK/Heat, 于是一边满功率
-         *      加热一边恒显示 "Sleep".
+         *   2) HOME 状态行里 SLEEP 优先级高于 OK/Heat, 于是一边满功率加热
+         *      一边恒显示 "Sleep".
          * 注: 唤醒自 SHUTDOWN 也走此分支(自动关机后按任意键即恢复工作). */
         work.state = WORK_STATE_ACTIVE;
 
@@ -1335,8 +1223,8 @@ int16_t WorkTask_GetRuntimeTemp(void)
 /* 手柄型号切换后的安全闭环: 调用方须已更新 g_config.handle_type 并 Config_Save().
  * 此处重新收敛运行状态到新型号的安全边界:
  *   0. 切换瞬间显式断热(门1), 不依赖 PID Reset 隐式归零兜底;
- *   1. 重载现役 PID 参数(每型号独立) 并复位(清积分/微分/Boost 抬升);
- *   2. 运行时目标温度若超过新型号上限则钳位(T12=400, 其余=450), 避免切到
+ *   1. 重载现役 PID 参数(每型号独立) 并复位(清积分/微分);
+ *   2. 运行时目标温度若超过新型号上限则钳位(三型号统一 450), 避免切到
  *      低上限型号后仍按旧目标持续加热超标称;
  *   3. 目标温度重新下发并复位 PID, 用新型号控制律重新起控. */
 void WorkTask_OnHandleChanged(void)
@@ -1371,10 +1259,6 @@ void WorkTask_OnHandleChanged(void)
     PID_Controller_SetSetpoint(runtime_temp);
     PID_Controller_Reset();
 
-    /* Boost 状态清空, 防止跨型号残留抬升 */
-    boost_reset();
-    last_setpoint = runtime_temp;
-
     /* 新型号校准点非法(会退化线性映射, 读温偏差大)时蜂鸣警示, 提示需重新校准 */
     if (!Cal_IsHandleValid(Config_GetHandleIdx()))
         Buzzer_Beep(BUZZER_EVENT_ALARM);
@@ -1397,12 +1281,6 @@ bool WorkTask_IsTempReached(void)
     return work.temp_reached;
 }
 
-bool WorkTask_IsBoostActive(void)
-{
-    /* 正在抬升有效设定值 或 抬升量尚未回落到 0(回落过程), 均视为 Boost 生效 */
-    return (boost_target > 0) || (PID_Controller_GetBoostOffset() > 0);
-}
-
 int16_t WorkTask_GetMeasuredTemp(void)
 {
     return work.measured_temp;
@@ -1415,8 +1293,15 @@ int16_t WorkTask_GetPower(void)
 
 uint8_t WorkTask_GetPowerPercent(void)
 {
-    uint32_t p = (uint32_t)work.power * 100 / HEATER_POWER_MAX;
-    return (uint8_t)p;
+    /* 以"实际可达功率"HEATER_POWER_LIMIT(90%)为满量程. 加热层会把请求功率钳到
+     * 该值(保留 ≥10% 关断窗供采样), PID 输出上限(PID_OUTPUT_MAX)也已与其绑定;
+     * 若按 HEATER_POWER_MAX(100%)换算, 功率条最后 10% 行程对应的实际加热量
+     * 毫无变化(死区), 且 100% 处占空比只有 90%. 按可达功率换算后,
+     * 100% = 设备能给出的最大加热, 读数与实际出力一致. */
+    uint32_t p = (uint32_t)work.power;
+    if (p > HEATER_POWER_LIMIT)
+        p = HEATER_POWER_LIMIT;
+    return (uint8_t)(p * 100 / HEATER_POWER_LIMIT);
 }
 
 bool WorkTask_IsHeaterFault(void)
@@ -1505,7 +1390,7 @@ uint16_t WorkTask_GetTipCur(void)
 
 /* 按实测脉冲电流匹配插入的发热芯型号 (Cur Cal 插头不匹配引导默认选中用):
  * 与各已标定参考取差值最小者; 候选均未标定 → 默认 450°C 量级型号(T245).
- * 仅 T12 配置(上限400°C)插 450°C 量级头场景触发, 故排除当前配置型号. */
+ * 仅 T12 配置插非 T12 量级头场景触发, 故排除当前配置型号. */
 uint8_t WorkTask_MatchTipType(uint16_t cur)
 {
     uint8_t  best   = HANDLE_T245;   /* 默认: 450°C 量级, 用户可 UP/DOWN 调整 */
@@ -1546,10 +1431,6 @@ static void WorkTask_Retry(void)
  * 其他故障(热电偶/加热器/自检链路) → 重跑自检链路, 全链路通过才恢复. */
 void WorkTask_Recover(void)
 {
-    /* 异常锁存期间 boost 状态冻结(boost_advance 不跑), 恢复前清空残留抬升:
-     * 否则恢复后按抬升目标重新起控, 可能再次触发同一故障(如过温) */
-    boost_reset();
-
     if (work.overtemp_fault && !work.thermo_fault && !work.heater_fault && !work.selftest_fault)
     {
         work.overtemp_fault = false;   /* 过温独立路径: 链路完好, 无需重检 */
@@ -1569,47 +1450,57 @@ void WorkTask_Recover(void)
     WorkTask_Retry();
 }
 
-/* 同步硬件链路检测 (型号切换确认时一次性校验, 不锁存):
- * 复用上电自检的判定阈值与测量脉冲, 但同步一次完成:
- *   热电偶区间 → 发热芯测量脉冲(10% 占空比, busy-wait 一个 PID 周期
- *   让 PWM 稳定后读注入组导通电流) → 电压范围.
- * 型号匹配按 目标型号 idx 判定 (调用方传待切换型号, 而非当前配置型号):
- * 换头场景下当前插入的正是目标头, 若仍按旧型号参考检查会误拦合法切换;
- * 反之目标头与所选型号不符(如 T12 头被选成 T245) → 拒绝切换.
- * 全部通过返回 true; 任一失败返回 false, 由调用方决定是否拒绝操作.
- * 阻塞约 200ms: 仅用于切换确认等低频操作, 期间 1ms 定时中断照常
- * (编码器计数/按键采样不丢), 仅延迟事件消费. 模拟模式恒返回 true. */
-bool WorkTask_CheckChain(uint8_t idx)
+/* ========== 非阻塞发热芯测量脉冲 ==========
+ * 换头链检与 Cur Cal 标定共用: 施加热芯脉冲(10% 占空比), 下一个 PID 周期读
+ * 注入组导通电流. 取代原 pulse_cur_raw() 的 busy-wait 200ms —— 期间主循环完全
+ * 停摆(输入事件积压、UI 冻结), 改为状态机后由 PID 周期推进, 主循环照常运行.
+ *
+ * 生命周期: Start → (WAIT) → Poll 返回 READY → 取走结果.
+ * 脉冲期间加热器由本状态机独占: pulse_step() 返回 true 时 WorkTask_Process 提前
+ * 返回, 跳过 PID/诊断, 防止闭环输出覆盖测量占空比. 任一保护介入
+ * (锁存故障/自检/关机)即中止, 结果作废. */
+
+typedef enum {
+    PULSE_IDLE = 0,   /* 未开始 / 已收尾 */
+    PULSE_WAIT,       /* 脉冲已施加, 等待下个 PID 周期读电流 */
+    PULSE_READY,      /* 结果就绪, 等调用方取走 */
+} pulse_state_t;
+
+static struct {
+    pulse_state_t state;
+    uint16_t cur;         /* 实测导通电流 ADC */
+    uint32_t t0;          /* 施加脉冲的时刻: 保证到读电流间隔 ≥ 一个 PID 周期 */
+    uint8_t  chain_idx;   /* 链检目标型号(异步期间保存) */
+    bool     chain_mode;  /* true = 链检(READY 时一并给出结论) */
+    bool     cold;        /* 发起时刻的冷态快照(结果一个周期后才判定) */
+    bool     result_ok;   /* 链检结论 */
+} pulse;
+
+
+#if !HW_SIM_MODE
+/* 链检后半段判定: 电流区间 → 型号匹配 → 供电, 与自检同源.
+ * cold 用发起时刻的快照: 结果在一个 PID 周期后才判定, 期间温度可能变化. */
+static bool chain_evaluate(uint8_t idx, uint16_t cur, bool cold)
 {
-#if HW_SIM_MODE
-    (void)idx;
-    return true;
-#else
-    uint16_t adc = AD_GetT12();
-    if (adc < THERMO_ADC_MIN || adc >= THERMO_ADC_OPEN)
-        return false;   /* 热电偶短路/开路 */
-
-    uint16_t cur = pulse_cur_raw();   /* 热态也实测: 危险判定(拦 T12 头)冷热态均可靠 */
-
     if (cur < SELFTEST_CUR_MIN || cur >= SELFTEST_CUR_MAX)
         return false;   /* 发热芯断芯/短路或电流链路失效 */
 
     /* 型号匹配: 冷态权威三档判型; 热态阻值偏移无法精确判型. 热态仅拦"真 T12
-     * 头切向 450°C 配置"危险场景 —— 但 is_t12_scale 对热 450°C 头同样误判
+     * 头切向非 T12 配置"危险场景 —— 但 is_t12_scale 对热 450°C 头同样误判
      * (热 T245/T210 电流衰减至 <1.5×ref 会被当 T12), 故仅当当前配置为 T12
      * (插头曾按 T12 冷态验证过)时才可信拦截: 此时若真插 T12 头, 其电流恒远
      * 低于门限(热态更低), 拦截可靠; 若插的是热 450°C 头(T245→T12→T245 回转),
      * 误拒但失败关闭, 冷后可重试. 450°C 组内互插(T245↔T210)放行, 无烧头风险 */
-    if (work.measured_temp <= TYPE_CUR_COOL_MAX)
+    if (cold)
     {
         if (!type_cur_match(cur, idx))
             return false;   /* 冷态: 插的烙铁头与目标型号不匹配 */
     }
-    else if (g_config.temp_max[idx] > 400 &&
-             g_config.temp_max[Config_GetHandleIdx()] <= 400 &&
-             is_t12_scale(cur))
+    else if (idx != HANDLE_T12 &&
+             Config_GetHandleIdx() == HANDLE_T12 &&
+             is_t12_scale(cur, idx))
     {
-        return false;   /* 热态: 仅拦 T12 配置下切向 450°C 型号 */
+        return false;   /* 热态: 仅拦 T12 配置下切向非 T12 型号 */
     }
 
     read_input_voltage();
@@ -1618,46 +1509,181 @@ bool WorkTask_CheckChain(uint8_t idx)
         return false;   /* 供电异常 */
 
     return true;
+}
 #endif
+
+
+/* 每 PID 周期推进一步. 返回 true = 脉冲期间独占加热器, 调用方跳过本轮闭环.
+ * 非阻塞要点: 只做"读一次电流 + 断热", 不等待 —— 等待由 PID 周期本身承担. */
+static bool pulse_step(void)
+{
+    if (pulse.state == PULSE_IDLE)
+        return false;
+
+    /* 保护/自检/关机介入: 立即中止并断热, 结果作废(轮询方会看到 IDLE).
+     * 过温并入此门: 脉冲期间 run_pid_cycle 被跳过, 而过温锁存判定在其中 ——
+     * 不在此快检, 新发生的过温要等脉冲结束才被发现. 这里只提前断热,
+     * 锁存仍交给下一 PID 周期的正式过温路径(判定/蜂鸣/记码口径不变). */
+    if (work.state == WORK_STATE_SHUTDOWN ||
+        work.selftest != SELFTEST_DONE ||
+        WorkTask_HasFault() ||
+        work.measured_temp > OVER_TEMP_LIMIT)
+    {
+        Heater_SetPower(0);
+        Heater_Disable();
+        work.power  = 0;
+        pulse.state = PULSE_IDLE;
+        return false;
+    }
+
+    if (pulse.state == PULSE_WAIT)
+    {
+        /* 施加脉冲到读电流必须间隔至少一个 PID 周期: Start 由页面在任意时刻发起,
+         * 若恰落在 PID 节拍之前, 下一个节拍就取样会"只加热了极短时间" —— 电流尚未
+         * 建立, 读数不可信. 自检路径(HEAT_ON→HEAT_READ)天然按节拍对齐, 无此问题.
+         * 故此处按时间判定: 未满一个周期就继续独占加热器, 下个节拍再读. */
+        if ((Timer_GetTick() - pulse.t0) < PID_INTERVAL_MS)
+            return true;
+
+        pulse.cur = AD_GetCurrent();
+        Heater_SetPower(0);   /* 先清测量占空比再断热, 防后续恢复使能时重放 */
+        Heater_Disable();
+        work.power = 0;
+
+#if HW_SIM_MODE
+        if (pulse.chain_mode)
+            pulse.result_ok = true;
+#else
+        if (pulse.chain_mode)
+            pulse.result_ok = chain_evaluate(pulse.chain_idx, pulse.cur, pulse.cold);
+#endif
+        pulse.state = PULSE_READY;
+        return true;   /* 本轮仍独占: 不让闭环在同一周期写回功率 */
+    }
+
+    return false;      /* PULSE_READY: 加热器已断, 闭环可正常运行 */
 }
 
-/* 施加热芯测量脉冲并读取导通电流 (不判热态, 供自检/切换链检/Cur Cal 复用).
- * 阻塞约 200ms 待 PWM 稳定后读注入组电流, 返回前断热.
- * 仅真机模式使用(模拟模式由 WorkTask_MeasurePulseCur 直接返回模拟值). */
-#if !HW_SIM_MODE
-static uint16_t pulse_cur_raw(void)
-{
-    /* 故障门: 已锁存故障(热电偶/过温/加热器/自检)时不得再输出测量脉冲.
-     * 换头"确认切换"路径(WorkTask_CheckChain)不经 handle_exit 的 !HasFault 门,
-     * 此处兜底 —— 返回 0 会被调用方判为"电流异常"从而拒绝该次操作.
-     * 与代码库其余位置"所有使能都过 !HasFault()"的不变式保持一致. */
-    if (WorkTask_HasFault())
-        return 0;
 
+/* 换头链路检测 —— 非阻塞版(取代原同步 WorkTask_CheckChain 的 busy-wait):
+ * CheckChainStart 做瞬时检查(准入/热电偶)并发起测量脉冲; 结果就绪后由
+ * CheckChainPoll 给出结论. 型号匹配按 目标型号 idx 判定 (调用方传待切换型号,
+ * 而非当前配置型号): 换头场景下当前插入的正是目标头, 若仍按旧型号参考检查会
+ * 误拦合法切换; 反之目标头与所选型号不符(如 T12 头被选成 T245) → 拒绝切换.
+ * 返回 false = 未受理(已有测量在跑 / 锁存故障 / 自检未完成 / 热电偶异常),
+ * 调用方应立即拒绝本次操作. 模拟模式: 恒受理, 首次 Poll 即 READY 且结论为 true. */
+bool WorkTask_CheckChainStart(uint8_t idx)
+{
+    if (pulse.state == PULSE_WAIT)
+        return false;                 /* 已有测量正在进行 */
+    /* READY(上次结果未被取走)视为可覆盖: 否则页面异常离开后本接口会永久拒绝 */
+
+    pulse.chain_mode = true;
+    pulse.chain_idx  = idx;
+    pulse.result_ok  = false;
+
+#if HW_SIM_MODE
+    (void)idx;
+    pulse.cold  = true;
+    pulse.cur   = 1200;               /* 模拟: 恒有效, 便于联调 */
+    pulse.state = PULSE_READY;        /* 无阻塞: 直接给结论 */
+    return true;
+#else
+    if (work.selftest != SELFTEST_DONE)
+        return false;
+    if (WorkTask_HasFault())
+        return false;                 /* 故障门: 不输出测量脉冲 */
+
+    {
+        uint16_t adc = AD_GetT12();
+        if (adc < THERMO_ADC_MIN || adc >= THERMO_ADC_OPEN)
+            return false;             /* 热电偶短路/开路 */
+    }
+
+    pulse.cold = (work.measured_temp <= TYPE_CUR_COOL_MAX);
+
+    pulse.t0 = Timer_GetTick();
     Heater_Enable();
     Heater_SetPower(SELFTEST_PULSE_POWER);
-    {
-        uint32_t t0 = Timer_GetTick();
-        while ((Timer_GetTick() - t0) < PID_INTERVAL_MS)
-            ;   /* 等待 PWM 稳定 (约 200ms) */
-    }
-    uint16_t cur = AD_GetCurrent();
-    Heater_Disable();
-    return cur;
+    pulse.state = PULSE_WAIT;         /* 满一个 PID 周期后读电流 */
+    return true;
+#endif
 }
-#endif
 
-uint16_t WorkTask_MeasurePulseCur(void)
+/* 发起一次冷态发热芯测量脉冲(Cur Cal 标定用, 非阻塞).
+ * require_cold=true 时非冷态直接拒绝 —— 阻值已随温度偏移, 标定不可靠.
+ * 返回 false = 未受理(已有测量在跑 / 锁存故障 / 自检未完成 / 非冷态). */
+bool WorkTask_PulseStart(bool require_cold)
 {
+    if (pulse.state == PULSE_WAIT)
+        return false;                 /* 已有测量正在进行 */
+    /* READY(上次结果未被取走)视为可覆盖: 否则页面异常离开后本接口会永久拒绝 */
+
+    pulse.chain_mode = false;
+    pulse.result_ok  = false;
+
 #if HW_SIM_MODE
-    return 1200;   /* 模拟: 恒返回有效脉冲电流, 便于 Cur Cal 页联调 */
+    (void)require_cold;
+    pulse.cur   = 1200;               /* 模拟: 恒有效, 便于 Cur Cal 页联调 */
+    pulse.state = PULSE_READY;
+    return true;
 #else
-    /* Cur Cal 标定依赖冷态阻值: 烙铁头未冷(超过 TYPE_CUR_COOL_MAX)时阻值已
-     * 偏移, 标定不可靠. 返回 0 表示"非冷态/不可标定", 由调用方拒绝保存 */
-    if (work.measured_temp > TYPE_CUR_COOL_MAX)
-        return 0;
-    return pulse_cur_raw();
+    if (work.selftest != SELFTEST_DONE)
+        return false;
+    if (WorkTask_HasFault())
+        return false;                 /* 故障门: 不输出测量脉冲 */
+    if (require_cold && work.measured_temp > TYPE_CUR_COOL_MAX)
+        return false;                 /* 非冷态: 阻值已偏移, 标定不可靠 */
+
+    pulse.t0 = Timer_GetTick();
+    Heater_Enable();
+    Heater_SetPower(SELFTEST_PULSE_POWER);
+    pulse.state = PULSE_WAIT;         /* 满一个 PID 周期后读电流 */
+    return true;
 #endif
+}
+
+
+/* 轮询测量结果(换头链检与 Cur Cal 共用):
+ *   IDLE  — 未开始 / 已收尾
+ *   BUSY  — 脉冲进行中
+ *   READY — 本次已给出结果(*cur_out / *ok_out 有效), 状态随即回到 IDLE.
+ * READY 时加热器已在 pulse_step() 内断开, 调用方无需再处理. */
+static work_pulse_t pulse_poll(uint16_t *cur_out, bool *ok_out)
+{
+    if (pulse.state == PULSE_WAIT)
+        return WORK_PULSE_BUSY;
+    if (pulse.state != PULSE_READY)
+        return WORK_PULSE_IDLE;
+
+    if (cur_out) *cur_out = pulse.cur;
+    if (ok_out)  *ok_out  = pulse.result_ok;
+    pulse.state = PULSE_IDLE;   /* 取走即收尾 */
+    return WORK_PULSE_READY;
+}
+
+work_pulse_t WorkTask_PulsePoll(uint16_t *cur_out)
+{
+    return pulse_poll(cur_out, NULL);
+}
+
+work_pulse_t WorkTask_CheckChainPoll(bool *ok_out)
+{
+    return pulse_poll(NULL, ok_out);
+}
+
+
+/* 中止进行中的测量(页面退出等): 清测量占空比并断热, 结果作废.
+ * 无测量时为空操作, 不影响正常加热使能. */
+void WorkTask_PulseAbort(void)
+{
+    if (pulse.state == PULSE_IDLE)
+        return;
+
+    pulse.state = PULSE_IDLE;
+    Heater_SetPower(0);   /* 防调用方随后 Heater_Enable 时重放测量占空比 */
+    Heater_Disable();
+    work.power = 0;
 }
 
 /* 发热芯型号匹配 (三档判型) 公开包装: Cur Cal 页保存参考值前校验用.

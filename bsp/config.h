@@ -7,12 +7,18 @@
 /* 硬件模拟模式开关 (1=模拟, 0=真机): 由 work_task.c 原私有定义提升为全局共享.
  * 模拟模式下所有 Flash 擦写/落盘跳过(见 config.c 三个 Save 函数),
  * 避免仿真器不建模 Flash 控制器时擦写死等 → 主循环卡死 → IWDG 复位死循环. */
+/* 默认保守使用模拟模式; Keil target 必须显式定义 HW_SIM_MODE:
+ * Debug-Sim = 1, Release-HW = 0. 这样发布构建不依赖开发者手动改源码宏.
+ * 若用其它构建系统未定义该宏, 回退模拟模式, 避免意外写 Flash/上真机路径. */
+#ifndef HW_SIM_MODE
 #define HW_SIM_MODE           1
+#endif
 
 #define CONFIG_MAGIC      0x5AA55AA5UL
-#define CONFIG_VERSION    12   /* 11→12: 修正 CRC 覆盖范围(原实现把 crc 字段自身纳入计算,
-                                * 见 config.c 的 *_calc_crc 注释). 旧数据 CRC 校验必失败,
-                                * 首启回落默认后即恢复正常持久化. */
+#define CONFIG_VERSION    13   /* 12→13: 移除 Boost 功能, config_t 删除 boost_max[] 字段;
+                                * 同时 T12 常规上限 400→450(三型号统一).
+                                * 旧 v12 数据由 config_v12_t 逐字段迁移, 保留 PID 增益/
+                                * 温度/时间/蜂鸣/亮度等用户设置, 仅 temp_max 取新默认. */
 
 /* 配置 Flash 存储地址 (使用 App Flash 最后一页, 0x0803F800) */
 #define CONFIG_FLASH_ADDR  0x0803F800UL
@@ -60,11 +66,8 @@ typedef struct
     int16_t pid_cons_ki[HANDLE_NUM];  /* 保守 Ki (*100) */
     int16_t pid_cons_kd[HANDLE_NUM];  /* 保守 Kd (*100) */
 
-    /* 每型号的温度上限 (°C) */
-    uint16_t temp_max[HANDLE_NUM];    /* 常规设定上限 (T12=400, T245/T210=450) */
-    uint16_t boost_max[HANDLE_NUM];   /* 大焊点自动加温(Boost)允许抬升到的上限
-                                       * (须 ≥ temp_max, T12=450, 其余=450)
-                                       * PID 计算按 boost_max 钳制有效设定值 */
+    /* 每型号的温度上限 (°C): T12/T245/T210 统一 450 */
+    uint16_t temp_max[HANDLE_NUM];
 
     /* 系统设置 */
     uint16_t sleep_time;        /* 休眠时间 分钟, 0=禁用 */
@@ -159,6 +162,32 @@ typedef struct
 
 }config_v10_t;
 
+/* v12 布局快照(含已删除的 boost_max[]): 仅供 12→13 迁移读取旧数据.
+ * 字段顺序/类型与当时的 config_t 完全一致, 编译器填充也随之相同.
+ * 注: v12 已有独立校准页(cal_t / type_cal_t), 故本结构不含 cal_* 字段. */
+typedef struct
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint8_t  handle_type;
+    uint16_t default_temp;
+    uint16_t sleep_temp;
+    int16_t  pid_agg_kp[HANDLE_NUM];
+    int16_t  pid_agg_ki[HANDLE_NUM];
+    int16_t  pid_agg_kd[HANDLE_NUM];
+    int16_t  pid_cons_kp[HANDLE_NUM];
+    int16_t  pid_cons_ki[HANDLE_NUM];
+    int16_t  pid_cons_kd[HANDLE_NUM];
+    uint16_t temp_max[HANDLE_NUM];
+    uint16_t boost_max[HANDLE_NUM];
+    uint16_t sleep_time;
+    uint16_t shutdown_time;
+    uint8_t  buzzer_enable;
+    uint8_t  brightness;
+    uint16_t crc;
+}config_v12_t;
+
 extern config_t g_config;
 extern cal_t    g_cal;
 extern type_cal_t g_typecal;
@@ -229,6 +258,5 @@ const char *Config_GetHandleName(void);
 
 /* 当前型号的温度上下限 (°C, 运行时按 handle_type 取值) */
 uint16_t Config_GetTempMax(void);   /* 常规设定上限 */
-uint16_t Config_GetBoostMax(void);  /* 有效设定(含 Boost 抬升)上限, 须 ≥ temp_max */
 
 #endif

@@ -23,15 +23,20 @@ static const config_t default_config =
     .pid_cons_kp   = {50,   50,   50  },   /* 保守 0.50 */
     .pid_cons_ki   = {60,   60,   60  },   /* 保守 0.60 */
     .pid_cons_kd   = {600,  600,  600 },   /* 保守 6.00 */
-    /* 温度上限: T12 常规 400°C(留余量给 Boost 爬升至 450), T245/T210 常规 450°C */
-    .temp_max      = {400,  450,  450 },
-    .boost_max     = {450,  450,  450 },
+    /* 温度上限: T12/T245/T210 统一 450°C */
+    .temp_max      = {450,  450,  450 },
     .sleep_time    = 5,      /* 5分钟 */
     .shutdown_time = 30,     /* 30分钟 */
     .buzzer_enable = 1,      /* 开 */
     .brightness    = 180,
     .crc           = 0,
 };
+
+/* 迁移结构必须与 v12 当时的 config_t 完全同布局(大小 72 / crc 偏移 68):
+ * 布局若被改动, 读取旧数据会字段错位 —— 那比"回落默认"更糟(会静默写入错误配置).
+ * 编译期守卫: 一旦有人增删本结构字段, 构建立即失败. 数值经 gcc 独立核对. */
+typedef char config_v12_layout_must_match[
+    (sizeof(config_v12_t) == 72 && offsetof(config_v12_t, crc) == 68) ? 1 : -1];
 
 /* 默认校准 (每型号一套, 参考 Cai-Zi; T245/T210 先同 T12 占位, 可在校准页重新标定) */
 static const cal_t default_cal =
@@ -84,11 +89,6 @@ uint8_t Config_GetHandleIdx(void)
 uint16_t Config_GetTempMax(void)
 {
     return g_config.temp_max[Config_GetHandleIdx()];
-}
-
-uint16_t Config_GetBoostMax(void)
-{
-    return g_config.boost_max[Config_GetHandleIdx()];
 }
 
 /* 手柄型号显示名 (与 HANDLE_* 索引一一对应) */
@@ -268,8 +268,7 @@ void Config_Load(void)
         memcpy(g_config.pid_cons_kp, old.pid_cons_kp, sizeof(g_config.pid_cons_kp));
         memcpy(g_config.pid_cons_ki, old.pid_cons_ki, sizeof(g_config.pid_cons_ki));
         memcpy(g_config.pid_cons_kd, old.pid_cons_kd, sizeof(g_config.pid_cons_kd));
-        memcpy(g_config.temp_max,    old.temp_max,    sizeof(g_config.temp_max));
-        memcpy(g_config.boost_max,   old.boost_max,   sizeof(g_config.boost_max));
+        /* temp_max 属型号硬件常量(非用户设置), 不迁移, 取新默认 */
         g_config.sleep_time    = old.sleep_time;
         g_config.shutdown_time = old.shutdown_time;
         g_config.buzzer_enable = old.buzzer_enable;
@@ -277,6 +276,37 @@ void Config_Load(void)
 
         cal_migrate_v10(&old);   /* 旧校准迁入独立页 (校验通过, 数据可信) */
         (void)Config_Save();   /* 回写当前版本布局 */
+    }
+    else if (version == 12)
+    {
+        /* v12 布局(含已移除的 boost_max): 必须逐字段迁移, 不能按旧长度整体拷贝 ——
+         * boost_max 已从 config_t 中删除, 整体拷贝会让其后的 sleep_time/shutdown_time/
+         * buzzer/brightness 全部错位. temp_max 属型号硬件常量, 不迁移(取新的 450 默认).
+         * CRC 覆盖范围与 v12 写入时一致(offsetof(crc)), 故能正确校验. */
+        config_v12_t old;
+        Flash_Read(CONFIG_FLASH_ADDR, &old, sizeof(old));
+
+        if (crc16((const uint8_t *)&old, (uint16_t)offsetof(config_v12_t, crc)) != old.crc)
+        {
+            Config_Reset();
+            return;
+        }
+
+        g_config.handle_type   = old.handle_type;
+        g_config.default_temp  = old.default_temp;
+        g_config.sleep_temp    = old.sleep_temp;
+        memcpy(g_config.pid_agg_kp,  old.pid_agg_kp,  sizeof(g_config.pid_agg_kp));
+        memcpy(g_config.pid_agg_ki,  old.pid_agg_ki,  sizeof(g_config.pid_agg_ki));
+        memcpy(g_config.pid_agg_kd,  old.pid_agg_kd,  sizeof(g_config.pid_agg_kd));
+        memcpy(g_config.pid_cons_kp, old.pid_cons_kp, sizeof(g_config.pid_cons_kp));
+        memcpy(g_config.pid_cons_ki, old.pid_cons_ki, sizeof(g_config.pid_cons_ki));
+        memcpy(g_config.pid_cons_kd, old.pid_cons_kd, sizeof(g_config.pid_cons_kd));
+        g_config.sleep_time    = old.sleep_time;
+        g_config.shutdown_time = old.shutdown_time;
+        g_config.buzzer_enable = old.buzzer_enable;
+        g_config.brightness    = old.brightness;
+
+        (void)Config_Save();   /* 回写新布局 */
     }
     else
     {

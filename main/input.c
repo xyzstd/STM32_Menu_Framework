@@ -7,19 +7,27 @@
 #include "work_task.h"
 #include "timer.h"
 
-/* 单次轮询最多出的事件数: 编码器受扰(毛刺/电气噪声)时可能一次累积很多步,
- * 若不设上限, 下方 for 会在一次轮询里入队上千次(耗时数毫秒), 期间主循环停摆、
- * 队列被瞬间灌满并丢弃大量事件. 超限部分直接丢弃(正交计数已由 TIM4 硬件滤波
- * 去毛刺, 正常旋转每 4ms 不过几步, 只有异常干扰才会触发上限). */
-#define ENC_MAX_EVENTS_PER_POLL  20
+/* 单次 4ms 编码器取样的物理合理上限。超过时把整批当作毛刺丢弃，而不把噪声
+ * 截成若干合法步送入 UI，避免一次异常计数导致突然跳格。 */
+#define ENC_MAX_EVENTS_PER_POLL  4
 
 /* 采样分频(ms): 定时器节拍 1ms. */
-#define KEY_SCAN_MS      5   /* 按键扫描间隔 */
-#define ENC_POLL_MS      4   /* 编码器步数取走间隔 */
+#define KEY_SCAN_MS      5
+#define ENC_POLL_MS      4
 
-/* 事件队列容量: 中断(生产者)入队, 主循环(消费者)出队.
- * 4ms 轮询内极速旋转的事件数远小于此, 满则丢弃最新, 可接受. */
-#define INPUT_EVT_QUEUE_SIZE  32
+/* 单队列 SPSC：保留末尾槽位给按键事件；旋转事件达到阈值就丢弃最新值。
+ * 旋转事件另带时间戳，主循环阻塞恢复后会丢弃过期旋转，避免陈旧动作突然补执行。 */
+#define INPUT_EVT_QUEUE_SIZE       32
+#define INPUT_KEY_RESERVED_SLOTS    4
+#define INPUT_ENCODER_MAX_AGE_MS   12
+
+typedef struct {
+    uint16_t tick16;   /* Timer_GetTick 低 16 位; 事件年龄远小于 32768ms */
+    int8_t   step;     /* 当前队列仅存 -1/0/+1 */
+    uint8_t  event;
+} input_evt_t;
+
+typedef char input_evt_size_must_be_4[(sizeof(input_evt_t) == 4) ? 1 : -1];
 
 static key_info_t key;
 
@@ -36,13 +44,13 @@ static uint32_t enc_tick  = 0;   /* 上次编码器取样时刻 */
  * 并发安全: 单生产者(中断)单消费者(主循环), head 仅消费者改, tail 仅生产者改,
  * 空 = head==tail, 满 = tail+1==head, 无锁; 消费者复制期间生产者不写该位置. */
 static struct{
-    menu_cmd_t buf[INPUT_EVT_QUEUE_SIZE];
+    input_evt_t buf[INPUT_EVT_QUEUE_SIZE];
     volatile uint8_t head;
     volatile uint8_t tail;
 }evt_q;
 
-static void evt_enqueue(uint8_t event, int16_t step);
-static bool evt_dequeue(menu_cmd_t *out);
+static void evt_enqueue(uint8_t event, int8_t step);
+static bool evt_dequeue(input_evt_t *out);
 
 static void menu_notify(menu_cmd_t *cmd);
 
@@ -55,34 +63,26 @@ static void encoder_process(void);
 static void input_scan(void);
 
 
-static void evt_enqueue(uint8_t event, int16_t step)
+static void evt_enqueue(uint8_t event, int8_t step)
 {
     uint8_t next = (uint8_t)((evt_q.tail + 1) % INPUT_EVT_QUEUE_SIZE);
+    uint8_t used = (uint8_t)((evt_q.tail + INPUT_EVT_QUEUE_SIZE - evt_q.head) % INPUT_EVT_QUEUE_SIZE);
+    bool is_key_event = (event == MENU_EVENT_CLICK || event == MENU_EVENT_LPRESS);
 
-    if(next == evt_q.head)
-    {
-        /* 满: 旋转事件(UP/DOWN)直接丢弃; 按键事件(CLICK/LPRESS)覆盖队尾旋转事件,
-         * 保证高速旋转后立即按键不丢操作(丢键=页面操作无响应/乱跳感).
-         * 竞态: 消费者正处理队尾槽时被替换, 单字节写完整, 结果仍是合法事件. */
-        if(event == MENU_EVENT_CLICK || event == MENU_EVENT_LPRESS)
-        {
-            uint8_t last = (uint8_t)((evt_q.tail + INPUT_EVT_QUEUE_SIZE - 1) % INPUT_EVT_QUEUE_SIZE);
+    /* 编码器不能占用预留槽: 主循环短时被 Flash/测量流程阻塞时，按键仍有位置入队. */
+    if (!is_key_event && used >= INPUT_EVT_QUEUE_SIZE - 1 - INPUT_KEY_RESERVED_SLOTS)
+        return;
 
-            if(evt_q.buf[last].event == MENU_EVENT_UP || evt_q.buf[last].event == MENU_EVENT_DOWN)
-            {
-                evt_q.buf[last].event = (menu_event_t)event;
-                evt_q.buf[last].step  = step;
-            }
-        }
-        return;   /* 满槽已按上述策略处理, 不再追加 */
-    }
+    if (next == evt_q.head)
+        return;   /* 极端情况下连按键预留槽也耗尽: 丢弃新事件，不改写消费者队列内容 */
 
-    evt_q.buf[evt_q.tail].event = (menu_event_t)event;
-    evt_q.buf[evt_q.tail].step  = step;
+    evt_q.buf[evt_q.tail].tick16 = (uint16_t)Timer_GetTick();
+    evt_q.buf[evt_q.tail].step   = (int8_t)step;
+    evt_q.buf[evt_q.tail].event  = event;
     evt_q.tail = next;
 }
 
-static bool evt_dequeue(menu_cmd_t *out)
+static bool evt_dequeue(input_evt_t *out)
 {
     if(evt_q.head == evt_q.tail)
         return false;
@@ -154,11 +154,10 @@ static void encoder_process(void)
     if (n == 0)
         return;
 
-    /* 异常干扰保护: 单次取样步数封顶, 防止一次入队过多而阻塞中断 */
-    if (n > ENC_MAX_EVENTS_PER_POLL)
-        n = ENC_MAX_EVENTS_PER_POLL;
-    else if (n < -ENC_MAX_EVENTS_PER_POLL)
-        n = -ENC_MAX_EVENTS_PER_POLL;
+    /* 4ms 内出现超过物理合理上限的步数视为计数毛刺, 整批丢弃。
+     * 旧逻辑把大脉冲截成 20 个合法事件, 仍会把明显异常变成一次大幅跳格. */
+    if (n > ENC_MAX_EVENTS_PER_POLL || n < -ENC_MAX_EVENTS_PER_POLL)
+        return;
 
     for (i = 0; i < n; i++)
         evt_enqueue(MENU_EVENT_UP, 1);
@@ -197,28 +196,35 @@ static void input_scan(void)
 }
 
 
-/* 主循环事件消费: 每轮最多消费 2 个事件, 不一次清空队列.
- * 快速旋转时事件批量到达, 若 while 一次清空, 渲染合并窗口内会一次反映 N 格
- * (视觉"先不动后连续跳格"); 限流后事件按到达顺序摊平到后续各帧, 每帧 ≤2 格,
- * 跟手且吞吐(≈800/s)仍高于编码器物理事件率, 队列不积压不丢事件.
- * 菜单逻辑/Flash 落盘等耗时操作全部在主循环上下文执行, 不阻塞 1ms 输入节拍.
- * 跳转重同步: 任一事件若使菜单上下文变化(跨页/跨列表), 让编码器丢弃当前半格残留
- * (见 Encoder_RequestResync), 防旧上下文相位带入新页面吃掉新方向第一格.
- * 注意: 队列里剩余的事件都是"本事件之后入队"的(FIFO), 属跳转后的有效输入, 不丢弃. */
+/* 主循环每轮最多分发 2 个新鲜事件。编码器旧事件超龄即丢弃；否则在 Flash/长测量
+ * 阻塞恢复后，队列会把过期旋转逐格补执行，表现为突然跳格，甚至在页面已变后误操作.
+ * 按键事件有预留槽且不超龄丢弃；过期旋转在这里快速跳过，不占本轮 2 个有效事件额度.
+ * 跨页后仍重同步编码器半格相位；未过期 FIFO 输入继续保留. */
 void Input_Process(void)
 {
+    input_evt_t evt;
     menu_cmd_t cmd;
     uint8_t n = 0;
 
-    while (n < 2 && evt_dequeue(&cmd))
+    while (n < 2 && evt_dequeue(&evt))
     {
-        uint16_t ctx_before = menu_ctx();
+        uint16_t now16 = (uint16_t)Timer_GetTick();
+        uint16_t age16 = (uint16_t)(now16 - evt.tick16);
+        uint16_t ctx_before;
+
+        if ((evt.event == MENU_EVENT_UP || evt.event == MENU_EVENT_DOWN) &&
+            age16 > INPUT_ENCODER_MAX_AGE_MS)
+            continue;   /* 丢弃过期旋转，不让旧输入在阻塞恢复后突然执行 */
+
+        cmd.event = (menu_event_t)evt.event;
+        cmd.step  = evt.step;
+        ctx_before = menu_ctx();
 
         n++;
         menu_notify(&cmd);
 
         if (menu_ctx() != ctx_before)
-            Input_ResyncEncoder();   /* 上下文已变: 重同步编码器相位(不清队列) */
+            Input_ResyncEncoder();   /* 上下文已变: 重同步编码器半格相位 */
     }
 }
 

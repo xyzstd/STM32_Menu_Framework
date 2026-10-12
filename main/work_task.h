@@ -53,16 +53,13 @@ work_state_t WorkTask_GetState(void);
 /* 温度是否已达到目标温度附近 */
 bool WorkTask_IsTempReached(void);
 
-/* 大焊点自动加温(Boost)是否正在生效(含回落过程) */
-bool WorkTask_IsBoostActive(void);
-
 /* 运行时目标温度 (RAM, 不落 flash):
  * HOME 页临时调解的温度保存在此, 整个运行期间持续生效,
  * 休眠唤醒时恢复到该值(而非默认值). 掉电丢失. */
 void    WorkTask_SetRuntimeTemp(int16_t temp);
 int16_t WorkTask_GetRuntimeTemp(void);
 
-/* 手柄型号切换后的安全闭环: 重载 PID + 目标重钳位 + 清 Boost 复位.
+/* 手柄型号切换后的安全闭环: 重载 PID + 目标重钳位.
  * 调用方需已更新 g_config.handle_type 并 Config_Save() 后调用. */
 void WorkTask_OnHandleChanged(void);
 
@@ -91,20 +88,36 @@ void WorkTask_ClearFaults(void);
  * 链路类故障(热电偶/加热器/自检) → 重跑自检链路, 全链路通过才恢复. */
 void WorkTask_Recover(void);
 
-/* 同步硬件链路检测 (型号切换确认时一次性校验, 不锁存):
- * 热电偶区间 → 发热芯测量脉冲(10% 占空比, 阻塞约一个 PID 周期) → 电压范围,
- * 并按 目标型号 idx 做冷态阻值匹配 (调用方传待切换型号, 而非当前配置型号).
- * 全部通过返回 true; 任一失败返回 false, 由调用方决定是否拒绝操作.
- * 模拟模式恒返回 true. */
-bool WorkTask_CheckChain(uint8_t idx);
+/* ========== 非阻塞发热芯测量脉冲 (换头链检 / Cur Cal 共用) ==========
+ * 原实现 busy-wait 约 200ms 等 PWM 稳定, 期间主循环停摆(输入事件积压、UI 冻结).
+ * 现改为状态机: Start 施脉冲 → 下一个 PID 周期读电流 → Poll 取结果.
+ * 调用方(页面)负责轮询, 并让 display 返回一个短周期以驱动轮询. */
+typedef enum {
+    WORK_PULSE_IDLE = 0,   /* 未开始 / 已收尾 */
+    WORK_PULSE_BUSY,       /* 脉冲进行中 */
+    WORK_PULSE_READY,      /* 结果就绪(本次已给出, 状态随即回 IDLE) */
+} work_pulse_t;
 
-/* 冷态发热芯测量脉冲导通电流 ADC (供 "Cur Cal" 电流标定页实测):
- * 复用于自检的测量脉冲 (10% 占空比, 阻塞约一个 PID 周期稳定后读注入组
- * 导通电流, 返回前断热). 该值由发热芯冷阻决定, 可区分型号,
- * 标定为 TypeCal 参考值后供型号匹配检查. 非冷态(超过 TYPE_CUR_COOL_MAX)
- * 返回 0 拒绝标定.
- * 模拟模式恒返回 1200 便于联调. */
-uint16_t WorkTask_MeasurePulseCur(void);
+/* 换头链路检测(非阻塞): 启动时做瞬时检查(准入/热电偶)并发起测量脉冲.
+ * 返回 false = 未受理(已有测量在跑 / 锁存故障 / 自检未完成 / 热电偶异常),
+ * 调用方应立即拒绝本次操作. 模拟模式恒受理. */
+bool WorkTask_CheckChainStart(uint8_t idx);
+
+/* 轮询链检结论: READY 时 *ok_out 给出最终结论(电流区间 / 型号匹配 / 供电).
+ * 未发起过链检时返回 IDLE. */
+work_pulse_t WorkTask_CheckChainPoll(bool *ok_out);
+
+/* 发起冷态发热芯测量脉冲(Cur Cal 标定用, 非阻塞).
+ * require_cold=true 时非冷态直接拒绝(阻值已偏移, 标定不可靠).
+ * 返回 false = 未受理. 模拟模式恒受理并立即就绪. */
+bool WorkTask_PulseStart(bool require_cold);
+
+/* 轮询冷态测量结果: READY 时 *cur_out 为发热芯导通电流 ADC. */
+work_pulse_t WorkTask_PulsePoll(uint16_t *cur_out);
+
+/* 中止进行中的测量(页面退出等): 清测量占空比并断热, 结果作废.
+ * 无测量时为空操作, 不影响正常加热使能. */
+void WorkTask_PulseAbort(void);
 
 /* 发热芯型号匹配 (两级保护) 公开包装: Cur Cal 页保存参考值前校验,
  * 拒绝拿 T12 头填 T245/T210 参考值等误操作 (判定规则见 type_cur_match). */

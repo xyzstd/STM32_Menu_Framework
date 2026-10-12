@@ -129,6 +129,7 @@ static void process_key_pressed(key_info_t *key)
         if (key->timer >= KEY_LONG_TIME)   /* 按下时间超过 KEY_LONG_TIME: 判定为长按 */
         {
             key->event_callback(KEY_EVENT_LONG_PRESS);
+            key->rel_cnt = 0;   /* 释放确认计数从 0 起(WAIT_RELEASE 用它做松手消抖) */
             key->state = KEY_STATE_WAIT_RELEASE;
         }
     }
@@ -148,12 +149,27 @@ static void process_key_pressed(key_info_t *key)
     }
 }
 
-/* 状态机处理函数: 长按后等待松手(无事件, 仅回空闲) */
+/* 状态机处理函数: 长按后等待松手(无事件, 仅回空闲).
+ * 需连续 KEY_DELAY_TIME 次高电平才确认松手 —— 原实现"一次高电平即回 IDLE"缺了这道
+ * 门槛: 长按松手瞬间的触点回弹(低电平)会立刻被 IDLE→DEBOUNCE 当成"新按下", 确认后
+ * 松手再补发一次 CLICK, 即"长按有时附带点击"(一次按压出 LPRESS+CLICK 两个事件).
+ * 与按下侧(DEBOUNCE)、普通释放侧(PRESSED 的 rel_cnt)同款"连续 N 次"门槛.
+ * 副作用: 若松手后按键持续交替抖动, 会停在 WAIT_RELEASE(不发事件)直到稳定 —— 属
+ * fail-safe: 宁可暂不响应, 也不再误发 CLICK. */
 static void process_pressed_release(key_info_t *key)
 {
     if (!is_key_pressed(key))
     {
-        key->state = KEY_STATE_IDLE;
+        key->rel_cnt++;
+        if (key->rel_cnt >= KEY_DELAY_TIME)
+        {
+            key->rel_cnt = 0;
+            key->state = KEY_STATE_IDLE;
+        }
+    }
+    else
+    {
+        key->rel_cnt = 0;   /* 仍按着 / 回弹到低电平: 释放计数作废 */
     }
 }
 

@@ -30,16 +30,20 @@ static const char *const cal_names[HANDLE_NUM] = {"T12", "T245", "T210"};
  * 烙铁头高于此温度时阻值已偏移, 标定不可靠, 需等降温 */
 /* 等降温时页面刷新周期 (ms) */
 #define CUR_CAL_COOL_PERIOD  200
+/* 测量脉冲进行中的轮询周期 (ms): 非阻塞测量需页面周期驱动取结果 */
+#define CUR_CAL_MEAS_PERIOD   50
 
 static uint8_t  cal_idx;      /* 当前选中的型号索引 */
 static uint16_t meas_cur;     /* 本次实测脉冲电流 ADC */
 static bool     meas_ok;      /* 本次测量是否有效 */
+static bool     meas_busy;    /* 测量脉冲进行中(等待结果) */
 static bool     cal_entered;  /* 本次进入是否已实测 */
 static bool     cal_boot;     /* 引导模式 (First Cal / Tip Cal) */
 static bool     cal_lock;     /* 引导模式锁定型号: 首次(未标定)锁定, 插头不匹配放开 */
 
 static const char *cur_cal_title(void);
 static void cur_cal_measure(void);
+static bool cur_cal_poll_measure(void);
 static menu_result_t cur_cal_handler(const menu_cmd_t *cmd, void *ud);
 static void cur_cal_enter(void *ud);
 static void cur_cal_exit(void *ud);
@@ -54,6 +58,8 @@ static const char *cur_cal_title(void)
     return cal_lock ? boot_title : tip_title;
 }
 
+/* 发起测量脉冲(非阻塞): 只启动, 结果由 cur_cal_poll_measure 轮询取回.
+ * 未受理(故障/自检未完成/非冷态/已有测量在跑)时蜂鸣, 并保持 meas_ok=false. */
 static void cur_cal_measure(void)
 {
     meas_ok  = false;
@@ -66,11 +72,41 @@ static void cur_cal_measure(void)
         return;
     }
 
-    meas_cur = WorkTask_MeasurePulseCur();
-    if (meas_cur == 0)
+    if (!WorkTask_PulseStart(true))
+    {
         Buzzer_Beep(BUZZER_EVENT_ALARM);   /* 非冷态: 阻值偏移, 标定不可靠 */
+        return;
+    }
+    meas_busy = true;
+}
+
+/* 轮询测量结果. 返回 true = 仍在测量中(本轮实测值暂显示为空). */
+static bool cur_cal_poll_measure(void)
+{
+    uint16_t cur = 0;
+    work_pulse_t st;
+
+    if (!meas_busy)
+        return false;
+
+    st = WorkTask_PulsePoll(&cur);
+    if (st == WORK_PULSE_BUSY)
+        return true;               /* 结果未就绪: 下个周期再问 */
+
+    /* READY = 取到结果; IDLE = 脉冲被中止(锁存故障/关机等).
+     * 二者都必须收尾 —— 只认 READY 会让 meas_busy 永远为真, 页面以 50ms 周期
+     * 无限重绘且标定永不落定. */
+    meas_busy = false;
+    if (st != WORK_PULSE_READY || cur == 0)
+    {
+        Buzzer_Beep(BUZZER_EVENT_ALARM);   /* 链路异常/被中止: 标定不可靠 */
+    }
     else
-        meas_ok = true;
+    {
+        meas_cur = cur;
+        meas_ok  = true;
+    }
+    return false;
 }
 
 static menu_result_t cur_cal_handler(const menu_cmd_t *cmd, void *ud)
@@ -146,6 +182,8 @@ static void cur_cal_exit(void *ud)
     (void)ud;
     cal_entered = false;   /* 下次进入重新实测 */
     cal_lock    = false;   /* 重置锁定状态 */
+    meas_busy   = false;
+    WorkTask_PulseAbort();            /* 未完成的测量: 断热作废, 防残留占空比 */
     WorkTask_SetCalSuppress(false);   /* 恢复加热使能 */
     WorkTask_SetSleepSuppress(false);   /* 恢复休眠/关机计时 */
 
@@ -173,6 +211,7 @@ static menu_period_t cur_cal_display(void *ud)
 {
     (void)ud;
     uint16_t ref = TypeCal_GetRef(cal_idx);
+    menu_period_t period = 0;
 
     if (!cal_entered)
     {
@@ -193,6 +232,11 @@ static menu_period_t cur_cal_display(void *ud)
         cal_entered = true;
         cur_cal_measure();
     }
+
+    /* 测量脉冲进行中: 周期轮询取结果; 未就绪则本轮后 50ms 再渲染一次.
+     * 期间实测值保持空(meas_ok=false), 结果到达后下一帧自动显示. */
+    if (cur_cal_poll_measure())
+        period = CUR_CAL_MEAS_PERIOD;
 
     OLED_Clear();
 
@@ -222,7 +266,7 @@ static menu_period_t cur_cal_display(void *ud)
     OLED_ShowString(29, 56, cal_boot ? "HLD: Skip" : "HLD: Exit", OLED_6X8);   /* 9 字 70px x29..99 */
 
     OLED_UpdateDiff();
-    return 0;
+    return period;
 }
 
 void CurCal_BootEnter(void)

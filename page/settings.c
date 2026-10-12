@@ -257,8 +257,8 @@ static menu_result_t reset_handler(const menu_cmd_t *cmd, void *ud)
     if (confirmed)
     {
         Config_Reset();   /* 内部已写 Flash (恢复默认并保存) */
-        /* 配置已回到默认型号(T12)/上限(400)/PID 参数: 走型号切换的安全收敛链路,
-         * 重载 PID、按新上限钳位目标、清 Boost 残留、对齐引导标志并重评型号故障.
+        /* 配置已回到默认型号(T12)/上限(450)/PID 参数: 走型号切换的安全收敛链路,
+         * 重载 PID、按新上限钳位目标、对齐引导标志并重评型号故障.
          * 该函数开头断热(防切换瞬间残余功率), 此处按"离开换头页"同一方式恢复使能:
          * ACTIVE 态没有其他 Heater_Enable 路径, 不补会静默永久停加热. */
         WorkTask_OnHandleChanged();
