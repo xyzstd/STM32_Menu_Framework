@@ -15,6 +15,12 @@
 static int16_t tune_setpoint = 0;    /* 进入时捕获的整定目标温度 (整定期间不变) */
 static bool    tune_started = false; /* 本次进入是否成功启动整定 (区分"被拒未启动"与"已失败") */
 
+/* 本页刷新周期: 整定要跑 40~160s, 期间温度与周期数都在变, 但**没有任何输入事件**.
+ * 渲染调度只在"输入事件派发后"和"页面返回的周期到期时"重绘(见 main/ui_task.c),
+ * 故返回 0 会让画面从进入那一刻冻结, 直到用户去拧旋钮. 200ms 足够跟上 1°C/s 的
+ * 温度变化; 静止帧由 OLED_UpdateDiff 差量判脏, 无变化时零 I2C 推送, 代价极低. */
+#define TUNE_REFRESH_MS  200
+
 static void tune_enter(void *ud);
 static menu_result_t tune_handler(const menu_cmd_t *cmd, void *ud);
 static void tune_exit(void *ud);
@@ -104,7 +110,7 @@ static menu_period_t tune_display(void *ud)
     }
 
     OLED_UpdateDiff();
-    return 0;
+    return TUNE_REFRESH_MS;   /* 非 0: 整定期间无输入也要周期重绘(见上) */
 }
 
 const menu_ops_t autotune_ops = {

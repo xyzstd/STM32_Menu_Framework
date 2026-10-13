@@ -256,7 +256,7 @@ static menu_result_t reset_handler(const menu_cmd_t *cmd, void *ud)
     menu_result_t r = confirm_handle(cmd, &reset_cf, &confirmed);
     if (confirmed)
     {
-        Config_Reset();   /* 内部已写 Flash (恢复默认并保存) */
+        bool saved = Config_Reset();   /* 内部已写 Flash (恢复默认并保存) */
         /* 配置已回到默认型号(T12)/上限(450)/PID 参数: 走型号切换的安全收敛链路,
          * 重载 PID、按新上限钳位目标、对齐引导标志并重评型号故障.
          * 该函数开头断热(防切换瞬间残余功率), 此处按"离开换头页"同一方式恢复使能:
@@ -267,7 +267,12 @@ static menu_result_t reset_handler(const menu_cmd_t *cmd, void *ud)
         /* 应用亮度与蜂鸣器默认值 */
         OLED_SetContrast(g_config.brightness);
         Buzzer_SetEnabled(g_config.buzzer_enable != 0);
-        Toast_Saved();   /* 落盘成功: 弹出"已保存"框 */
+        /* 仅"确实落盘成功"才弹"已保存" —— 与 param_exit/pid 页同一口径;
+         * 写失败却提示已保存, 会让用户以为设置已生效, 重启后却发现回到旧值. */
+        if (saved)
+            Toast_Saved();
+        else
+            Buzzer_Beep(BUZZER_EVENT_ALARM);
         return MENU_RET_DONE;
     }
     if (r == MENU_RET_DONE)

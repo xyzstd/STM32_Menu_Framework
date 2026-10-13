@@ -205,7 +205,7 @@ void Config_Load(void)
     Flash_Read(CONFIG_FLASH_ADDR, &magic, sizeof(magic));
     if (magic != CONFIG_MAGIC)
     {
-        Config_Reset();   /* 空页(全FF)/magic 不符 → 出厂默认 */
+        (void)Config_Reset();   /* 空页(全FF)/magic 不符 → 出厂默认 */
         return;
     }
 
@@ -228,7 +228,7 @@ void Config_Load(void)
             uint16_t old_crc = (uint16_t)(p[old.size - 2] | ((uint16_t)p[old.size - 1] << 8));
             if (crc16(p, (uint16_t)(old.size - 2)) != old_crc)
             {
-                Config_Reset();
+                (void)Config_Reset();
                 return;
             }
             memcpy(&g_config, p, old.size);
@@ -237,12 +237,12 @@ void Config_Load(void)
         }
         else
         {
-            Config_Reset();   /* size 异常 → 出厂默认 */
+            (void)Config_Reset();   /* size 异常 → 出厂默认 */
             return;
         }
 
         if (config_calc_crc(&g_config) != g_config.crc)
-            Config_Reset();
+            (void)Config_Reset();
     }
     else if (version == 10)
     {
@@ -255,7 +255,7 @@ void Config_Load(void)
 
         if (crc16((const uint8_t *)&old, sizeof(old) - sizeof(old.crc)) != old.crc)
         {
-            Config_Reset();
+            (void)Config_Reset();
             return;
         }
 
@@ -288,7 +288,7 @@ void Config_Load(void)
 
         if (crc16((const uint8_t *)&old, (uint16_t)offsetof(config_v12_t, crc)) != old.crc)
         {
-            Config_Reset();
+            (void)Config_Reset();
             return;
         }
 
@@ -310,7 +310,7 @@ void Config_Load(void)
     }
     else
     {
-        Config_Reset();   /* 无法解析的版本 → 出厂默认 */
+        (void)Config_Reset();   /* 无法解析的版本 → 出厂默认 */
     }
 }
 
@@ -322,10 +322,10 @@ bool Config_Save(void)
     return save_page(CONFIG_FLASH_ADDR, &g_config, sizeof(g_config));
 }
 
-void Config_Reset(void)
+bool Config_Reset(void)
 {
     memcpy(&g_config, &default_config, sizeof(g_config));
-    (void)Config_Save();   /* 只重置用户设置, 不触碰校准页 */
+    return Config_Save();   /* 只重置用户设置, 不触碰校准页; 返回落盘结果供调用方反馈 */
 }
 
 /* ==================== 校准数据独立页 ==================== */
@@ -429,12 +429,12 @@ uint16_t TypeCal_GetRef(uint8_t h)
     return g_typecal.cur_ref[h];
 }
 
-void TypeCal_SetRef(uint8_t h, uint16_t v)
+bool TypeCal_SetRef(uint8_t h, uint16_t v)
 {
     if (h >= HANDLE_NUM)
-        return;
+        return false;
     if (g_typecal.cur_ref[h] == v)
-        return;   /* 值未变化: 跳过落盘, 避免无谓的 Flash 擦写损耗 */
+        return true;   /* 值未变化: 跳过落盘(省 Flash 擦写), 目标状态已满足 → 视为成功 */
     g_typecal.cur_ref[h] = v;
-    (void)TypeCal_Save();
+    return TypeCal_Save();
 }

@@ -132,9 +132,18 @@ static menu_result_t cur_cal_handler(const menu_cmd_t *cmd, void *ud)
                 Buzzer_Beep(BUZZER_EVENT_ALARM);
                 break;
             }
-            TypeCal_SetRef(cal_idx, meas_cur);
-            Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
-            Toast_Saved();   /* 人性化反馈: 弹出"已保存"框 */
+            /* 仅"确实落盘成功"才提示已保存(与 settings/param/pid 页同一口径):
+             * 写失败却弹"已保存", 用户会以为参考值已生效, 重启后回到旧值且无从察觉. */
+            if (TypeCal_SetRef(cal_idx, meas_cur))
+            {
+                Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
+                Toast_Saved();   /* 人性化反馈: 弹出"已保存"框 */
+            }
+            else
+            {
+                Buzzer_Beep(BUZZER_EVENT_ALARM);   /* 落盘失败: 不弹"已保存" */
+                break;
+            }
             /* 当前配置型号已标定 → 清除首次引导标志 (手动/引导路径均幂等;
              * 标定的是其他型号时不清, 引导仍待处理) */
             if (cal_idx == Config_GetHandleIdx())

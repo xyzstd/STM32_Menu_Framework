@@ -21,6 +21,13 @@
 #define CAL_OFF_MAX   50
 #define CAL_OFF_MIN   (-50)
 
+/* 本页刷新周期: 底部有实时温度(cal_draw_live), 而"等烙铁头温度稳定"这段过程
+ * **没有任何输入事件**. 渲染调度只在"输入事件派发后"和"页面返回的周期到期时"
+ * 重绘(见 main/ui_task.c), 故返回 0 会让实时温度从进入那一刻冻结, 直到用户拧旋钮
+ * —— 用户就无法判断何时稳定可以开始校准. 200ms 足够; 静止帧由 OLED_UpdateDiff
+ * 差量判脏, 无变化时零 I2C 推送, 代价极低. */
+#define CAL_LIVE_REFRESH_MS  200
+
 /* 各校准点的目标温度 (°C) */
 static const int16_t cal_points[CAL_POINT_NUM] = {100, 200, 300, 350, 400, 450};
 
@@ -170,7 +177,7 @@ static menu_period_t calibrate_display(void *user_data)
         OLED_DrawRoundRect(4, row_y[focus], 60, 9, 4, OLED_COLOR_SET);
 
     OLED_UpdateDiff();
-    return 0;
+    return CAL_LIVE_REFRESH_MS;   /* 非 0: 无输入时也要刷新底部实时温度(见上) */
 }
 
 static void calibrate_enter(void *user_data)

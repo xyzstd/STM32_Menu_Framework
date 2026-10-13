@@ -220,12 +220,23 @@ CONFIG_PAGE_GUARD(guard_data_pages_distinct,
                   CONFIG_FLASH_PG(CAL_FLASH_ADDR) != CONFIG_FLASH_PG(CONFIG_FLASH_ADDR)  &&
                   CONFIG_FLASH_PG(TYPECAL_FLASH_ADDR) != CONFIG_FLASH_PG(CONFIG_FLASH_ADDR));
 
+/* 数据页容量守卫: save_page() 只擦一页再写 sizeof(...) 字节, 故每个结构体必须装得进
+ * 一页(2KB). 超出会溢写到相邻页, 且是**静默损坏**:
+ *   - CAL 溢出    → 覆盖 CONFIG 页(0x0803F800) → 用户设置丢失
+ *   - TYPECAL 溢出 → 覆盖 CAL 页(0x0803F000)    → 温度校准丢失
+ *   - CONFIG 溢出  → 越过 Flash 末尾, 写失败
+ * 三者都表现为"下次启动 CRC 失败 → 回落出厂值". 当前 64/64/16 字节, 离 2KB 尚远,
+ * 加守卫是为了"新增字段撞线时立刻编译失败", 而不是等真机出现数据丢失再回查. */
+CONFIG_PAGE_GUARD(guard_config_fits_page,  sizeof(config_t)   <= CONFIG_FLASH_PAGE_SIZE);
+CONFIG_PAGE_GUARD(guard_cal_fits_page,     sizeof(cal_t)      <= CONFIG_FLASH_PAGE_SIZE);
+CONFIG_PAGE_GUARD(guard_typecal_fits_page, sizeof(type_cal_t) <= CONFIG_FLASH_PAGE_SIZE);
+
 void Config_Init(void);
 void Config_Load(void);
 /* 三个 Save 均返回 true=已成功写入 Flash(失败多为写保护/超时).
  * RAM 副本无论成败都已更新为待写内容, 调用方可安全重试. */
 bool Config_Save(void);
-void Config_Reset(void);
+bool Config_Reset(void);   /* 恢复默认并落盘; 返回 false = Flash 写失败(未持久化) */
 
 /* 校准数据独立页管理 (Config_Reset 不触碰) */
 void Cal_Init(void);
@@ -248,7 +259,7 @@ bool     TypeCal_Save(void);
 void     TypeCal_Reset(void);
 
 uint16_t TypeCal_GetRef(uint8_t h);   /* 取某型号冷态脉冲电流参考 ADC (0=未标定) */
-void     TypeCal_SetRef(uint8_t h, uint16_t v);   /* 写入并落盘 */
+bool     TypeCal_SetRef(uint8_t h, uint16_t v);   /* 写入并落盘; false = 写失败 */
 
 /* 当前型号的脚柄索引 (越界回落到 T12) */
 uint8_t  Config_GetHandleIdx(void);
