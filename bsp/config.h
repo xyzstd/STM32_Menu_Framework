@@ -37,6 +37,12 @@
 /* 温度校准点数 (100/200/300/350/400/450°C) */
 #define CAL_POINT_NUM     6
 
+/* 校准偏移的合法范围 (±°C) —— 单一来源:
+ *   - 页面(page/calibrate.c)用它钳位用户可设范围;
+ *   - Cal_Init 用它校验从 Flash 载入的数据.
+ * 二者必须同源: 页面能设出的值必须能通过加载校验, 反之亦然. */
+#define CAL_OFF_LIMIT     50
+
 /* 手柄型号索引 */
 #define HANDLE_NUM      3
 #define HANDLE_T12      0

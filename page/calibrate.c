@@ -18,8 +18,10 @@
  *      (实际温度 = 基准 + 偏移, 实测比设定高则填正值, 如设定350/实测355 → +5)
  *   5. 导航态 LPRESS 退出, 恢复进入前的目标温度 */
 
-#define CAL_OFF_MAX   50
-#define CAL_OFF_MIN   (-50)
+/* 偏移范围取自 bsp/config.h 的 CAL_OFF_LIMIT —— 与 Cal_Init 的加载范围校验
+ * 同一来源, 保证"页面能设出的值"与"加载时接受的值"不会分歧 */
+#define CAL_OFF_MAX   CAL_OFF_LIMIT
+#define CAL_OFF_MIN   (-CAL_OFF_LIMIT)
 
 /* 本页刷新周期: 底部有实时温度(cal_draw_live), 而"等烙铁头温度稳定"这段过程
  * **没有任何输入事件**. 渲染调度只在"输入事件派发后"和"页面返回的周期到期时"

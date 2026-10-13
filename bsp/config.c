@@ -368,13 +368,36 @@ bool Cal_IsHandleValid(uint8_t h)
             Cal_GetAdc(5, h) > Cal_GetAdc(4, h));
 }
 
+/* 校准偏移的范围校验: 六个温度点 × 每型号(共 CAL_POINT_NUM*HANDLE_NUM 个)
+ * 必须全部落在 ±CAL_OFF_LIMIT 内.
+ * 为何必须校验: 偏移经 cal_offset_interp → spline_interp **直接叠加到读温**上.
+ * 越界值(如 -128)会让报温严重偏低, PID 因此持续满功率 → 实际温度远超设定(不安全方向);
+ * 页面也会因 '0' + |v|/10 拼出非数字字符.
+ * 正常路径(页面编辑 + Cal_SetOff)恒写入钳位后的值, 故越界只可能来自版本迁移
+ * (cal_migrate_v10 的 memcpy)或"CRC 自洽但语义越界"的存量数据.
+ * 布局前提: 六个偏移数组在 cal_t 内连续无填充 —— 与 Cal_GetOff/Cal_SetOff 的指针
+ * 步进访问同一假设, 已由上面的 guard_cal_off_contiguous 编译期守卫保证. */
+static bool cal_offsets_valid(void)
+{
+    const int8_t *off = (const int8_t *)&g_cal.cal_off_100;
+    uint8_t i;
+
+    for (i = 0; i < (uint8_t)(CAL_POINT_NUM * HANDLE_NUM); i++)
+    {
+        if (off[i] > CAL_OFF_LIMIT || off[i] < -CAL_OFF_LIMIT)
+            return false;
+    }
+
+    return true;
+}
+
 void Cal_Init(void)
 {
     Cal_Load();
 
     if (g_cal.magic != CAL_MAGIC || g_cal.version != CAL_VERSION ||
-        cal_calc_crc(&g_cal) != g_cal.crc)
-        Cal_Reset();   /* 空页(全FF)/版本不符/数据损坏 → 出厂校准 */
+        cal_calc_crc(&g_cal) != g_cal.crc || !cal_offsets_valid())
+        Cal_Reset();   /* 空页(全FF)/版本不符/数据损坏/偏移越界 → 出厂校准 */
 }
 
 void Cal_Load(void)
