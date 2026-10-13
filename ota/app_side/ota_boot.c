@@ -9,6 +9,9 @@
  * 需要用串口观察进入流程时置 1 即可, 其余代码不受影响. */
 #define OTA_BOOT_DEBUG  0
 
+/* 标志页写入重试次数: 单次失败常见于瞬时低压, 重试一次即可覆盖绝大多数情况 */
+#define OTA_FLAG_WRITE_RETRY  2
+
 #if OTA_BOOT_DEBUG
 #include <stdio.h>
 #endif
@@ -32,20 +35,42 @@ void OTA_SerialFeedRx(uint8_t b)
 
 void OTA_EnterBootloader(void)
 {
+    uint8_t retry;
+
+    /* 擦+写标志页, **回读校验通过才复位**; 失败则返回(不复位).
+     * 原先不检查 FLASH_ErasePage / FLASH_ProgramWord 的返回值就无条件复位: 低压或
+     * 写保护导致写失败时魔数没写进去, Bootloader 读不到标志 → 直接回 App, 用户看到
+     * "正在重启"却毫无变化, 且没有任何错误反馈(本仓库 config.c/flash.c 都检查返回值,
+     * 这里是唯一漏点). 回读校验不能省 —— 编程操作报 FLASH_COMPLETE 不代表内容正确. */
+    for (retry = 0; retry < OTA_FLAG_WRITE_RETRY; retry++)
+    {
 #if OTA_BOOT_DEBUG
-    printf("[APP] erasing flag page at 0x%08X...\r\n", (unsigned int)OTA_FLAG_FLASH_ADDR);
+        printf("[APP] erase+write flag page 0x%08X (try %u)...\r\n",
+               (unsigned int)OTA_FLAG_FLASH_ADDR, (unsigned)retry);
 #endif
-    FLASH_Unlock();
-    FLASH_ClearFlag(FLASH_FLAG_EOP | FLASH_FLAG_PGERR | FLASH_FLAG_WRPRTERR);
-    FLASH_ErasePage(OTA_FLAG_FLASH_ADDR);
-#if OTA_BOOT_DEBUG
-    printf("[APP] writing magic 0x%08lX to Flash...\r\n", (unsigned long)OTA_FLAG_MAGIC);
-#endif
-    FLASH_ProgramWord(OTA_FLAG_FLASH_ADDR, OTA_FLAG_MAGIC);
-    FLASH_Lock();
+        FLASH_Unlock();
+        FLASH_ClearFlag(FLASH_FLAG_EOP | FLASH_FLAG_PGERR | FLASH_FLAG_WRPRTERR);
+
+        if (FLASH_ErasePage(OTA_FLAG_FLASH_ADDR) == FLASH_COMPLETE &&
+            FLASH_ProgramWord(OTA_FLAG_FLASH_ADDR, OTA_FLAG_MAGIC) == FLASH_COMPLETE)
+        {
+            FLASH_Lock();
+            if (*(volatile uint32_t *)OTA_FLAG_FLASH_ADDR == OTA_FLAG_MAGIC)
+                break;   /* 已写入且回读一致 */
+        }
+        else
+        {
+            FLASH_Lock();
+        }
+    }
+
 #if OTA_BOOT_DEBUG
     printf("[APP] verify readback=0x%08lX\r\n", (unsigned long)(*(volatile uint32_t *)OTA_FLAG_FLASH_ADDR));
 #endif
-    /* 写魔数到 Flash 标志页（非易失，任意复位不丢）*/
+
+    if (*(volatile uint32_t *)OTA_FLAG_FLASH_ADDR != OTA_FLAG_MAGIC)
+        return;   /* 标志页写入失败: 不复位, 由调用方提示并留在原页 */
+
+    /* 标志页已确认写入(非易失, 任意复位不丢) → 复位进 Bootloader, 不返回 */
     NVIC_SystemReset();
 }

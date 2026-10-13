@@ -2,6 +2,7 @@
 #include "oled.h"
 #include "menu_display.h"
 #include "ota_boot.h"
+#include "buzzer.h"
 
 /* 每 250ms 显示/检查一次 */
 #define REFRESH_PERIOD_MS  250
@@ -9,6 +10,10 @@
 /* 等待动画: 4 帧循环 */
 #define ANIM_FRAMES  4
 static uint8_t anim_frame = 0;
+
+/* 标志页写入失败(低压/写保护): 停在错误提示, 不再重画等待界面.
+ * OTA_EnterBootloader 成功即复位不返回, 故"函数返回"本身就等于失败. */
+static bool boot_failed = false;
 
 static menu_result_t ota_wait_handler(const menu_cmd_t *cmd, void *user_data);
 static menu_period_t ota_wait_display(void *user_data);
@@ -32,6 +37,16 @@ static menu_period_t ota_wait_display(void *user_data)
     char buf[16];
     const char *d = dots[anim_frame];
 
+    /* 标志页写入失败: 只提示错误 + 退出方式, 不再显示"等待主机"以免误导 */
+    if (boot_failed)
+    {
+        OLED_Clear();
+        OLED_ShowChinese(32, 20, "升级失败");   /* 4 汉字 64px, 居中 x=32 */
+        OLED_ShowChinese(32, 56, "长按退出");
+        OLED_UpdateDiff();
+        return REFRESH_PERIOD_MS;
+    }
+
     /* 检查 OTA 请求标志（串口 RX 中断里 OTA_SerialFeedRx 状态机设置）。*/
     if (OTA_GetAppRequest()) {
         OTA_SetAppRequest(false);
@@ -42,7 +57,12 @@ static menu_period_t ota_wait_display(void *user_data)
         OLED_ReverseArea(0, 19, OLED_WIDTH, 18);
         OLED_ShowChinese(32, 42, "正在重启");
         OLED_Update();
-        OTA_EnterBootloader();  /* 写 noinit 魔数 + NVIC_SystemReset()，不返回 */
+        OTA_EnterBootloader();  /* 成功: 写标志页 + NVIC_SystemReset(), 不返回 */
+        /* 走到这里 = 标志页写入失败(低压/写保护), 未复位. 若不提示, 用户会看到
+         * "正在重启"却停在原界面, 误以为已进入升级而实际上什么都没发生. */
+        boot_failed = true;
+        Buzzer_Beep(BUZZER_EVENT_ALARM);
+        return REFRESH_PERIOD_MS;   /* 本帧先不重画, 下一帧进上面的错误分支 */
     }
 
     anim_frame = (uint8_t)((anim_frame + 1) % ANIM_FRAMES);
@@ -67,7 +87,8 @@ static void ota_wait_enter(void *user_data)
 {
     (void)user_data;
     OTA_SetAppRequest(false);
-    anim_frame = 0;
+    anim_frame  = 0;
+    boot_failed = false;   /* 重进本页清错误态, 允许再试一次 */
 }
 
 static void ota_wait_exit(void *user_data)

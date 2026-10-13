@@ -1,4 +1,4 @@
-/**
+﻿/**
   ******************************************************************************
   * @file    Project/STM32F10x_StdPeriph_Template/stm32f10x_it.c 
   * @author  MCD Application Team
@@ -36,6 +36,23 @@
 /* Private function prototypes -----------------------------------------------*/
 /* Private functions ---------------------------------------------------------*/
 
+/* ==================== 故障兜底: 先断热, 再停住 ====================
+ * 故障(含 NMI)时 TIM1 CH1(PA8) 的加热 PWM **仍由硬件按最后占空比持续输出**, 而
+ * 控制环路(work_task 的 PID/安全状态机)已经死了 —— 若只写 while(1), 烙铁会继续
+ * 加热, 只能靠 IWDG(约 2s 超时)复位兜底; 换到未启用看门狗的项目即**无限加热**.
+ *
+ * 故这里先直接清 CCR1 断热:
+ *   - 不经 Heater 层: 故障时软件状态(heater.enabled/power)可能已不可信;
+ *   - 不依赖任何外设初始化: TIM1 的 PWM 输出由硬件维持, 清比较值即立即归零.
+ * 之后再自旋停住(等 IWDG 复位或调试器介入). */
+static void fault_shutdown(void)
+{
+    TIM1->CCR1 = 0;   /* 加热 PWM 占空比归零 */
+    while (1)
+    {
+    }
+}
+
 /******************************************************************************/
 /*            Cortex-M3 Processor Exceptions Handlers                         */
 /******************************************************************************/
@@ -47,6 +64,8 @@
   */
 void NMI_Handler(void)
 {
+    /* 原为空实现: 若 NMI 源未清除会立即重入, 形成无限 NMI 且加热不停. */
+    fault_shutdown();
 }
 
 /**
@@ -56,10 +75,8 @@ void NMI_Handler(void)
   */
 void HardFault_Handler(void)
 {
-  /* Go to infinite loop when Hard Fault exception occurs */
-  while (1)
-  {
-  }
+  /* 故障时 PWM 仍在输出: 先断热再停住(见 fault_shutdown 说明) */
+  fault_shutdown();
 }
 
 /**
@@ -69,10 +86,7 @@ void HardFault_Handler(void)
   */
 void MemManage_Handler(void)
 {
-  /* Go to infinite loop when Memory Manage exception occurs */
-  while (1)
-  {
-  }
+  fault_shutdown();
 }
 
 /**
@@ -82,10 +96,7 @@ void MemManage_Handler(void)
   */
 void BusFault_Handler(void)
 {
-  /* Go to infinite loop when Bus Fault exception occurs */
-  while (1)
-  {
-  }
+  fault_shutdown();
 }
 
 /**
@@ -95,10 +106,7 @@ void BusFault_Handler(void)
   */
 void UsageFault_Handler(void)
 {
-  /* Go to infinite loop when Usage Fault exception occurs */
-  while (1)
-  {
-  }
+  fault_shutdown();
 }
 
 /**
