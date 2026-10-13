@@ -88,6 +88,8 @@ static void handle_apply_switch(void)
     WorkTask_OnHandleChanged();
     if (saved)
         Toast_Saved();   /* 仅在确实落盘成功时弹框 */
+    else
+        Buzzer_Beep(BUZZER_EVENT_ALARM);   /* 失败必须告警, 否则用户以为已存下 */
 
 #if !HW_SIM_MODE
     /* 切换到尚无冷态电流参考(未标定)的型号: 直接引导进 Cur Cal 完成冷态标定,

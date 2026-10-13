@@ -5,6 +5,7 @@
 #include "config.h"
 #include "pid_controller.h"
 #include "toast.h"
+#include "buzzer.h"
 
 /*
  * PID 参数设置: 两个子页面
@@ -121,6 +122,8 @@ static void pid_agg_store(void)
     PID_Controller_SetAggKd(agg.val[2]);
     if (Config_Save())
         Toast_Saved();   /* 仅在确实落盘成功时弹框: 失败却提示"已保存"会误导用户 */
+    else
+        Buzzer_Beep(BUZZER_EVENT_ALARM);   /* 失败必须告警, 否则用户以为已存下 */
 }
 
 /* ==================== 保守参数 ==================== */
@@ -144,6 +147,8 @@ static void pid_cons_store(void)
     PID_Controller_SetConsKd(cons.val[2]);
     if (Config_Save())
         Toast_Saved();   /* 仅在确实落盘成功时弹框 */
+    else
+        Buzzer_Beep(BUZZER_EVENT_ALARM);
 }
 
 /* ==================== 共享 display 布局 (本页私有) ==================== */

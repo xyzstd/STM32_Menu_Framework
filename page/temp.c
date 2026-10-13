@@ -6,6 +6,7 @@
 #include "pid_controller.h"
 #include "param.h"
 #include "work_task.h"
+#include "buzzer.h"
 
 /*
  * 目标温度设置项 (单参数模板):
@@ -63,9 +64,15 @@ static void temp_enter(void *ud)
 
 static menu_result_t temp_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &temp); }
 
-/* 目标温度是 HOME 高频操作, 退出落盘不弹"已保存"框以免遮挡读数
- * (param_exit 返回落盘标记, 此处有意忽略) */
-static void temp_exit(void *ud){ (void)ud; (void)param_exit(&temp); }
+/* 目标温度是 HOME 高频操作, 退出落盘**不弹"已保存"框**以免遮挡读数;
+ * 但落盘失败必须蜂鸣 —— 静默失败会让用户以为新设定已存下, 重启才发现回到旧值.
+ * (仅抑制成功提示, 不抑制失败告警) */
+static void temp_exit(void *ud)
+{
+    (void)ud;
+    if (param_exit(&temp) == PARAM_EXIT_SAVE_FAILED)
+        Buzzer_Beep(BUZZER_EVENT_ALARM);
+}
 
 static menu_period_t temp_display(void *ud)
 {

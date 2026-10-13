@@ -60,7 +60,7 @@ static param_t sleep_time = {
 
 static void sleep_time_enter(void *ud){ (void)ud; param_enter(&sleep_time); }
 static menu_result_t sleep_time_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &sleep_time); }
-static void sleep_time_exit(void *ud){ (void)ud; if (param_exit(&sleep_time)) Toast_Saved(); }
+static void sleep_time_exit(void *ud){ (void)ud; param_exit_notify(&sleep_time); }
 static menu_period_t sleep_time_display(void *ud)
 {
     (void)ud;
@@ -98,7 +98,7 @@ static param_t sleep_temp = {
 
 static void sleep_temp_enter(void *ud){ (void)ud; param_enter(&sleep_temp); }
 static menu_result_t sleep_temp_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &sleep_temp); }
-static void sleep_temp_exit(void *ud){ (void)ud; if (param_exit(&sleep_temp)) Toast_Saved(); }
+static void sleep_temp_exit(void *ud){ (void)ud; param_exit_notify(&sleep_temp); }
 static menu_period_t sleep_temp_display(void *ud)
 {
     (void)ud;
@@ -133,7 +133,7 @@ static param_t shutdown = {
 
 static void shutdown_enter(void *ud){ (void)ud; param_enter(&shutdown); }
 static menu_result_t shutdown_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &shutdown); }
-static void shutdown_exit(void *ud){ (void)ud; if (param_exit(&shutdown)) Toast_Saved(); }
+static void shutdown_exit(void *ud){ (void)ud; param_exit_notify(&shutdown); }
 static menu_period_t shutdown_display(void *ud)
 {
     (void)ud;
@@ -175,7 +175,7 @@ static param_t buzzer = {
 
 static void buzzer_enter(void *ud){ (void)ud; param_enter(&buzzer); }
 static menu_result_t buzzer_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &buzzer); }
-static void buzzer_exit(void *ud){ (void)ud; if (param_exit(&buzzer)) Toast_Saved(); }
+static void buzzer_exit(void *ud){ (void)ud; param_exit_notify(&buzzer); }
 static menu_period_t buzzer_display(void *ud)
 {
     (void)ud;
@@ -212,7 +212,7 @@ static param_t brightness = {
 
 static void brightness_enter(void *ud){ (void)ud; param_enter(&brightness); }
 static menu_result_t brightness_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return param_handler(cmd, &brightness); }
-static void brightness_exit(void *ud){ (void)ud; if (param_exit(&brightness)) Toast_Saved(); }
+static void brightness_exit(void *ud){ (void)ud; param_exit_notify(&brightness); }
 static menu_period_t brightness_display(void *ud)
 {
     (void)ud;

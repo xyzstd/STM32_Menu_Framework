@@ -1,5 +1,7 @@
 ﻿#include "param.h"
 #include "config.h"
+#include "buzzer.h"
+#include "toast.h"
 
 void param_enter(param_t *it)
 {
@@ -22,6 +24,9 @@ menu_result_t param_handler(const menu_cmd_t *cmd, param_t *it)
     {
     case MENU_EVENT_UP:
     case MENU_EVENT_DOWN:
+    {
+        int16_t old = it->val;
+
         if (it->toggle)
             it->val = (it->val == it->min) ? it->max : it->min;
         else
@@ -32,8 +37,13 @@ menu_result_t param_handler(const menu_cmd_t *cmd, param_t *it)
             if (it->val > it->max) it->val = it->max;
         }
         it->dirty = true;
-        if (it->on_change) it->on_change(it);
+
+        /* 仅值真的变化才回调: 已到上/下限后继续转不会再改值, 此时回调"实时生效"
+         * 型页面(如亮度)只是把同一个值反复写一遍 —— 白费一次 I2C 事务. */
+        if (it->on_change && it->val != old)
+            it->on_change(it);
         break;
+    }
 
     case MENU_EVENT_CLICK:
     case MENU_EVENT_LPRESS:
@@ -45,19 +55,42 @@ menu_result_t param_handler(const menu_cmd_t *cmd, param_t *it)
     return MENU_RET_OK;
 }
 
-bool param_exit(param_t *it)
+param_exit_result_t param_exit(param_t *it)
 {
-    bool saved = false;
+    param_exit_result_t r = PARAM_EXIT_UNCHANGED;
 
     if (it->dirty && it->store && it->val != it->base)
     {
         it->store(it);
-        /* 返回"确实落盘成功"而非"用户改过值": 落盘失败时必须让调用方
-         * 拿到 false, 否则页面弹出"已保存"却什么都没写进 Flash —— 正是
-         * 最误导人的静默数据丢失. RAM 副本已更新, 用户退出重进再改一次
-         * 即可重试落盘. */
-        saved = Config_Save();
+
+        if (Config_Save())
+            r = PARAM_EXIT_SAVED;
+        else
+        {
+            /* 落盘失败: 回滚 RAM 副本, 让 UI/运行时状态与 Flash 保持一致.
+             * 不回滚的话, 重进页面 load() 读到的是新值且 val==base, 于是表现成
+             * "已经保存了"而 Flash 仍是旧值, 重启才回到旧值 —— 正是最误导人的
+             * 静默数据丢失. 回滚后用户立刻能看到设置并未生效.
+             * on_change 需一并重放: "实时生效"型效果(如亮度)由它施加, 不重放会
+             * 让实际效果停留在未保存的新值上, 与回滚后的 RAM 值不一致. */
+            it->val = it->base;
+            it->store(it);
+            if (it->on_change)
+                it->on_change(it);
+            r = PARAM_EXIT_SAVE_FAILED;
+        }
     }
     it->dirty = false;
-    return saved;
+    return r;
+}
+
+void param_exit_notify(param_t *it)
+{
+    param_exit_result_t r = param_exit(it);
+
+    if (r == PARAM_EXIT_SAVED)
+        Toast_Saved();
+    else if (r == PARAM_EXIT_SAVE_FAILED)
+        Buzzer_Beep(BUZZER_EVENT_ALARM);
+    /* PARAM_EXIT_UNCHANGED: 未改动, 静默 */
 }
