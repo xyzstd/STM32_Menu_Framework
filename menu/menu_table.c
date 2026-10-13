@@ -191,3 +191,16 @@ const menu_item_t menu_table[] =
 };
 
 const uint8_t menu_max_num = sizeof(menu_table) / sizeof(menu_table[0]);
+
+/* ==================== 编译期守卫(能力范围内的那部分) ====================
+ * 索引类型是 uint8_t, 项数超过 255 会被静默截断 —— 这类"由 sizeof 得出的量"在
+ * C99 里是整数常量表达式, 可以用负数组长度手法断言(AC5 不认 C11 _Static_assert).
+ *
+ * 表内 parent/child 关系**无法在此断言**: C99 下 const 数组成员不是整数常量表达式,
+ * menu_table[3].first_child + menu_table[3].child_num 不能用于数组长度或 case 标签.
+ * 那部分由构建期脚本 build_tools/check_menu_table.py 静态解析本文件覆盖(改表即报,
+ * 不必上机); 内核的 menu_validate_table 则作为现场运行期兜底保留. */
+#define MENU_TABLE_COUNT (sizeof(menu_table) / sizeof(menu_table[0]))
+
+typedef char menu_table_count_guard[(MENU_TABLE_COUNT <= 255u) ? 1 : -1];
+typedef char menu_table_home_guard[(MENU_TABLE_COUNT > MENU_HOME_ID) ? 1 : -1];

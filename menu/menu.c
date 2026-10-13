@@ -1,4 +1,4 @@
-﻿#include "menu.h"
+#include "menu.h"
 
 typedef struct{
     uint8_t current;
@@ -6,9 +6,11 @@ typedef struct{
 }menu_ctrl_t;
 
 static menu_ctrl_t menu_ctrl;
-static bool menu_table_valid;
 
+#if MENU_DEBUG_ASSERT
 static bool menu_validate_table(void);
+#endif
+
 static const menu_item_t *menu_current_item(void);
 
 static void menu_activate(void);
@@ -25,14 +27,23 @@ static void menu_back(void);
 
 void Menu_Init(void)
 {
+	menu_ctrl.state   = MENU_STATE_NORMAL;
+	
+#if MENU_DEBUG_ASSERT
     menu_ctrl.current = MENU_NO_PARENT;
-    menu_ctrl.state   = MENU_STATE_NORMAL;
-    menu_table_valid  = menu_validate_table();
+    static bool menu_table_valid  = menu_validate_table();
+    /* 表配错时这里是唯一"能看见"的时机: 正常路径会静默降级, 现象只有
+     * "上电后按键完全无反应", 没有任何日志/提示.
+     * 陷阱动作由 MENU_ASSERT_TRAP() 决定(默认纯自旋; 应用可重定义为"自旋+喂狗",
+     * 见 menu.h) —— 内核自身不引用看门狗, 以免破坏整目录复用. */
+    if (!menu_table_valid)
+        MENU_ASSERT_TRAP();
 
     /* 菜单表损坏时保持虚拟根+列表态: 所有导航入口停用, 避免按错误 parent/child
-     * 范围访问表或调用错误页面回调. 调试时可在此检查 menu_table_valid. */
+     * 范围访问表或调用错误页面回调. 应用可用 Menu_IsValid() 主动查询本状态. */
     if (!menu_table_valid)
         return;
+#endif
 
     menu_ctrl.current = MENU_HOME_ID;
     menu_activate();
@@ -47,7 +58,11 @@ void *Menu_GetUserData(const menu_item_t *item)
 
 void Menu_EventDispatch(const menu_cmd_t *cmd)
 {
-    if (!menu_table_valid || !cmd)
+#if MENU_DEBUG_ASSERT	
+	if(!menu_validate_table())
+		return;
+#endif
+    if (!cmd)
         return;
 
     if(menu_ctrl.state==MENU_STATE_HANDLER)
@@ -73,8 +88,10 @@ menu_state_t Menu_GetState(void)
  * 不改动列表滚动/差量渲染等既有逻辑; 渲染层经 GetCurrentId/GetState 自动适配. */
 void Menu_SetCurrentId(uint8_t id)
 {
-    if (!menu_table_valid)
-        return;
+#if MENU_DEBUG_ASSERT	
+	if(!menu_validate_table())
+		return;
+#endif
 
     /* 0 = 占位虚拟根(ops=NULL, 且不属于任何列表): 若置为 current, 渲染层
      * Menu_GetSiblingRange(0) 返回 false → menu_list_display 不渲染, 画面冻结在
@@ -120,6 +137,7 @@ const menu_item_t *Menu_GetItem(uint8_t id)
 /* 启动期验证只读菜单表, 不调用页面回调、不依赖 UI。
  * 校验父->子与子->父双向一致、半开范围不越界、树无孤岛/环, 并检查可激活 ops 契约.
  * 返回 false 时 Menu_Init 留在虚拟根, 且拒绝所有事件/强制跳转(安全失败). */
+#if MENU_DEBUG_ASSERT
 static bool menu_validate_table(void)
 {
     const menu_item_t *item;
@@ -207,6 +225,7 @@ static bool menu_validate_table(void)
 
     return true;
 }
+#endif
 
 
 static const menu_item_t *menu_current_item(void)

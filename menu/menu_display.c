@@ -16,6 +16,22 @@ static uint8_t win_cursor = 0;   /* 高亮所在行(0..lines-1) */
 static uint8_t win_prev   = 0;   /* 上一帧选中下标, 用于判定移动方向(含环回) */
 static bool    win_entry_pending = false;   /* 刚离开列表态(渲染过页面): 下次进入列表按"新进入"复位窗口 */
 
+/* 刷新请求 hook(由应用层注册, 见 menu_display.h): 仅动画需要"本帧未完"时调用.
+ * menu 层借此与调度方解耦, 不按名字依赖 UI_RequestRefresh().
+ * 变量与消费点同受 MENU_ANIM_ENABLE 约束, 否则动画关闭时"只写不读"会告警. */
+#if MENU_ANIM_ENABLE
+static void (*menu_refresh_hook)(void) = 0;
+#endif
+
+void MenuDisplay_SetRefreshHook(void (*hook)(void))
+{
+#if MENU_ANIM_ENABLE
+    menu_refresh_hook = hook;
+#else
+    (void)hook;   /* 动画关闭: 暂无消费方, 保留注册接口使调用方无需条件编译 */
+#endif
+}
+
 static void menu_window_reset(uint8_t index, uint8_t first, uint8_t count);
 static void menu_list_advance(uint8_t index, uint8_t first, uint8_t count);
 
@@ -285,7 +301,7 @@ static menu_period_t menu_page_display(void)
     return 0;
 }
 
-menu_period_t UI_Render(void)
+menu_period_t MenuDisplay_Render(void)
 {
     if (Menu_GetState() == MENU_STATE_NORMAL)
     {
@@ -293,8 +309,8 @@ menu_period_t UI_Render(void)
         menu_period_t ret = menu_list_display();
 
 #if MENU_ANIM_ENABLE
-        if (AnimNav_Advance())
-            UI_RequestRefresh();
+        if (AnimNav_Advance() && menu_refresh_hook)
+            menu_refresh_hook();   /* 动画未完: 请调度方再渲染一帧 */
 #endif
 
         return ret;

@@ -1,6 +1,5 @@
 ﻿#include "stm32f10x.h"
 #include "timer.h"
-#include "oled.h"
 #include "menu_display.h"
 #include "menu.h"
 #include "work_task.h"
@@ -39,7 +38,11 @@ void UI_RequestRefresh(void)
 
 void UI_Task_Init(void)
 {
-    ui_refresh_period = UI_Render();
+    /* 注册刷新请求 hook: 动画需要"再渲染一帧"时由 menu 层回调到这里.
+     * 单向依赖 —— menu 层不再声明/引用本层的 UI_RequestRefresh(). */
+    MenuDisplay_SetRefreshHook(UI_RequestRefresh);
+
+    ui_refresh_period = MenuDisplay_Render();
     ui_refresh_tick = Timer_GetTick();
     ui_last_render_tick = ui_refresh_tick;
 }
@@ -99,7 +102,7 @@ void UI_Task_Process(void)
         ui_refresh_request = false;
         ui_last_render_tick = now;
         ui_refresh_tick = now;
-        ui_refresh_period = UI_Render();
+        ui_refresh_period = MenuDisplay_Render();
         (void)Toast_Overlay();   /* 渲染后叠加保存框 */
     }
     else if(ui_refresh_period != 0)
@@ -108,7 +111,7 @@ void UI_Task_Process(void)
         {
             ui_refresh_tick = now;
             ui_last_render_tick = now;
-            ui_refresh_period = UI_Render();
+            ui_refresh_period = MenuDisplay_Render();
             (void)Toast_Overlay();   /* 渲染后叠加保存框 */
         }
     }
