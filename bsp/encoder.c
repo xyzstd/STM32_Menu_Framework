@@ -77,13 +77,18 @@ void Encoder_RequestResync(void)
 }
 
 /* 取走自上次调用以来累计的步数(正=正向/UP, 负=反向/DOWN); 读后清零.
- * 仅由 input_scan(TIM2 中断)单上下文调用, 故无需临界区. */
+ * 仅由 input_scan(TIM2 中断)单上下文调用, 故无需临界区.
+ * 重锚的规范语义按单位计数定义. 直接对聚合 delta 反射会令结果依赖 4ms 采样分块；
+ * 这里最多处理首次反向计数以决定是否预支相位, 再把同方向余量作 O(1) 净结算.
+ * 因而既与单位计数状态转移等价, 又不会因毛刺让 ISR 进入长循环. */
 int16_t Encoder_GetSteps(void)
 {
     uint16_t now   = TIM_GetCounter(TIMx);
     int16_t  delta = (int16_t)(now - enc_last);   /* 差分: 16bit 回绕安全 */
-    int16_t  sum;
+    int32_t  sum;
+    int32_t  residual;
     int16_t  steps;
+    int8_t   dir;
 
     /* 跳转重同步: 只清残留相位(enc_acc), 不动计数基准 enc_last ——
      * 自上次取样以来的计数(delta)照常结算, 故"跳转后立刻转的第一格"不会被吞. */
@@ -97,23 +102,31 @@ int16_t Encoder_GetSteps(void)
         return 0;
 
     enc_last = now;
-    sum = (int16_t)(enc_acc + delta);
+    residual = enc_acc;
+    steps = 0;
+    dir = (delta > 0) ? 1 : -1;
 
-    /* 转向重锚(消除"转向卡格"): 反向时把旧方向的残留相位 r 沿新方向预支掉 ——
-     * 锚点反射到当前位置, 新方向只需 4-|r| 计数即出一步, 而不是"先还清 |r|
-     * 再走 4"(最坏 7 计数 ≈ 1.75 格空转, 即"转到底子后反向不动").
-     * 只在反向"尚未跨过锚点"时反射: 判据取 sum 与 enc_acc 同号(残留仍在本侧).
-     * 一旦反向计数越过锚点(sum 变号)即按净位移结算 —— 否则反射会得到与净位移
-     * 反号的残差(快速反向时多走数格才出事件, 甚至多报/少报一步).
-     * 残留为 0(正好停在格边界)时无残留可预支, 转向死区保持 1 格, 属固有下限. */
-    if (enc_acc != 0 && ((delta > 0) != (enc_acc > 0)) &&
-        ((sum > 0) == (enc_acc > 0)))
-        enc_acc = (int16_t)(-sum);
-    else
-        enc_acc = sum;
+    /* 转向预支: 若新方向与旧残差反号, 先只处理第一个单位计数.
+     * sum 仍与旧残差同号=该单位尚未越锚, 反射相位; 随后残差已与新方向同号,
+     * delta 剩余部分不可能再触发反射, 可直接合并. 若 sum 为 0, 按越锚分支处理.
+     * 例 acc=+3、delta=-3: 首计数使 sum=+2→预支成 -2, 余量 -2 合计 -4,
+     * 输出 -1 步; 无论该 -3 被分成 -1/-2 还是 -2/-1, 结果相同.
+     * delta 由 int16_t 差分给出, 最大幅度 32768; 全程 int32_t 中间量, 无长循环. */
+    if (residual != 0 && ((delta > 0) != (residual > 0)))
+    {
+        sum = residual + dir;
+        if ((sum > 0) == (residual > 0))
+            residual = -sum;   /* 越锚前反射, 减少换向死区 */
+        else
+            residual = sum;    /* 首个计数已到锚点/越锚: 不反射 */
+        delta = (int16_t)(delta - dir);  /* 首个单位计数已纳入 residual */
+    }
 
-    steps   = (int16_t)(enc_acc / ENC_TICKS_PER_STEP);         /* 满格数(向零截断) */
-    enc_acc = (int16_t)(enc_acc - steps * ENC_TICKS_PER_STEP); /* 保留不足一格的余量 */
-
+    residual += delta;
+    steps = (int16_t)(residual / ENC_TICKS_PER_STEP);  /* C99 有符号除法向零截断 */
+    residual -= (int32_t)steps * ENC_TICKS_PER_STEP;
+    enc_acc = (int16_t)residual;
     return steps;
 }
+#undef TIMx
+#undef TIMx_CLK
