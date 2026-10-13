@@ -28,9 +28,12 @@ def read_bom(path):
 
 
 def strip_comments(t):
-    """去掉块注释与行注释, 避免注释内引号文本污染统计."""
+    """去掉块注释、行注释与预处理诊断指令, 避免非显示文本污染统计."""
     t = re.sub(r'/\*.*?\*/', '', t, flags=re.S)
     t = re.sub(r'//[^\n]*', '', t)
+    # #warning / #error 的字符串是给编译器看的诊断信息, 永远不会上屏,
+    # 不应计入"需要字库支持"的汉字. (menu.c 的 MENU_DEBUG_ASSERT 提示即属此类.)
+    t = re.sub(r'^[ \t]*#[ \t]*(?:warning|error)\b[^\n]*', '', t, flags=re.M)
     return t
 
 
