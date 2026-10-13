@@ -213,7 +213,7 @@ void Input_Process(void)
         uint16_t ctx_before;
 
         if ((evt.event == MENU_EVENT_UP || evt.event == MENU_EVENT_DOWN) &&
-            age16 > INPUT_ENCODER_MAX_AGE_MS)
+             age16 > INPUT_ENCODER_MAX_AGE_MS)
             continue;   /* 丢弃过期旋转，不让旧输入在阻塞恢复后突然执行 */
 
         cmd.event = (menu_event_t)evt.event;
