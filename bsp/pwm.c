@@ -10,8 +10,11 @@
 
 /* 注入组采样相位: false = 导通段中点(采导通电流), true = 关断段中点(采关断基准)。
  * 由 ADC 的 JEOC 中断逐帧取反, 主循环只读。初值取关断相位: 保证第一帧先落到关断
- * 基准上, 免得 AD_GetCurrent 在基准尚未采到时把 0 当基准算出偏大的电流。 */
-static bool inject_off_phase = true;
+ * 基准上, 免得 AD_GetCurrent 在基准尚未采到时把 0 当基准算出偏大的电流。
+ * volatile 必须加: 该量在 ADC1_2_IRQHandler 里写、在 PWM_SetCompare1 里读,
+ * 无 volatile 时编译器可把读取提升到循环外缓存, 主循环将长期用错相位 ——
+ * 直接影响电流采样与过流判定。同类 ISR/主循环共享量在 adc.c/encoder.c 均已加。 */
+static volatile bool inject_off_phase = true;
 
 /* ADC 采样孔径 (注入通道采样时间 55.5 个 ADC 时钟): 采样开关在孔径末端断开,
  * 锁存到的就是那一刻的输入, 故触发点要比目标时刻提前一个孔径。ADC 时钟与 TIM1

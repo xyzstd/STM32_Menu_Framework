@@ -32,6 +32,25 @@ static uint8_t oled_flush_next = 0;
  * 8 页×1.7ms / 10s ≈ 0.14% 的 I2C 占用. */
 #define OLED_FULL_REFRESH_MS  10000u
 #define OLED_WRITE_RETRY_MS   50u     /* NACK 后退避, OLED 缺失时不在主循环每轮忙重试 */
+
+/* 触发全局退避所需的"连续 NACK"次数.
+ * 退避本意是防"屏幕缺失/总线挂了"时主循环每轮白耗 1.7ms 重试; 但若一有 NACK
+ * 就全局退避 50ms, 一次瞬时干扰(软 I2C 总线受加热 PWM 串扰等)就会让**整屏**
+ * 50ms 不更新 —— 表现为"画面突然卡一下". 故改为连续失败达阈值才退避: 单次瞬时
+ * NACK 只丢掉那一页(下轮继续推其它页, 该页留脏稍后重试), 不影响整体刷新节奏. */
+#define OLED_NACK_BACKOFF_AFTER  3u
+static uint8_t oled_nack_streak = 0;
+
+/* 软 I2C 半周期延时(volatile 空循环次数). 时序经反汇编核对(Release -O3):
+ * 一次 volatile 空循环迭代 ≈ 11 周期 ≈ 0.15µs.
+ * 原实现**只在 SCL 高电平段加延时**(12 次 ≈ 1.8µs), 低电平段直接进下一位的 SDA
+ * 设置 —— 实测 tLOW ≈ 0.3µs, 远低于 I2C 规范最小 1.3µs(400kHz 快速模式), 等效时钟
+ * 约 476kHz 也已超规范. 这是"偶发 NACK"的根因: 总线一旦受加热 PWM 串扰或温漂,
+ * 从机就可能采样失败 → 丢写 → 该页不刷新(旧版无 ACK 检测时表现为像素残影).
+ * 现高低电平各留合规宽度, 每位总时长仅增约 1/3, 分帧刷屏完全吸收. */
+#define I2C_DLY_HIGH  8u    /* SCL 高 ≈1.2µs (规范 ≥0.6µs) */
+#define I2C_DLY_LOW   10u   /* SCL 低 ≈1.5µs (规范 ≥1.3µs) */
+
 static uint32_t oled_full_tick = 0;
 static uint32_t oled_retry_tick = 0;
 static bool oled_retry_wait = false;
@@ -133,8 +152,9 @@ static bool oled_i2c_send_byte(uint8_t byte)
     {
         oled_w_sda(byte&(0x80>>i));
         oled_w_scl(1);
-        for(delay=0;delay<12;delay++);   /* 保持 SCL 高电平宽度, 满足 SSD1315 采样 */
+        for(delay=0;delay<I2C_DLY_HIGH;delay++);   /* 保持 SCL 高电平宽度 */
         oled_w_scl(0);
+        for(delay=0;delay<I2C_DLY_LOW;delay++);    /* 补 SCL 低电平宽度(原缺失) */
     }
 
     /* 第9个时钟采 ACK: 开漏输出写 1 即释放 SDA, 从机应拉低应答.
@@ -142,9 +162,10 @@ static bool oled_i2c_send_byte(uint8_t byte)
     oled_w_sda(1);
     for(delay=0;delay<4;delay++);
     oled_w_scl(1);
-    for(delay=0;delay<12;delay++);
+    for(delay=0;delay<I2C_DLY_HIGH;delay++);
     ack = (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_9) == Bit_RESET);
     oled_w_scl(0);
+    for(delay=0;delay<I2C_DLY_LOW;delay++);   /* 字节之间同样保证 tLOW */
     return ack;
 }
 
@@ -391,14 +412,24 @@ void OLED_FlushStep(void)
             oled_dirty &= (uint8_t)~mask;
             oled_flush_next = (uint8_t)((page + 1) % OLED_PAGE_NUM);
             oled_retry_wait = false;
+            oled_nack_streak = 0;   /* 总线恢复正常: 清零连续失败计数 */
         }
         else
         {
             /* ACK 缺失: 不提交快照、不清脏位; 给总线恢复/屏幕重连留时间. */
             oled_dirty |= mask;
             oled_flush_next = (uint8_t)((page + 1) % OLED_PAGE_NUM);
-            oled_retry_tick = now;
-            oled_retry_wait = true;
+            /* 只有**连续**失败才启用全局退避(见 OLED_NACK_BACKOFF_AFTER):
+             * 单次瞬时 NACK 若也退避 50ms, 整屏会跟着停摆 → "突然卡一下".
+             * 屏幕真的不在时, 前几次失败很快(地址字节即 NACK, 约几十 µs),
+             * 达到阈值后照样退避, 不会退化成每轮忙重试. */
+            if (oled_nack_streak < 0xFFu)
+                oled_nack_streak++;
+            if (oled_nack_streak >= OLED_NACK_BACKOFF_AFTER)
+            {
+                oled_retry_tick = now;
+                oled_retry_wait = true;
+            }
         }
         return;   /* 每轮最多推一页 */
     }
