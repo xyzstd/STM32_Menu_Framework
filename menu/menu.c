@@ -1,4 +1,4 @@
-#include "menu.h"
+﻿#include "menu.h"
 
 typedef struct{
     uint8_t current;
@@ -7,9 +7,12 @@ typedef struct{
 
 static menu_ctrl_t menu_ctrl;
 
-#if MENU_DEBUG_ASSERT
+/* 表校验: 只读、无副作用. **无条件编译** —— 是否占空间交给链接器按引用决定
+ * (OneElfS=1, 每函数独立段):
+ *   - Menu_Init 在 MENU_DEBUG_ASSERT 下用它做启动断言;
+ *   - 应用可经 Menu_IsValid() 在量产固件里主动查询表是否配错.
+ * 二者都不引用它时, 它会与 Menu_IsValid 一起被丢弃, 不占 Flash. */
 static bool menu_validate_table(void);
-#endif
 
 static const menu_item_t *menu_current_item(void);
 
@@ -27,11 +30,17 @@ static void menu_back(void);
 
 void Menu_Init(void)
 {
+	/* current 必须**无条件**初始化: 原先它被放在下面的 #if 里, 默认构建
+	 * (MENU_DEBUG_ASSERT=0) 会把该赋值整行编掉, 只剩"文件级 static 零初始化 +
+	 * MENU_NO_PARENT==0"碰巧成立 —— 与紧邻 state 的显式赋值也不对称. */
+	menu_ctrl.current = MENU_NO_PARENT;
 	menu_ctrl.state   = MENU_STATE_NORMAL;
 	
 #if MENU_DEBUG_ASSERT
-    menu_ctrl.current = MENU_NO_PARENT;
-    static bool menu_table_valid  = menu_validate_table();
+    /* 局部量**不可加 static**: C 要求 static 存储期对象用常量表达式初始化, 函数
+     * 调用会报 "error #59: function call is not allowed in a constant expression".
+     * Menu_Init 只调用一次, 普通局部量即可(原先加 static 使本开关无法编译). */
+    bool menu_table_valid = menu_validate_table();
     /* 表配错时这里是唯一"能看见"的时机: 正常路径会静默降级, 现象只有
      * "上电后按键完全无反应", 没有任何日志/提示.
      * 陷阱动作由 MENU_ASSERT_TRAP() 决定(默认纯自旋; 应用可重定义为"自旋+喂狗",
@@ -136,8 +145,8 @@ const menu_item_t *Menu_GetItem(uint8_t id)
 
 /* 启动期验证只读菜单表, 不调用页面回调、不依赖 UI。
  * 校验父->子与子->父双向一致、半开范围不越界、树无孤岛/环, 并检查可激活 ops 契约.
- * 返回 false 时 Menu_Init 留在虚拟根, 且拒绝所有事件/强制跳转(安全失败). */
-#if MENU_DEBUG_ASSERT
+ * 返回 false 时 Menu_Init 留在虚拟根, 且拒绝所有事件/强制跳转(安全失败).
+ * **无条件编译**: 是否占空间交给链接器按引用决定(见文件头部前置声明处说明). */
 static bool menu_validate_table(void)
 {
     const menu_item_t *item;
@@ -225,7 +234,15 @@ static bool menu_validate_table(void)
 
     return true;
 }
-#endif
+
+/* 菜单表是否通过校验(见 menu.h): 供应用在量产固件里主动查询, 把"按键完全无反应"
+ * 这一静默降级状态变成可观测的提示(与 MENU_DEBUG_ASSERT 互补: 那个给调试期).
+ * 与 menu_validate_table 一同"按需链接": 无人调用时两者都被链接器丢弃, 不占空间;
+ * 一旦调用即引入校验函数(实测 Release-HW 约 +328 B). */
+bool Menu_IsValid(void)
+{
+    return menu_validate_table();
+}
 
 
 static const menu_item_t *menu_current_item(void)
