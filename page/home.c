@@ -95,18 +95,7 @@ static menu_period_t home_display(void *user_data)
         OLED_ShowLargeNum(num_x, 16, meas_temp);
 
         /* 大字号 °C 紧随数字右侧 (页对齐 y=16, 不越出外框) */
-        {
-            uint8_t page, col;
-            for(page = 0; page < 4; page++)
-            {
-                for(col = 0; col < 16; col++)
-                {
-                    uint8_t data = OLED_Rev8(OLED_F16x32[10][page * 16 + col]);
-                    if(data)
-                        OLED_DisplayBuf[2 + page][(uint8_t)(num_x + span * 16) + col] |= data;
-                }
-            }
-        }
+        OLED_ShowLargeDegC((int16_t)(num_x + span * 16), 16);
     }
 
     /*========== 第3行 (y=48-63): 状态行 ==========*/

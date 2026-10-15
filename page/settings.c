@@ -236,11 +236,15 @@ static menu_period_t sleep_set_display(void *ud)
         }
     }
 
-    /* 聚焦框: 只框数值区, 单位留在框外(与原单参数页同一处理, 避免边框与单位粘连) */
+    /* 聚焦框: 框住**整行**(标签 + 数值 + 单位), 与 page/pid.c 的多参页同一规则
+     * (那边是 x=2 宽 80 框住 "Kp 11.00" 整行)。原先只框数值区(x=58 宽 36):
+     * 128px 屏上又小又贴右, 与 PID 页的整行框风格割裂, 且数值在框内右贴边
+     * (3 位数左空 10px、右空 2px), 看着不平衡。
+     * 单位留在框内右侧, 不再"数值在框里、单位在框外"地切开一行。 */
     if (slp.editing)
-        OLED_ReverseRoundRect(58, (int16_t)(8 + slp.focus * 16), 36, 16, 6);
+        OLED_ReverseRoundRect(2, (int16_t)(8 + slp.focus * 16), 124, 16, 6);
     else
-        OLED_DrawRoundRect(58, (int16_t)(8 + slp.focus * 16), 36, 16, 6, OLED_COLOR_SET);
+        OLED_DrawRoundRect(2, (int16_t)(8 + slp.focus * 16), 124, 16, 6, OLED_COLOR_SET);
 
     /* 冲突诊断行. 刻意用 ASCII 而非汉字: 汉字字库每字 32 B, 不为一句提示扩容
      * (见 build_tools/check_chars.py 的安全网约定). "Sleep too long" 的所有
@@ -427,8 +431,12 @@ static menu_result_t func_set_handler(const menu_cmd_t *cmd, void *ud)
     return func_set_edit(cmd);
 }
 
-/* 两行参数(y=8 / y=24) + 底部亮度条(y=46): 条长随亮度值同步变化.
- * 标签 x=4, 数值右对齐到 92, 聚焦框 x=58 宽 36(与 sleep_set 同一几何). */
+/* 两行参数垂直居中(y=16 / y=32): 两行共 32px, 上下各留 16px —— 与"休眠设置"
+ * 三行居中(8/24/40, 上下各 8px)同一构图规则, 两页进出时视觉重心一致。
+ * 标签 x=4, 数值右对齐到 124(本页无单位, 贴右边界使行内容与整行框等宽,
+ * 与"休眠设置"的"数值+单位"右端对齐到 123 视觉一致), 聚焦框 x=2 宽 124(整行)。
+ * 原实现的底部亮度指示条(y=46, 高 10)已移除: 亮度本身就是数值显示, 条既不精确
+ * (255 级映射到 112px)又占掉半屏, 还让两行参数被顶到上半屏。 */
 static menu_period_t func_set_display(void *ud)
 {
     uint8_t i;
@@ -438,30 +446,26 @@ static menu_period_t func_set_display(void *ud)
 
     for (i = 0; i < FUNC_FIELD_NUM; i++)
     {
-        int16_t y = (int16_t)(8 + i * 16);
+        int16_t y = (int16_t)(16 + i * 16);
 
         OLED_ShowString(4, y, fn_label[i], OLED_8X16);
 
         if (fn_toggle[i])
         {
-            set_show_right(92, y, fn.val[i] ? "ON" : "OFF");
+            set_show_right(124, y, fn.val[i] ? "ON" : "OFF");
         }
         else
         {
             uint8_t d = set_digits(fn.val[i]);
-            OLED_ShowNum((int16_t)(92 - d * 8), y, fn.val[i], d);
+            OLED_ShowNum((int16_t)(124 - d * 8), y, fn.val[i], d);
         }
     }
 
-    /* 亮度指示条 (算法与旧亮度页一致: 满宽 = OLED_WIDTH-16) */
-    if (fn.val[1] > 0)
-        OLED_FillRect(8, 46, (uint8_t)((uint32_t)(OLED_WIDTH - 16) * fn.val[1] / 255), 10,
-                      OLED_COLOR_SET);
-
+    /* 聚焦框: 框住整行, 与 sleep_set / pid 多参页同一几何 */
     if (fn.editing)
-        OLED_ReverseRoundRect(58, (int16_t)(8 + fn.focus * 16), 36, 16, 6);
+        OLED_ReverseRoundRect(2, (int16_t)(16 + fn.focus * 16), 124, 16, 6);
     else
-        OLED_DrawRoundRect(58, (int16_t)(8 + fn.focus * 16), 36, 16, 6, OLED_COLOR_SET);
+        OLED_DrawRoundRect(2, (int16_t)(16 + fn.focus * 16), 124, 16, 6, OLED_COLOR_SET);
 
     OLED_UpdateDiff();
     return 0;
@@ -573,22 +577,25 @@ static menu_result_t version_handler(const menu_cmd_t *cmd, void *ud)
     return MENU_RET_OK;         /* UP/DOWN: 只读页无内容可滚, 忽略留守 */
 }
 
+/* 只显示版本号, 8x16 居中(水平 (128-8*len)/2, 垂直 (64-16)/2 = 24)。
+ * 原先另有标题"智能烙铁"与"芯片:F103RC"/"屏幕:128x64" 三行 —— 芯片型号与分辨率是
+ * 固定硬件事实, 对使用者没有信息量; 去掉后整页只剩一个版本号, 一眼可读, 也免去
+ * 为这几行文案维护汉字字模。
+ * 版本串取自 FW_VERSION_STR 单点定义: 发布时只改宏, 不必再翻渲染代码。
+ * 直接输出 ASCII, 不再经 oled_pair_cat 拼"固件版本:"前缀(该函数仍供 handle/ota_wait 用)。 */
 static menu_period_t version_display(void *ud)
 {
-    char ver[24];
+    const char *v = FW_VERSION_STR;
+    uint8_t len = 0;
     (void)ud;
+
     OLED_Clear();
 
-    /* 4 行 16px 高铺满屏无重叠: y0/16/32/48
-     * 标题 4 汉字 64px 居中; 信息行 ASCII 与汉字混合 (OLED_ShowChinese) */
-    OLED_ShowChinese(32, 0, "智能烙铁");
-    /* 版本号取自 FW_VERSION_STR 单点定义: 发布时只改宏, 不必再翻渲染代码.
-     * 拼接用 oled_pair_cat 而非 snprintf: 避免为 2 处文案把 stdio 格式化
-     * 机制整个拉进链接(实测约 2.3KB, 含随 printfa 一并引入的浮点支持). */
-    oled_pair_cat(ver, sizeof(ver), "固件版本:", FW_VERSION_STR);
-    OLED_ShowChinese(8, 16, ver);
-    OLED_ShowChinese(8, 32, "芯片:F103RC");
-    OLED_ShowChinese(8, 48, "屏幕:128x64");
+    while (v[len]) len++;
+
+    OLED_ShowString((int16_t)(((int16_t)OLED_WIDTH - (int16_t)len * 8) / 2),
+                    (int16_t)(((int16_t)OLED_HEIGHT - 16) / 2),
+                    v, OLED_8X16);
 
     OLED_UpdateDiff();
     return 0;

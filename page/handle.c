@@ -231,13 +231,21 @@ static menu_period_t handle_display(void *ud)
     }
 
     /* ---- 单个型号视图: 显示当前选中, 切换预览 ---- */
-    OLED_ShowChinese(8, 0, "手柄");   /* 标题 y0, 与其它页统一 */
+    OLED_ShowChinese(32, 0, "手柄型号");   /* 标题居中, 与其它页统一 */
 
-    /* 当前型号大号反显框 (宽 40 容纳 "T245", 整行居中 x44..83):
-     * 文字 8x16 在 18px 高框内上下各留 1px; 标题(0..15)/型号框(27..44)/
-     * 提示(56)三行间距均衡 */
-    OLED_ShowString(48, 28, Config_GetHandleNameByIdx(cur_idx), OLED_8X16);
-    OLED_ReverseRoundRect(44, 27, 40, 18, 6);
+    /* 型号反显框: 定宽 48x20 居中, 名字在框内居中 —— 定宽使 T12/T245/T210 之间
+     * 切换时框不变大小(原实现按名字长度取宽, 切到 T12 会缩一圈, 看着在"抖");
+     * 反显即"当前选中"语义, 与菜单列表的选中行同款。文字 8x16 在 20px 高框内
+     * 上下各留 2px。 */
+    {
+        const char *name = Config_GetHandleNameByIdx(cur_idx);
+        uint8_t len = 0;
+
+        while (name[len]) len++;
+
+        OLED_ShowString((int16_t)(40 + (48 - (int16_t)len * 8) / 2), 24, name, OLED_8X16);
+        OLED_ReverseRoundRect(40, 22, 48, 20, 6);
+    }
 
     /* 底部操作提示 (6x8, 统一"键名: 动作"形式, 两行各居中):
      * CLK: Switch = 型号已改动时按键弹确认页切换; HLD: Exit = 未改动时长按退出 */

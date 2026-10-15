@@ -47,21 +47,23 @@ static menu_period_t ota_wait_display(void *user_data)
 
 #if !OTA_APP_SIDE_ENABLED
     OLED_Clear();
-    /* 文案只用字库现有汉字(升/级/已/关), 不为一句提示扩字库 —— 每个汉字 32B,
-     * 扩 3 个字就多占近百字节 flash, 与"把固件收进 32KB"的目标背道而驰.
-     * 需要更贴切的措辞(如"升级功能未启用")时应先跑 build_tools/check_chars.py
-     * 确认字库是否覆盖, 缺字则按 gen_fonts.py 补字形并接受体积代价. */
-    OLED_ShowChinese(40, 20, "升级已关");   /* 4 汉字 64px, 居中 x=(128-64)/2=32→用 40 视觉更稳 */
-    OLED_ShowChinese(32, 56, "长按退出");
+    /* OTA 模块已关闭: 整页只居中显示一行"未启用"。
+     * 原实现是"升级已关"(y=20) + "长按退出"(y=56) 两行 —— 后者把 16x16 汉字放在
+     * y=56, 底部 8 行超出 64px 屏被静默裁掉(只剩上半截), 本就是坏的; 去掉后既解决
+     * 裁切, 又让页面只剩一句结论。
+     * 退出手势不必提示: 长按返回是全局一致的操作(本页 handler 亦只认 LPRESS)。
+     * 字库已按需补"未/用"(见 bsp/oled_data.c), 措辞不必再迁就已有字形。 */
+    OLED_ShowChinese((int16_t)(((int16_t)OLED_WIDTH - 3 * 16) / 2),   /* 3 汉字 48px 居中 */
+                     (int16_t)(((int16_t)OLED_HEIGHT - 16) / 2),      /* 16px 行高垂直居中 */
+                     "未启用");
     OLED_UpdateDiff();
     return REFRESH_PERIOD_MS;
 #else
-    /* 标志页写入失败: 只提示错误 + 退出方式, 不再显示"等待主机"以免误导 */
+    /* 标志页写入失败: 只提示错误, 不再显示"等待主机"以免误导 */
     if (boot_failed)
     {
         OLED_Clear();
         OLED_ShowChinese(32, 20, "升级失败");   /* 4 汉字 64px, 居中 x=32 */
-        OLED_ShowChinese(32, 56, "长按退出");
         OLED_UpdateDiff();
         return REFRESH_PERIOD_MS;
     }
@@ -91,12 +93,10 @@ static menu_period_t ota_wait_display(void *user_data)
     /* status text */
     OLED_ShowChinese(32, 20, "等待主机");
 
-    /* animated dots: "连接" 32px + 3 点 24px = 56px, 居中 x=36 */
+    /* 状态行与动画点, 不再加"长按退出"提示: 长按返回是全局一致的操作,
+     * 每个页面都重复一遍既占版面也不好看。 */
     oled_pair_cat(buf, sizeof(buf), "连接", d);
     OLED_ShowChinese(36, 38, buf);
-
-    /* 底部提示: 本页 CLICK/UP/DOWN 均不退出(要等待握手), 必须让用户知道怎么离开 */
-    OLED_ShowChinese(32, 56, "长按退出");   /* 4 汉字 64px, 居中 x=32 */
 
     OLED_UpdateDiff();
     return REFRESH_PERIOD_MS;

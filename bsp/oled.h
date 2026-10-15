@@ -160,6 +160,11 @@ void OLED_ShowLargeChar(int16_t x,int16_t y,char ch);
 
 void OLED_ShowLargeNum(int16_t x,int16_t y,int32_t num);
 
+/* 大字号 "°C" (16x32), 紧随 OLED_ShowLargeNum 绘出的数字右侧 (同一 y)。
+ * 字形取自 OLED_F16x32 表的第 10 项; 原由 page/home.c 直接写 OLED_DisplayBuf
+ * 绘制(绕过本层封装), 现收进本层, 供 HOME 与"温度设置"页共用。 */
+void OLED_ShowLargeDegC(int16_t x,int16_t y);
+
 
 /*================ 进度条 =================*/
 

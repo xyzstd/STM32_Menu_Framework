@@ -1144,6 +1144,31 @@ void OLED_ShowLargeNum(int16_t x,int16_t y,int32_t num)
     }
 }
 
+/* 大字号 °C (16x32): 字形是 OLED_F16x32 表的第 10 项。
+ * 收进本层的理由: "°C" 用哪一号字形是本层字模表的约定, 让页面层自己去数索引并
+ * 直接写 OLED_DisplayBuf, 既破坏封装又容易写错; HOME 与温度设置页都要画它。
+ * 32 行高须按页对齐, 否则跨页拼接会错位 —— 不满足直接不画(调用点只传 y=16)。 */
+void OLED_ShowLargeDegC(int16_t x,int16_t y)
+{
+    uint8_t page;
+    uint8_t col;
+
+    if(y < 0 || (y & 0x07) != 0 || y + 32 > OLED_HEIGHT)
+        return;
+
+    for(page = 0; page < 4; page++)
+    {
+        for(col = 0; col < 16; col++)
+        {
+            uint8_t data = OLED_Rev8(OLED_F16x32[10][page * 16 + col]);
+            int16_t px   = (int16_t)(x + col);
+
+            if(data && px >= 0 && px < OLED_WIDTH)
+                OLED_DisplayBuf[(uint8_t)((y >> 3) + page)][px] |= data;
+        }
+    }
+}
+
 
 
 /*================ 中文 =================*/

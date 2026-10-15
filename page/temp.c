@@ -75,18 +75,31 @@ static void temp_exit(void *ud)
         Buzzer_Beep(BUZZER_EVENT_ALARM);
 }
 
+/* 单参数页: 顶部中文标题 + 一行带框的目标温度。
+ * 数值按实际位数显示(不补前导零), 与单位整组在行内居中; 行框 (2,24,124,16) 与
+ * 多参页的"整行框"同一几何, 风格一致。
+ * 原实现是 "Set:" + 三位定长数值 + 只框数值的小圆角框: 三位定长会把 100 以下补成
+ * 前导零(显示成 "030"), 小框也与多参页的整行框割裂。 */
 static menu_period_t temp_display(void *ud)
 {
+    uint8_t d;
+    int16_t w;
+    int16_t x;
+
     (void)ud;
     OLED_Clear();
 
-    OLED_ShowString(16, 20, "Set:", OLED_8X16);
-    OLED_ShowNum(56, 20, temp.val, 3);
-    OLED_ShowDegree(88, 20);            /* °C 移到选中框右侧外, 避免与边框粘连 */
-    OLED_ShowChar(96, 20, 'C', OLED_8X16);
+    OLED_ShowChinese(32, 0, "温度设置");   /* 4 汉字 64px, 居中 */
 
-    /* 单参数: 常驻实线框标识可调区 (x54..81, 数值 x56..79 两侧各 2px; 上下各 1px) */
-    OLED_DrawRoundRect(54, 19, 28, 18, 6, OLED_COLOR_SET);
+    d = (temp.val >= 100) ? 3 : (temp.val >= 10) ? 2 : 1;
+    w = (int16_t)(d * 8 + 8 + 16);          /* 数字 + 间隔 8px + °C(度号 8px + 'C' 8px) */
+    x = (int16_t)(((int16_t)OLED_WIDTH - w) / 2);
+
+    OLED_ShowNum(x, 24, temp.val, d);
+    OLED_ShowDegree((int16_t)(x + d * 8 + 8), 24);
+    OLED_ShowChar((int16_t)(x + d * 8 + 16), 24, 'C', OLED_8X16);
+
+    OLED_DrawRoundRect(2, 24, 124, 16, 6, OLED_COLOR_SET);
 
     OLED_UpdateDiff();
     return 0;
