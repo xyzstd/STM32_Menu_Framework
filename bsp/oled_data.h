@@ -22,8 +22,13 @@ typedef struct
 } ChineseCell_t;
 
 /* ASCII font declarations */
-extern const uint8_t OLED_F8x16[][16];
-extern const uint8_t OLED_F6x8[][6];
+/* 8x16 / 6x8 为紧凑表(每行 = 1 字符 + 字形字节), 按字符线性查找, 不用 ch-' ' 索引;
+ * 只编入运行期可达字符(G8 宏开关, 见 oled_data.c 裁剪说明);
+ * 行数随开关变化, 由 oled_data.c 定义处 sizeof 导出(用法同 OLED_CF16x16_COUNT) */
+extern const uint8_t OLED_F8x16[][17];
+extern const uint8_t OLED_F6x8[][7];
+extern const uint8_t OLED_F8x16_COUNT;
+extern const uint8_t OLED_F6x8_COUNT;
 extern const uint8_t OLED_F16x32[][64];
 
 /* Chinese font declarations */

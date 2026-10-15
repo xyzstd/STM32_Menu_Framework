@@ -1,17 +1,16 @@
 ﻿#include "menu.h"
 #include "oled.h"
-#include "menu_display.h"
 #include "calibrate.h"
 #include "config.h"
 #include "work_task.h"
 #include "pid_controller.h"
 
-/* 多点温度校准: 100/200/300/350/400/450°C 六个温度点各设一个偏移量
- * 实际温度 = 六点插值基准温度 + 按温度区间插值的偏移
+/* 多点温度校准: 200/300/350/400/450°C 五个温度点各设一个偏移量
+ * 实际温度 = 五点插值基准温度 + 按温度区间插值的偏移
  * 偏移量范围: -50 ~ +50 °C
  *
  * 使用流程:
- *   1. 进入本页后, 先用 UP/DOWN 导航切换聚焦点 (100/200/300/350/400/450), 此时不改变目标温度
+ *   1. 进入本页后, 先用 UP/DOWN 导航切换聚焦点 (200/300/350/400/450), 此时不改变目标温度
  *   2. CLICK 选中当前聚焦点后, 才将其设为目标温度, 烙铁加热至该校准点
  *   3. 调参态 UP/DOWN 调整该点偏移; CLICK 或 LPRESS 返回导航态 (不退出页面)
  *   4. 等温度稳定后, 用万用表测烙铁头实际温度, 将"实测 - 设定"的差值直接填入偏移
@@ -31,15 +30,15 @@
 #define CAL_LIVE_REFRESH_MS  200
 
 /* 各校准点的目标温度 (°C) */
-static const int16_t cal_points[CAL_POINT_NUM] = {100, 200, 300, 350, 400, 450};
+static const int16_t cal_points[CAL_POINT_NUM] = {200, 300, 350, 400, 450};
 
 static int16_t off[CAL_POINT_NUM]; /* 各温度点偏移量 */
 static int16_t prev_setpoint;      /* 进入本页前的目标温度, 退出时恢复 */
-static uint8_t focus = 0;          /* 当前聚焦的温度点 0..5 */
+static uint8_t focus = 0;          /* 当前聚焦的温度点 0..4 */
 static bool sel = false;           /* false=导航态, true=调参态 */
 static bool dirty = false;         /* 参数是否被修改 */
 
-static const char *cal_names[CAL_POINT_NUM] = {"100:", "200:", "300:", "350:", "400:", "450:"};
+static const char *const cal_names[CAL_POINT_NUM] = {"200:", "300:", "350:", "400:", "450:"};
 
 static void cal_draw_row(uint8_t y, uint8_t idx);
 static void cal_draw_live(uint8_t y);
@@ -148,8 +147,8 @@ static menu_result_t calibrate_handler(const menu_cmd_t *cmd, void *user_data)
 static menu_period_t calibrate_display(void *user_data)
 {
     (void)user_data;
-    /* 紧凑布局: 6 行偏移 (6x8, y0 起每行 8px) + 底部实时温度 (8x16, y48) */
-    const uint8_t row_y[CAL_POINT_NUM] = {0, 8, 16, 24, 32, 40};
+    /* 紧凑布局: 5 行偏移 (6x8, y0 起每行 8px) + 底部实时温度 (8x16, y48) */
+    const uint8_t row_y[CAL_POINT_NUM] = {0, 8, 16, 24, 32};
     uint8_t i;
 
     OLED_Clear();

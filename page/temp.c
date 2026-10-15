@@ -1,6 +1,5 @@
 ﻿#include "menu.h"
 #include "oled.h"
-#include "menu_display.h"
 #include "temp.h"
 #include "config.h"
 #include "pid_controller.h"
@@ -16,11 +15,13 @@
  * 页内独立整页显示当前值; CLICK/LPRESS 由 param_handler 返回 DONE → 内核走
  * menu_exit_handler → exit 落盘并回列表。
  *
- * 因上限随当前型号(Config_GetTempMax)动态变化, param_t 的 max
- * 无法静态初始化, 故使用静态实例, 在 enter 时解析当前型号上限.
+ * 因上限随当前型号(Config_GetTempMax)动态变化, param_cfg_t 的 max
+ * 无法静态初始化, 故用非 const 的静态实例(落 .bss, 零初始化, 无 Flash 代价),
+ * 在 enter 时解析当前型号上限.
  */
 
-static param_t temp;
+static param_cfg_t temp_cfg;
+static param_t temp = { .cfg = &temp_cfg };
 
 static void temp_load(param_t *it);
 static void temp_store(param_t *it);
@@ -47,12 +48,12 @@ static void temp_store(param_t *it)
 
 static void temp_setup(void)
 {
-    temp.min      = (int16_t)TEMP_MIN;
-    temp.max      = (int16_t)Config_GetTempMax();
-    temp.step     = 5;
-    temp.toggle   = 0;
-    temp.load     = temp_load;
-    temp.store    = temp_store;
+    temp_cfg.min      = (int16_t)TEMP_MIN;
+    temp_cfg.max      = (int16_t)Config_GetTempMax();
+    temp_cfg.step     = 5;
+    temp_cfg.toggle   = 0;
+    temp_cfg.load     = temp_load;
+    temp_cfg.store    = temp_store;
 }
 
 static void temp_enter(void *ud)

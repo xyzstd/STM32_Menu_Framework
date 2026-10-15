@@ -1,6 +1,5 @@
 ﻿#include "menu.h"
 #include "oled.h"
-#include "menu_display.h"
 #include "autotune.h"
 #include "config.h"
 #include "work_task.h"
@@ -92,14 +91,18 @@ static menu_period_t tune_display(void *ud)
         OLED_ShowChinese(8, 48, "无法整定");   /* 入口校验被拒 */
     else if (over)
     {
-        /* 成败取自控制器的留存结论, 不再用 prog 阈值猜:
-         * work_task 在整定结束后会立刻 PID_TuneAbort(), 该调用把 finished/success
-         * 清掉, 故此处只能看 PID_TuneLastSucceeded(). 旧实现拿 prog>=8 当成功判据,
-         * 把"提前中止只跑到一半"误判成"失败"(中止并不等于整定失败, 只是用户退出). */
+        /* 算法整定成功与 Flash 保存成功分开判定, 防止保存失败仍显示"完成保存". */
         if (PID_TuneLastSucceeded())
-            OLED_ShowChinese(8, 48, "完成保存");
+        {
+            if (WorkTask_TuneSaveSucceeded())
+                OLED_ShowChinese(8, 48, "完成保存");
+            else
+                OLED_ShowChinese(8, 48, "保存失败");
+        }
         else
+        {
             OLED_ShowChinese(8, 48, "失败");
+        }
     }
     else
     {

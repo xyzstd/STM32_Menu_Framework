@@ -307,6 +307,7 @@ static struct {
     uint32_t     last_pid_tick;
     int16_t      measured_temp;
     int16_t      power;
+    bool         tune_save_succeeded; /* 最近一次算法成功整定是否已持久化 */
     bool         temp_reached;
     bool         temp_reached_prev;
     uint8_t      reached_cnt;        /* 到达判定去抖: 连续满足阈值的周期数 */
@@ -405,21 +406,22 @@ static int32_t spline_interp(const int32_t *x, const int32_t *y, uint8_t n, int3
     return yy;
 }
 
-/* 温度校准偏移: 100/200/300/350/400/450°C 六点偏移, 用单调三次样条平滑插值
- * 6 温度点细分常用焊接带 (300~350), 曲线平滑连续; 超范围时取端点偏移. */
+/* 温度校准偏移: 200/300/350/400/450°C 五点偏移, 用单调三次样条平滑插值
+ * 5 温度点细分常用焊接带 (300~350), 曲线平滑连续; 超范围时取端点偏移. */
 static int16_t cal_offset_interp(int16_t temp_base)
 {
     uint8_t h = Config_GetHandleIdx();
-    int32_t xs[6] = {100, 200, 300, 350, 400, 450};
-    int32_t ys[6] = {
+    /* xs 是常量: 用 static const 放 Flash(RO), 免去每次调用把它拷到栈(20 B).
+     * ys 依赖运行时校准值, 必须留在栈上. */
+    static const int32_t xs[5] = {200, 300, 350, 400, 450};
+    int32_t ys[5] = {
         Cal_GetOff(0, h),
         Cal_GetOff(1, h),
         Cal_GetOff(2, h),
         Cal_GetOff(3, h),
         Cal_GetOff(4, h),
-        Cal_GetOff(5, h),
     };
-    return (int16_t)spline_interp(xs, ys, 6, temp_base);
+    return (int16_t)spline_interp(xs, ys, 5, temp_base);
 }
 
 /* 使用校准点进行温度转换 (线性插值 + 多点偏移), 校准点按当前型号索引 */
@@ -436,33 +438,35 @@ static int16_t adc_to_temp(uint16_t adc_val)
     }
 
     /* 使用多项校准点进行温度转换:
-     * 校准点之间用单调三次样条平滑插值, 低于 100°C 用原点线性, 高于 450°C 用末段斜率外推 */
+     * 校准点之间用单调三次样条平滑插值, 低于 200°C 用原点线性, 高于 450°C 用末段斜率外推 */
     if (adc <= Cal_GetAdc(0, h))
     {
-        /* 低于 100°C */
-        temp = 100 * adc / Cal_GetAdc(0, h);
+        /* 低于 200°C(最低校准点): 原点线性外推 */
+        temp = 200 * adc / Cal_GetAdc(0, h);
     }
-    else if (adc <= Cal_GetAdc(5, h))
+    else if (adc <= Cal_GetAdc(4, h))
     {
-        /* 100°C~450°C: 校准点区间单调三次样条平滑插值, 消除分段线性拐角,
-         * 6 温度点 (100/200/300/350/400/450) 细分常用焊接带 */
-        int32_t xs[6] = {
+        /* 200°C~450°C: 校准点区间单调三次样条平滑插值, 消除分段线性拐角,
+         * 5 温度点 (200/300/350/400/450) 细分常用焊接带 */
+        int32_t xs[5] = {
             Cal_GetAdc(0, h),
             Cal_GetAdc(1, h),
             Cal_GetAdc(2, h),
             Cal_GetAdc(3, h),
             Cal_GetAdc(4, h),
-            Cal_GetAdc(5, h),
         };
-        int32_t ys[6] = {100, 200, 300, 350, 400, 450};
-        temp = spline_interp(xs, ys, 6, (int32_t)adc);
+        /* ys 是常量: 用 static const 放 Flash(RO), 免去每次调用拷到栈(20 B).
+         * 本函数会调用 cal_offset_interp, 两者栈帧嵌套 —— 两处常量化后峰值栈共省 40 B.
+         * xs 依赖运行时校准值, 必须留在栈上. */
+        static const int32_t ys[5] = {200, 300, 350, 400, 450};
+        temp = spline_interp(xs, ys, 5, (int32_t)adc);
     }
     else
     {
         /* 高于 450°C: 沿用 400~450 段斜率外推 */
-        int32_t span = (int32_t)Cal_GetAdc(5, h) - Cal_GetAdc(4, h);
+        int32_t span = (int32_t)Cal_GetAdc(4, h) - Cal_GetAdc(3, h);
         if (span <= 0) span = 1;
-        temp = 450 + (int32_t)(adc - Cal_GetAdc(5, h)) * 50 / span;
+        temp = 450 + (int32_t)(adc - Cal_GetAdc(4, h)) * 50 / span;
     }
 
     /* 叠加按温度区间插值的校准偏移 */
@@ -904,20 +908,42 @@ static void run_pid_cycle(void)
                 PID_Gain_t tg;
                 uint8_t h = Config_GetHandleIdx();
                 PID_TuneGetResult(&tg);
+                /* 钳位到页面可显示/可编辑上限(与 page/pid.c 同源): 整定短暂可产出
+                 * Kd 达 3×10^4(经 tune_gain_sat 饱和到 32767), 原样存入会让用户
+                 * 一进 PID 页就被页面上限静默钳掉, 且 2 位整数显示截断高位. */
+                if (tg.kp > PID_KP_MAX) tg.kp = PID_KP_MAX;
+                if (tg.ki > PID_KI_MAX) tg.ki = PID_KI_MAX;
+                if (tg.kd > PID_KD_MAX) tg.kd = PID_KD_MAX;
+                int16_t old_kp = g_config.pid_cons_kp[h];
+                int16_t old_ki = g_config.pid_cons_ki[h];
+                int16_t old_kd = g_config.pid_cons_kd[h];
+                bool saved;
+
                 g_config.pid_cons_kp[h] = tg.kp;   /* 写入当前型号保守组 */
                 g_config.pid_cons_ki[h] = tg.ki;
                 g_config.pid_cons_kd[h] = tg.kd;
-                /* 落盘失败时告警而非静默: 用户看到"完成保存"却重启即丢参数 */
-                if (Config_Save())
-                    Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
-                else
-                    Buzzer_Beep(BUZZER_EVENT_ALARM);
+                saved = Config_Save();
+                work.tune_save_succeeded = saved;
 
-                /* 整定结果必须即刻装载: 上面只更新了 g_config 内存副本并落盘, 而运行时
-                 * pid.cons_* 是 PID_Controller_Reload 时拷进来的副本 —— 不重载则本次
-                 * 会话仍按旧系数控温(要重启或切一次手柄型号才生效), 用户会认为整定无效.
-                 * Reload 内含 Reset: 顺带复位 d_first/last_measured, 消除整定期间
-                 * Compute 未运行、last_measured 停留在整定前所导致的首帧陈旧微分尖峰. */
+                if (!saved)
+                {
+                    /* 保存失败时运行参数、RAM 配置均回滚到整定前快照.
+                     * Config_Save 先擦页再写; 若失败发生在擦除之后, 旧 Flash 内容可能已
+                     * 不完整, 故恢复旧值后尽力再写一次. 若 Flash 持续故障, 持久化状态仍
+                     * 无法保证, 但本次运行绝不启用未保存的新增益, 且 UI 明确报告失败. */
+                    g_config.pid_cons_kp[h] = old_kp;
+                    g_config.pid_cons_ki[h] = old_ki;
+                    g_config.pid_cons_kd[h] = old_kd;
+                    (void)Config_Save();
+                    Buzzer_Beep(BUZZER_EVENT_ALARM);
+                }
+                else
+                {
+                    Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
+                }
+
+                /* 仅成功落盘的新参数可用于本次运行; 失败则从已回滚的旧配置重载.
+                 * Reload 内含 Reset, 也清除整定期间遗留的微分历史, 避免首帧尖峰. */
                 PID_Controller_Reload();
             }
             else
@@ -930,16 +956,10 @@ static void run_pid_cycle(void)
         return;
     }
 
-    /* 5. 执行分段 PID 计算 */
-    power = PID_Controller_Compute();
-
-    /* 5.5 开环前馈预置: 温差大时按查表直接给大占空比, 加速冷启动/大焊点回温.
-     * PID 只负责接近设定后的稳态微调; 温差≤0 时前馈归零, 完全不干扰稳态.
-     * 取 max 而非线性叠加, 升温段前馈接管, 避免 PID 积分从零缓慢爬升.
-     * setpoint 取 PID_Controller_GetSetpoint()(已在 SetSetpoint 中按型号 temp_max 钳位).
-     * 查表改为**段内线性插值**(断点 (0,0)(10,180)(25,350)(50,600)(100,900)) —— 原实现
-     * 是硬阶跃, diff 跨过 10°C 时 ff 从 180 直接归零, 输出瞬间最多掉 18% 占空比,
-     * 温度会下陷再靠 PID 爬回, 在接近设定点处易形成小振荡. 表值 0~1000 尺度. */
+    /* 5. 前馈与 PID 协同: 前馈查表连续增加冷启动/大焊点功率, 并把实际前馈下限
+     * 传入 PID, 让积分器在前馈主导时冻结正向累积. 高误差下仍计算激进 PID,
+     * 不再在 50°C 处从约 600 直接切到 900; 前馈曲线在 50°C 为 600、100°C 为 900.
+     * 参数组也在 25~35°C 误差范围渐变, 避免旧 30°C 边界的增益跳变. */
     {
         static const int16_t ff_d[5] = { 0, 10, 25, 50, 100 };
         static const int16_t ff_v[5] = { 0, 180, 350, 600, 900 };
@@ -954,12 +974,13 @@ static void run_pid_cycle(void)
             uint8_t k;
             for (k = 0; k < 4; k++)
                 if (diff < ff_d[k + 1])
-                    break;   /* 落在 (ff_d[k], ff_d[k+1]) 段 */
+                    break;
             ff = (int16_t)(ff_v[k] +
                  (int32_t)(ff_v[k + 1] - ff_v[k]) * (diff - ff_d[k]) /
                  (ff_d[k + 1] - ff_d[k]));
         }
 
+        power = PID_Controller_Compute(ff);
         if (power < ff)
             power = ff;
     }
@@ -1018,6 +1039,7 @@ void WorkTask_Init(void)
     work.last_pid_tick = Timer_GetTick();
     work.measured_temp = ROOM_TEMP;
     work.power = 0;
+    work.tune_save_succeeded = false;
     work.temp_reached = false;
     work.temp_reached_prev = false;
     work.reached_cnt = 0;
@@ -1289,6 +1311,11 @@ int16_t WorkTask_GetMeasuredTemp(void)
 int16_t WorkTask_GetPower(void)
 {
     return work.power;
+}
+
+bool WorkTask_TuneSaveSucceeded(void)
+{
+    return work.tune_save_succeeded;
 }
 
 uint8_t WorkTask_GetPowerPercent(void)

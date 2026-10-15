@@ -1,4 +1,4 @@
-# 烙铁控制器 — 架构一页纸
+﻿# 烙铁控制器 — 架构一页纸
 
 > 单循环裸机（无 RTOS），STM32F103 系列，Keil ARMCC 工程（`Project.uvprojx`）。
 

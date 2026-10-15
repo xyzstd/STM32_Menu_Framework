@@ -29,8 +29,8 @@
  *       重载 PID、目标重新钳位到新型号上限.
  */
 
-#define HANDLE_LABEL_NUM  3
-static const char *handle_labels[HANDLE_LABEL_NUM] = {"T12", "T245", "T210"};
+/* 型号显示名不在此另存一份: 统一用 Config_GetHandleNameByIdx()(见 bsp/config.h),
+ * 型号个数即 HANDLE_NUM(见 bsp/config.h). */
 
 /* 链检进行中的轮询周期 (ms): 非阻塞链检需页面周期驱动取结论 */
 #define HANDLE_CHK_PERIOD  50
@@ -154,10 +154,10 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
     switch(cmd->event)
     {
         case MENU_EVENT_UP:
-            cur_idx = (cur_idx + 1 >= HANDLE_LABEL_NUM) ? 0 : (uint8_t)(cur_idx + 1);
+            cur_idx = (cur_idx + 1 >= HANDLE_NUM) ? 0 : (uint8_t)(cur_idx + 1);
             break;
         case MENU_EVENT_DOWN:
-            cur_idx = (cur_idx == 0) ? (uint8_t)(HANDLE_LABEL_NUM - 1) : (uint8_t)(cur_idx - 1);
+            cur_idx = (cur_idx == 0) ? (uint8_t)(HANDLE_NUM - 1) : (uint8_t)(cur_idx - 1);
             break;
         case MENU_EVENT_CLICK:
         case MENU_EVENT_LPRESS:
@@ -223,7 +223,7 @@ static menu_period_t handle_display(void *ud)
          * 文案为 "切换到" + 型号 + "?", 分两步拼接(本页只有这一处, 不值得引入变参拼接).
          * confirm_display 仍负责水平居中, 故这里只传拼好的标题字符串 */
         char title[20];
-        oled_pair_cat(title, sizeof(title), "切换到", handle_labels[cur_idx]);
+        oled_pair_cat(title, sizeof(title), "切换到", Config_GetHandleNameByIdx(cur_idx));
         oled_pair_cat(title, sizeof(title), title, "?");
         confirm_display(&cf, title);
         OLED_UpdateDiff();
@@ -236,7 +236,7 @@ static menu_period_t handle_display(void *ud)
     /* 当前型号大号反显框 (宽 40 容纳 "T245", 整行居中 x44..83):
      * 文字 8x16 在 18px 高框内上下各留 1px; 标题(0..15)/型号框(27..44)/
      * 提示(56)三行间距均衡 */
-    OLED_ShowString(48, 28, handle_labels[cur_idx], OLED_8X16);
+    OLED_ShowString(48, 28, Config_GetHandleNameByIdx(cur_idx), OLED_8X16);
     OLED_ReverseRoundRect(44, 27, 40, 18, 6);
 
     /* 底部操作提示 (6x8, 统一"键名: 动作"形式, 两行各居中):

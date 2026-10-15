@@ -53,8 +53,12 @@ int main(void)
     Watchdog_Init();    /* 先启动 IWDG, 之后主循环周期性喂狗; 跑飞/死锁时超时复位防无限加热 */
     Serial_Init();
     /* 把 OTA 请求序列识别挂到串口接收上: 由应用层注册, 而不是让 bsp/serial.c
-     * 反过来 include ota_boot.h —— 后者会让 bsp/ 依赖 ota/. */
+     * 反过来 include ota_boot.h —— 后者会让 bsp/ 依赖 ota/.
+     * OTA 模块关闭时(见 ota_boot.h 的 OTA_APP_SIDE_ENABLED)取消注册,
+     * 串口接收保持默认行为, 不带任何 OTA 状态机. */
+#if OTA_APP_SIDE_ENABLED
     Serial_SetRxCallback(OTA_SerialFeedRx);
+#endif
     Timer_Init();
     AD_Init();
     Buzzer_Init();

@@ -1,5 +1,12 @@
 ﻿#include "ota_boot.h"
 #include "ota_config.h"
+
+/* 本文件整体受 OTA_APP_SIDE_ENABLED 控制(见 ota_boot.h 说明):
+ * 关闭时编译为空单元 —— 内容仍保留, 改开关 + 恢复编译即可原样复活.
+ * 注意: 本文件已从 Keil 工程排除编译, 所以当前连空单元都不会产出;
+ * 下面的 #if 是为"重新纳入工程但忘了改开关"这种情况兜底, 避免半开状态. */
+#if OTA_APP_SIDE_ENABLED
+
 #include "stm32f10x.h"
 
 /* OTA 进入过程的上位机串口日志开关.
@@ -74,3 +81,5 @@ void OTA_EnterBootloader(void)
     /* 标志页已确认写入(非易失, 任意复位不丢) → 复位进 Bootloader, 不返回 */
     NVIC_SystemReset();
 }
+
+#endif /* OTA_APP_SIDE_ENABLED */

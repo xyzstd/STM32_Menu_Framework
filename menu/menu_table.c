@@ -15,13 +15,15 @@
  * ID  0 = 虚拟根  (占位容器, MENU_NO_PARENT; 唯一子项即 HOME: first_child=1, child_num=1)
  * ID  1 = HOME    (常驻页, parent=0; 顶层列表: first_child=2, child_num=6)
  * ID  2 = 温度设置
- * ID  3 = PID参数 (子菜单容器, first_child=15, child_num=4)
+ * ID  3 = PID参数 (子菜单容器, first_child=12, child_num=4)
  * ID  4 = 温度校准
  * ID  5 = 手柄型号
  * ID  6 = 固件升级
- * ID  7 = 系统设置 (子菜单容器, first_child=8, child_num=7)
- * ID  8-14 = 系统设置子菜单
- * ID 15-18 = PID子菜单
+ * ID  7 = 系统设置 (子菜单容器, first_child=8, child_num=4)
+ * ID  8 = 休眠设置 (多参页: 休眠时间/休眠温度/自动关机 合并在同一页)
+ * ID  9 = 功能设置 (多参页: 蜂鸣器/屏幕亮度 合并在同一页)
+ * ID 10-11 = 系统设置其余子项
+ * ID 12-15 = PID子菜单
  *
  * 编码: 本文件为 UTF-8, 中文名与 bsp/oled_data.c 字库 Index(UTF-8) 逐字节匹配.
  */
@@ -54,7 +56,7 @@ const menu_item_t menu_table[] =
 
     [3]={
         .parent      = 1,
-        .first_child = 15,
+        .first_child = 12,
         .child_num   = 4,
         .ops         = NULL,
         .name        = "PID参数",
@@ -91,7 +93,7 @@ const menu_item_t menu_table[] =
     [7]={
         .parent      = 1,
         .first_child = 8,
-        .child_num   = 7,
+        .child_num   = 4,
         .ops         = NULL,
         .name        = "系统设置",
     },
@@ -102,43 +104,26 @@ const menu_item_t menu_table[] =
         .parent      = 7,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
-        .ops         = &sleep_time_ops,
-        .name        = "休眠时间",
+        /* 三参一页(休眠时间/休眠温度/自动关机): 三者存在隐藏耦合(关机时间必须
+         * 晚于休眠时间, 否则休眠永不触发), 分页时用户无法察觉, 故合并同屏并
+         * 在冲突时给出诊断. 带 ops 的叶子项在列表里显示右侧三角 ▶(与 PID 多参页
+         * 一致); 左侧靶心圆点所有行都有, 并非本项特有. */
+        .ops         = &sleep_set_ops,
+        .name        = "休眠设置",
     },
 
     [9]={
         .parent      = 7,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
-        .ops         = &sleep_temp_ops,
-        .name        = "休眠温度",
+        /* 两参一页(蜂鸣器/屏幕亮度): 原为两页, 2026-10 合并为多参调节页,
+         * 与"休眠设置"同一形态(导航态选字段 → CLICK 进调参 → LPRESS 退出).
+         * 亮度在调参时即时预览, 页面底部有指示条. */
+        .ops         = &func_set_ops,
+        .name        = "功能设置",
     },
 
     [10]={
-        .parent      = 7,
-        .first_child = MENU_NO_CHILD,
-        .child_num   = MENU_LEAF,
-        .ops         = &shutdown_ops,
-        .name        = "自动关机",
-    },
-
-    [11]={
-        .parent      = 7,
-        .first_child = MENU_NO_CHILD,
-        .child_num   = MENU_LEAF,
-        .ops         = &buzzer_ops,
-        .name        = "蜂鸣器",
-    },
-
-    [12]={
-        .parent      = 7,
-        .first_child = MENU_NO_CHILD,
-        .child_num   = MENU_LEAF,
-        .ops         = &brightness_ops,
-        .name        = "屏幕亮度",
-    },
-
-    [13]={
         .parent      = 7,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
@@ -146,7 +131,7 @@ const menu_item_t menu_table[] =
         .name        = "恢复默认",
     },
 
-    [14]={
+    [11]={
         .parent      = 7,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
@@ -157,7 +142,7 @@ const menu_item_t menu_table[] =
 
     /* ========== PID参数子菜单 ========== */
 
-    [15]={
+    [12]={
         .parent      = 3,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
@@ -165,7 +150,7 @@ const menu_item_t menu_table[] =
         .name        = "快速PID",
     },
 
-    [16]={
+    [13]={
         .parent      = 3,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
@@ -173,7 +158,7 @@ const menu_item_t menu_table[] =
         .name        = "慢速PID",
     },
 
-    [17]={
+    [14]={
         .parent      = 3,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,
@@ -181,7 +166,7 @@ const menu_item_t menu_table[] =
         .name        = "自动整定",
     },
 
-    [18]={
+    [15]={
         .parent      = 3,
         .first_child = MENU_NO_CHILD,
         .child_num   = MENU_LEAF,

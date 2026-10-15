@@ -4,10 +4,8 @@
 /*
  * 分段式整数 PID 控制器
  *
- * 参考 Cai-Zi/STM32_T12_Controller 的分段控制策略:
- *   - ΔT > 50°C: 全速加热 (输出 = PID_OUTPUT_MAX)
- *   - 30°C < ΔT ≤ 50°C: 激进 PID (aggressive)
- *   - ΔT ≤ 30°C: 保守 PID (conservative)
+ * 参数调度在 25~35°C 误差带内线性混合保守/激进参数, 避免 30°C 处跳变;
+ * 大误差下由工作层连续前馈抬高基准, PID 仍参与输出而非硬切满功率.
  *
  * 所有计算使用整数运算, 无浮点:
  *   - Kp/Ki/Kd 存储为 *100, 计算时除以 PID_SCALE(100)
@@ -20,7 +18,16 @@
 /* 不完全微分低通系数 k: 192/256 ≈ 0.75 = 新值权重,
  * 即 d_filter = (1-k)*旧 + k*新。k 越小 D 越平滑(响应越慢),
  * k 越大越接近原始微分(测量噪声放大越明显)。 */
-#define PID_D_FILTER  192
+#define PID_D_FILTER       192
+#define PID_BLEND_LOW      25
+#define PID_BLEND_HIGH     35
+
+static int16_t pid_blend_gain(int16_t cons, int16_t agg, int16_t error)
+{
+    int32_t span = PID_BLEND_HIGH - PID_BLEND_LOW;
+    int32_t pos  = error - PID_BLEND_LOW;
+    return (int16_t)(cons + ((int32_t)(agg - cons) * pos) / span);
+}
 
 static struct {
     /* 激进 PID 参数 */
@@ -107,75 +114,58 @@ int16_t PID_Controller_GetMeasured(void)
     return pid.measured;
 }
 
-int16_t PID_Controller_Compute(void)
+int16_t PID_Controller_Compute(int16_t feedforward_floor)
 {
     int16_t error;
-    int32_t p_term, i_term, d_term;
-    int32_t output;
+    int16_t abs_error;
     int16_t cur_kp, cur_ki, cur_kd;
+    int16_t lim;
+    int32_t p_term, d_term;
+    int32_t output, candidate_integral;
+    int32_t old_integral, old_rem, raw, inc, next_rem;
 
-    /* 计算误差: 目标温度已在 SetSetpoint 中统一钳位到 [TEMP_MIN, 型号 temp_max] */
     error = (int16_t)(pid.setpoint - pid.measured);
+    if (feedforward_floor < 0)
+        feedforward_floor = 0;
+    else if (feedforward_floor > PID_OUTPUT_MAX)
+        feedforward_floor = PID_OUTPUT_MAX;
 
-    /* 分段控制 */
-    if (error > 50)
+    /* 平滑参数调度: ≤25°C 保守, ≥35°C 激进, 中间 10°C 线性混合.
+     * 对负误差保持保守参数, 仅积分限幅根据过冲幅度收紧. */
+    if (error <= PID_BLEND_LOW)
     {
-        /* 温差 > 50°C: 全速加热 */
-        pid.integral = 0;                       /* 全速时清零积分 */
-        pid.last_measured = pid.measured;       /* 持续记录实测温度, 使切回 PID 时微分先行项保持连续, 避免输出瞬间跌落 */
-        pid.output = PID_OUTPUT_MAX;            /* 同步"上次输出", 使 GetOutput() 在全速段也不失真 */
-        return PID_OUTPUT_MAX;
+        cur_kp = pid.cons_kp;
+        cur_ki = pid.cons_ki;
+        cur_kd = pid.cons_kd;
     }
-
-    /* 选择 PID 参数集 */
-    if (error > 30)
+    else if (error >= PID_BLEND_HIGH)
     {
-        /* 30°C < 温差 ≤ 50°C: 激进 PID */
         cur_kp = pid.agg_kp;
         cur_ki = pid.agg_ki;
         cur_kd = pid.agg_kd;
     }
     else
     {
-        /* 温差 ≤ 30°C: 保守 PID */
-        cur_kp = pid.cons_kp;
-        cur_ki = pid.cons_ki;
-        cur_kd = pid.cons_kd;
+        cur_kp = pid_blend_gain(pid.cons_kp, pid.agg_kp, error);
+        cur_ki = pid_blend_gain(pid.cons_ki, pid.agg_ki, error);
+        cur_kd = pid_blend_gain(pid.cons_kd, pid.agg_kd, error);
     }
 
-    /* 比例项: P = Kp * error / 100 */
+    abs_error = (error < 0) ? (int16_t)(-error) : error;
+    if (abs_error <= PID_BLEND_LOW)
+        lim = PID_INTEGRAL_LIMIT;
+    else if (abs_error >= PID_BLEND_HIGH)
+        lim = PID_INTEGRAL_LIMIT_AGG;
+    else
+        lim = (int16_t)(PID_INTEGRAL_LIMIT -
+              ((PID_INTEGRAL_LIMIT - PID_INTEGRAL_LIMIT_AGG) *
+               (abs_error - PID_BLEND_LOW) / (PID_BLEND_HIGH - PID_BLEND_LOW)));
+
     p_term = (int32_t)cur_kp * error / PID_SCALE;
 
-    /* 积分项: I += Ki * error / 100, 积分分离 + 抗饱和.
-     * 只有限幅值随分段变化:
-     *   - 激进/过冲区(|ΔT|>30°C): 收紧到 15% 满量程, 大误差下不致饱和;
-     *   - 保守区(ΔT≤30°C): 放宽到 30% 满量程, 保证稳态精度.
-     * 全速区(ΔT>50°C)上方已清零积分, 不累计. */
-    {
-        int16_t lim = (error > 30 || error < -30) ? PID_INTEGRAL_LIMIT_AGG : PID_INTEGRAL_LIMIT;
-        int32_t raw, inc;
-
-        /* 余数累加: 直接写 (ki*error)/100 会在 |error| < 100/ki 时整除截断为 0
-         * (ki 存 ×100, 保守组 0.60→60, 故 |error|<2 时积分完全停走), 稳态消不掉最后
-         * 1~2°C 偏差. 这里把未除尽的余数留到下一周期, 使小误差也能缓慢累积. */
-        raw = (int32_t)cur_ki * error + pid.i_rem;
-        inc = raw / PID_SCALE;
-        pid.i_rem = raw - inc * PID_SCALE;   /* 余数(与 raw 同号, 范围 ±<100) */
-        pid.integral += inc;
-        if (pid.integral > lim)
-            pid.integral = lim;
-        else if (pid.integral < -lim)
-            pid.integral = -lim;
-    }
-    i_term = pid.integral;
-
-    /* 微分项: 微分先行 + 不完全微分
-     * 微分先行: 对实测温度微分 (D = Kd*(last_meas - meas)/100),
-     * 设定值突变(调温/休眠唤醒)不进入微分, 消除微分冲击;
-     * 不完全微分: 一阶低通滤波, 抑制测量噪声放大 */
+    /* 微分先行 + 一阶低通: 对实测温度求导, 设定值变化不直接产生冲击. */
     if (pid.d_first)
     {
-        /* 首帧仅记录温度, 不产生微分 */
         pid.d_first = false;
         pid.d_filter = 0;
     }
@@ -184,29 +174,57 @@ int16_t PID_Controller_Compute(void)
         int32_t d_new = (int32_t)(pid.last_measured - pid.measured) * cur_kd / PID_SCALE;
         pid.d_filter += (d_new - pid.d_filter) * PID_D_FILTER / 256;
     }
-    pid.last_measured = pid.measured;   /* 持续记录, 供下一帧微分 */
+    pid.last_measured = pid.measured;
     d_term = pid.d_filter;
 
-    /* 合成输出 + 抗饱和(integral clamping):
-     * 若未钳输出已顶出 [0, PID_OUTPUT_MAX], 把积分回退到"使输出恰落在限值"的
-     * 值, 阻止饱和期间积分继续朝饱和方向累积(退出饱和后过冲的主要来源).
-     * 上方限幅只约束积分自身幅度, 防不住"比例+积分"合力越界, 故在此补齐. */
-    output = p_term + i_term + d_term;
+    /* 先形成候选积分, 再检查实际输出是否仍被前馈托底.
+     * 前馈主导且误差仍要求加热时, 把积分直接跟踪到 ff-P-D (受积分限幅约束),
+     * 使 PID 内部输出贴近外部实际命令; 前馈退出时避免积分器接管冲击. */
+    if (pid.integral > lim)
+        pid.integral = lim;
+    else if (pid.integral < -lim)
+        pid.integral = -lim;
+    old_integral = pid.integral;
+    old_rem = pid.i_rem;
+    raw = (int32_t)cur_ki * error + old_rem;
+    inc = raw / PID_SCALE;
+    next_rem = raw - inc * PID_SCALE;
+    candidate_integral = old_integral + inc;
+    if (candidate_integral > lim)
+        candidate_integral = lim;
+    else if (candidate_integral < -lim)
+        candidate_integral = -lim;
 
+    output = p_term + candidate_integral + d_term;
+
+    /* 条件积分 anti-windup:
+     * ① 前馈主导且仍有正误差: 积分跟踪外部前馈命令(受限幅约束), 减小接管误差;
+     * ② PID 已饱和时, 只冻结继续推向饱和方向的积分, 允许反方向误差退饱和. */
+    if (error > 0 && output < feedforward_floor)
+    {
+        pid.integral = (int32_t)feedforward_floor - p_term - d_term;
+        if (pid.integral > lim)
+            pid.integral = lim;
+        else if (pid.integral < -lim)
+            pid.integral = -lim;
+        pid.i_rem = 0;
+    }
+    else if ((output > PID_OUTPUT_MAX && inc > 0) || (output < 0 && inc < 0))
+    {
+        pid.integral = old_integral;
+        pid.i_rem = old_rem;
+    }
+    else
+    {
+        pid.integral = candidate_integral;
+        pid.i_rem = next_rem;
+    }
+
+    output = p_term + pid.integral + d_term;
     if (output > PID_OUTPUT_MAX)
-    {
-        int32_t i_cap = PID_OUTPUT_MAX - p_term - d_term;
-        if (pid.integral > i_cap)
-            pid.integral = i_cap;
         output = PID_OUTPUT_MAX;
-    }
     else if (output < 0)
-    {
-        int32_t i_floor = -p_term - d_term;
-        if (pid.integral < i_floor)
-            pid.integral = i_floor;
         output = 0;
-    }
 
     pid.output = (int16_t)output;
     return (int16_t)output;

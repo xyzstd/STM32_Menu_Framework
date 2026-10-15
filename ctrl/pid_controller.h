@@ -21,6 +21,16 @@
 /* PID 参数存储格式: 实际值 = 存储值 / 100 */
 #define PID_SCALE       100
 
+/* 用户可编辑的 PID 增益上限 (*100) —— 单一来源:
+ *   - 页面(page/pid.c)用它钳位用户可设范围与载入值;
+ *   - 自整定写回(main/work_task.c)用它钳位整定结果.
+ * 二者必须同源: 整定短暂可产出 Kd 达 3×10^4(经 tune_gain_sat 饱和到 32767),
+ * 若原样存入配置, 用户一进 PID 页就会被页面上限静默钳掉, 且 2 位整数显示
+ * 截断高位 —— 同源钳位后不会落盘超出页面可显示/可编辑范围的值. */
+#define PID_KP_MAX      2000   /* 20.00, 覆盖激进默认 11.00 */
+#define PID_KI_MAX      500    /* 5.00 */
+#define PID_KD_MAX      1000   /* 10.00, 覆盖保守默认 6.00 */
+
 /* 温度下限固定 100°C; 上限按型号在运行时由 Config_GetTempMax() 提供
  * (T12/T245/T210 均为 450), 不再使用固定宏, 保证切型号后目标不越标称上限 */
 #define TEMP_MIN        100
@@ -38,14 +48,14 @@ void PID_Controller_SetMeasured(int16_t measured);
 int16_t PID_Controller_GetMeasured(void);
 
 /*
- * 执行分段 PID 计算, 返回加热功率 0 ~ PID_OUTPUT_MAX
- * - ΔT > 50°C: 全速加热
- * - 30°C < ΔT ≤ 50°C: 激进 PID
- * - ΔT ≤ 30°C: 保守 PID
- * - 积分: 全速区清零, 激进区累计(限幅 15%), 保守区限幅 30%;
- *          微分: 先行 + 不完全微分低通
+ * 执行分段 PID 计算, 返回 PID 输出 0 ~ PID_OUTPUT_MAX.
+ * feedforward_floor 是工作层最终 PID+前馈输出中的前馈下限:
+ * 前馈主导且误差为正时, 积分跟踪前馈下限(受积分限幅约束), 避免接管冲击.
+ * - 参数组在误差 25~35°C 内线性混合, 平滑原 30°C 调度边界;
+ * - 大误差区仍使用激进参数, 由工作层连续前馈托底, 不再在 50°C 硬切满功率;
+ * - 积分: 激进区限幅 15%, 保守区限幅 30%; 微分: 先行 + 不完全微分低通.
  */
-int16_t PID_Controller_Compute(void);
+int16_t PID_Controller_Compute(int16_t feedforward_floor);
 
 /* 设置 PID 参数 (激进组 / 保守组, 均为 *100) */
 void PID_Controller_SetAggKp(int16_t kp);

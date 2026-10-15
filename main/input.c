@@ -17,9 +17,17 @@
 
 /* 单队列 SPSC：保留末尾槽位给按键事件；旋转事件达到阈值就丢弃最新值。
  * 旋转事件另带时间戳，主循环阻塞恢复后会丢弃过期旋转，避免陈旧动作突然补执行。 */
-#define INPUT_EVT_QUEUE_SIZE       32
-#define INPUT_KEY_RESERVED_SLOTS    4
-#define INPUT_ENCODER_MAX_AGE_MS   12
+#define INPUT_EVT_QUEUE_SIZE       32u
+#define INPUT_EVT_QUEUE_MASK       (INPUT_EVT_QUEUE_SIZE - 1u)
+#define INPUT_KEY_RESERVED_SLOTS    4u
+#define INPUT_ENCODER_MAX_AGE_MS   12u
+
+/* 队列头尾用 uint8_t, 空槽法需留 1 格; 掩码求占用量要求容量为 2 的幂. */
+typedef char input_evt_queue_size_must_be_valid[
+    (INPUT_EVT_QUEUE_SIZE >= 2u &&
+     INPUT_EVT_QUEUE_SIZE <  256u &&   /* uint8_t head/tail 无法表示容量 256 */
+     (INPUT_EVT_QUEUE_SIZE & (INPUT_EVT_QUEUE_SIZE - 1u)) == 0u &&
+     INPUT_EVT_QUEUE_SIZE > INPUT_KEY_RESERVED_SLOTS + 1u) ? 1 : -1];
 
 typedef struct {
     uint16_t tick16;   /* Timer_GetTick 低 16 位; 事件年龄远小于 32768ms */
@@ -65,8 +73,8 @@ static void input_scan(void);
 
 static void evt_enqueue(uint8_t event, int8_t step)
 {
-    uint8_t next = (uint8_t)((evt_q.tail + 1) % INPUT_EVT_QUEUE_SIZE);
-    uint8_t used = (uint8_t)((evt_q.tail + INPUT_EVT_QUEUE_SIZE - evt_q.head) % INPUT_EVT_QUEUE_SIZE);
+    uint8_t next = (uint8_t)((evt_q.tail + 1u) % INPUT_EVT_QUEUE_SIZE);
+    uint8_t used = (uint8_t)((uint8_t)(evt_q.tail - evt_q.head) & INPUT_EVT_QUEUE_MASK);
     bool is_key_event = (event == MENU_EVENT_CLICK || event == MENU_EVENT_LPRESS);
 
     /* 编码器不能占用预留槽: 主循环短时被 Flash/测量流程阻塞时，按键仍有位置入队. */
@@ -199,7 +207,7 @@ static void input_scan(void)
 /* 主循环每轮最多分发 2 个新鲜事件。编码器旧事件超龄即丢弃；否则在 Flash/长测量
  * 阻塞恢复后，队列会把过期旋转逐格补执行，表现为突然跳格，甚至在页面已变后误操作.
  * 按键事件有预留槽且不超龄丢弃；过期旋转在这里快速跳过，不占本轮 2 个有效事件额度.
- * 跨页后仍重同步编码器半格相位；未过期 FIFO 输入继续保留. */
+ * 检测到跨页面/列表上下文后清空剩余队列，并重同步编码器半格相位，避免旧上下文积压输入带入新页面. */
 void Input_Process(void)
 {
     input_evt_t evt;
@@ -224,7 +232,10 @@ void Input_Process(void)
         menu_notify(&cmd);
 
         if (menu_ctx() != ctx_before)
-            Input_ResyncEncoder();   /* 上下文已变: 重同步编码器半格相位 */
+        {
+            Input_ClearEvents();     /* 上下文已变: 丢弃仍排队的旧输入 */
+            Input_ResyncEncoder();   /* 同时丢弃编码器未满一格的残留相位 */
+        }
     }
 }
 

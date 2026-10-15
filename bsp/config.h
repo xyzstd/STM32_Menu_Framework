@@ -31,17 +31,31 @@
 /* 温度校准数据 Flash 存储地址 (独立页 0x0803F000)
  * 与配置页分离: Config_Reset() 只重置用户设置, 校准页由 Cal_Init 独立维护 */
 #define CAL_MAGIC         0xCA1B4A55UL
-#define CAL_VERSION       1
+#define CAL_VERSION       2   /* 1→2: 校准点由 6 点(100/200/300/350/400/450)改为
+                               * 5 点(200/300/350/400/450), cal_t 布局随之变化.
+                               * 旧 v1 数据版本不符 → Cal_Init 回落出厂默认表, 需重新校准. */
 #define CAL_FLASH_ADDR    0x0803F000UL
 
-/* 温度校准点数 (100/200/300/350/400/450°C) */
-#define CAL_POINT_NUM     6
+/* 温度校准点数 (200/300/350/400/450°C) */
+#define CAL_POINT_NUM     5
 
 /* 校准偏移的合法范围 (±°C) —— 单一来源:
  *   - 页面(page/calibrate.c)用它钳位用户可设范围;
  *   - Cal_Init 用它校验从 Flash 载入的数据.
  * 二者必须同源: 页面能设出的值必须能通过加载校验, 反之亦然. */
 #define CAL_OFF_LIMIT     50
+
+/* 休眠设置三项的合法范围 —— 单一来源(同 CAL_OFF_LIMIT 的做法):
+ *   - 页面(page/settings.c)用它限定用户可调范围;
+ *   - Config_Init → config_clamp 用它收敛从 Flash 载入的越界值.
+ * 二者必须同源: 页面能设出的值必然通过载入收敛, 反之亦然.
+ * sleep_temp 下限 50: 更低已无保温意义; 上限 300 覆盖常见保温区间. */
+#define SLEEP_TIME_MIN      0
+#define SLEEP_TIME_MAX      60      /* 分钟, 0 = 禁用休眠 */
+#define SLEEP_TEMP_MIN      50      /* °C */
+#define SLEEP_TEMP_MAX      300     /* °C */
+#define SHUTDOWN_TIME_MIN   0
+#define SHUTDOWN_TIME_MAX   120     /* 分钟, 0 = 禁用自动关机 */
 
 /* 手柄型号索引 */
 #define HANDLE_NUM      3
@@ -92,16 +106,17 @@ typedef struct
     uint16_t version;        /* CAL_VERSION */
 
     /* 多点温度校准偏移 (°C, -50 ~ +50), 每型号一套, 按温度区间插值
-     * 6 温度点: 100/200/300/350/400/450, 细分常用焊接带 (300~350) */
-    int8_t  cal_off_100[HANDLE_NUM];  /* 100°C 校准偏移 */
+     * 5 温度点: 200/300/350/400/450, 细分常用焊接带 (300~350) */
     int8_t  cal_off_200[HANDLE_NUM];  /* 200°C 校准偏移 */
     int8_t  cal_off_300[HANDLE_NUM];  /* 300°C 校准偏移 */
     int8_t  cal_off_350[HANDLE_NUM];  /* 350°C 校准偏移 */
     int8_t  cal_off_400[HANDLE_NUM];  /* 400°C 校准偏移 */
     int8_t  cal_off_450[HANDLE_NUM];  /* 450°C 校准偏移 */
+    /* 显式填充: 偏移块 5×3=15 B 为奇数, 其后 uint16 块需 2 字节对齐 ——
+     * 把编译器本会插入的那 1 B 显式写出, 使布局确定、布局守卫可精确校验(见 config.c). */
+    uint8_t cal_off_pad;
 
     /* 温度校准点 (ADC 值), 每型号一套, 与偏移同温度点对齐 */
-    uint16_t cal_adc_100[HANDLE_NUM];  /* 100°C 时的 ADC 值 */
     uint16_t cal_adc_200[HANDLE_NUM];  /* 200°C 时的 ADC 值 */
     uint16_t cal_adc_300[HANDLE_NUM];  /* 300°C 时的 ADC 值 */
     uint16_t cal_adc_350[HANDLE_NUM];  /* 350°C 时的 ADC 值 */
@@ -250,7 +265,7 @@ void Cal_Load(void);
 bool Cal_Save(void);
 void Cal_Reset(void);
 
-/* 校准点按温度点索引 0..CAL_POINT_NUM-1 (100/200/300/350/400/450°C) */
+/* 校准点按温度点索引 0..CAL_POINT_NUM-1 (200/300/350/400/450°C) */
 int8_t   Cal_GetOff(uint8_t idx, uint8_t h);   /* 取某温度点某型号的偏移 */
 void     Cal_SetOff(uint8_t idx, uint8_t h, int8_t v);
 uint16_t Cal_GetAdc(uint8_t idx, uint8_t h);   /* 取某温度点某型号的 ADC 值 */
@@ -272,6 +287,9 @@ uint8_t  Config_GetHandleIdx(void);
 
 /* 当前型号显示名 ("T12"/"T245"/"T210", 与索引对应) */
 const char *Config_GetHandleName(void);
+/* 按索引取型号显示名(越界回落 T12). 供各页面显示"选中/预览的型号"用 ——
+ * 有了它, Cur Cal / 换头页就不必各自再存一份型号名表(单一来源). */
+const char *Config_GetHandleNameByIdx(uint8_t idx);
 
 /* 当前型号的温度上下限 (°C, 运行时按 handle_type 取值) */
 uint16_t Config_GetTempMax(void);   /* 常规设定上限 */

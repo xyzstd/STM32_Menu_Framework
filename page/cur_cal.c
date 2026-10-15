@@ -24,7 +24,7 @@
 static const char cal_title[]  = "电流标定";
 static const char boot_title[] = "首次标定";
 static const char tip_title[]  = "换头标定";
-static const char *const cal_names[HANDLE_NUM] = {"T12", "T245", "T210"};
+/* 型号显示名不在此另存一份: 统一用 Config_GetHandleNameByIdx()(见 bsp/config.h) */
 
 /* 冷态标定温度门共用 TYPE_CUR_COOL_MAX (见 work_task.h):
  * 烙铁头高于此温度时阻值已偏移, 标定不可靠, 需等降温 */
@@ -254,7 +254,7 @@ static menu_period_t cur_cal_display(void *ud)
     /* 第1行: 选中型号 + 已存参考值 (---- 表示未标定)
      * 型号最长 4 字符(T245/T210)占 32px, 冒号定在 x=40 不遮盖第4字符
      * (原 x=32 会盖掉 '5'/'0', 显示成 T24/T21); 参考值列 x=48 与 Meas 行对齐 */
-    OLED_ShowString(8, 16, cal_names[cal_idx], OLED_8X16);
+    OLED_ShowString(8, 16, Config_GetHandleNameByIdx(cal_idx), OLED_8X16);
     OLED_ShowChar(40, 16, ':', OLED_8X16);
     if (ref == 0)
         OLED_ShowString(48, 16, "----", OLED_8X16);

@@ -878,9 +878,35 @@ void OLED_ShowImage(int16_t x,int16_t y,uint8_t width,uint8_t height,const uint8
 
 /*================ 字符 =================*/
 
+/* 紧凑 ASCII 字库(每行 = [字符, 字形字节], 见 oled_data.c 裁剪说明):
+ * 逐行线性查找 ch 的字形, 命中返回字形数据指针.
+ * 未命中 = 该字符被 G8 宏开关剔除(或新增文案忘了开开关), 退化为 '?'
+ * 兜底字形 —— 显示问号, 失败可见, 且不影响其它字符的对位.
+ * '?' 由构建期(check_ascii_font.py)保证在保留集内, 第二次查找必中;
+ * tab[1] 只是理论不可达时的非空兜底(第 0 行恒为 ' '). */
+static const uint8_t *oled_ascii_glyph(const uint8_t *tab, uint8_t row, uint8_t n, uint8_t ch)
+{
+    uint8_t i;
+    uint16_t off;
+
+    for(i = 0; i < n; i++)
+    {
+        off = (uint16_t)((uint16_t)i * row);
+        if(tab[off] == ch)
+            return &tab[off + 1];
+    }
+    for(i = 0; i < n; i++)
+    {
+        off = (uint16_t)((uint16_t)i * row);
+        if(tab[off] == '?')
+            return &tab[off + 1];
+    }
+    return &tab[1];
+}
+
 void OLED_ShowChar(int16_t x,int16_t y,char ch,uint8_t font)
 {
-    /* 越界字符(控制符/非ASCII)替换为 '?', 防止字模数组越界读 */
+    /* 越界字符(控制符/非ASCII)替换为 '?', 防止字库越界读 */
     if(ch<' '||ch>'~')
         ch='?';
 
@@ -891,7 +917,10 @@ void OLED_ShowChar(int16_t x,int16_t y,char ch,uint8_t font)
             y,
             8,
             16,
-            OLED_F8x16[ch-' ']);
+            oled_ascii_glyph((const uint8_t *)OLED_F8x16,
+                             (uint8_t)sizeof(OLED_F8x16[0]),
+                             OLED_F8x16_COUNT,
+                             (uint8_t)ch));
     }
     else if(font==OLED_6X8)
     {
@@ -900,7 +929,10 @@ void OLED_ShowChar(int16_t x,int16_t y,char ch,uint8_t font)
             y,
             6,
             8,
-            OLED_F6x8[ch-' ']);
+            oled_ascii_glyph((const uint8_t *)OLED_F6x8,
+                             (uint8_t)sizeof(OLED_F6x8[0]),
+                             OLED_F6x8_COUNT,
+                             (uint8_t)ch));
     }
 }
 

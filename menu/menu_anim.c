@@ -1,10 +1,16 @@
 ﻿/*====================================================================
  * 菜单导航动画模块实现
  * 帧格式: 见 menu_anim.h。
+ *
+ * ⚠️ 本模块当前 **未接入**(未加入 Project.uvprojx 构建, MENU_ANIM_ENABLE=0),
+ *    整文件不参与编译与链接。保留在仓库供将来集成 —— 启用步骤见 menu_anim.h 顶部。
+ *
  * 实现要点:
  *   - 动画状态收敛到单一结构体, 由本模块统一维护
  *   - step 从 1 起步: 跳过与静止画面相同的 t=0 帧,
  *     使"停住后再转一格"首帧立即可见移动, 不产生卡顿感
+ *   - Start* 必须同时置 anim.type: 查询接口(AnimNav_Type/PageOffset/BarY)
+ *     全部按 type 分派, 只置 step 会让它们恒走 default 分支(画面无动画)
  *====================================================================*/
 #include "menu_anim.h"
 
@@ -63,10 +69,12 @@ static int16_t anim_progress(void)
 void AnimNav_Stop(void)
 {
     anim.step = ANIM_STEPS;
+    anim.type = ANIM_NONE;
 }
 
 void AnimNav_StartBar(int16_t from_y, int16_t to_y)
 {
+    anim.type   = ANIM_BAR;
     anim.step   = 1;
     anim.from_y = from_y;
     anim.to_y   = to_y;
@@ -74,6 +82,7 @@ void AnimNav_StartBar(int16_t from_y, int16_t to_y)
 
 void AnimNav_StartPage(int8_t dir)
 {
+    anim.type = ANIM_PAGE;
     anim.step = 1;
     anim.dir  = dir;
 }

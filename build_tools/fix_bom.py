@@ -10,6 +10,9 @@
 文件; 带 --fix 参数则直接补上. 许多编辑器保存时会静默丢掉 BOM, 建议改完中文
 文案后跑一次:
 
+注意: 扫描范围含 docs/ 下的 .md (纯文档不需要 BOM 编译, 但为保持仓库统一编码,
+同样纳入检查).
+
     python build_tools/fix_bom.py          # 只检查
     python build_tools/fix_bom.py --fix    # 检查并补回
 """
@@ -19,8 +22,9 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOM = b'\xef\xbb\xbf'
 
-# 扫描这些目录下的 .c/.h; package/ 是 ST 标准库, 保持原样不碰
-SCAN_DIRS = ['bsp', 'ctrl', 'menu', 'page', 'sys', 'main', 'ota']
+# 扫描这些目录下的源码/文档; package/ 是 ST 标准库, 保持原样不碰
+SCAN_DIRS = ['bsp', 'ctrl', 'menu', 'page', 'sys', 'main', 'ota', 'docs']
+SCAN_EXTS = ('.c', '.h', '.md')
 SKIP_DIRS = {'package', 'Objects', 'Listings', 'obj', '_objs', '_b', 'build_tools'}
 
 
@@ -32,7 +36,7 @@ def iter_sources():
         if top not in SCAN_DIRS:
             continue
         for fn in sorted(files):
-            if fn.endswith(('.c', '.h')):
+            if fn.endswith(SCAN_EXTS):
                 yield os.path.join(base, fn)
 
 

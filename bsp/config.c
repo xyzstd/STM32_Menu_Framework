@@ -43,13 +43,12 @@ static const cal_t default_cal =
 {
     .magic         = CAL_MAGIC,
     .version       = CAL_VERSION,
-    .cal_off_100   = {0, 0, 0},
     .cal_off_200   = {0, 0, 0},
     .cal_off_300   = {0, 0, 0},
     .cal_off_350   = {0, 0, 0},
     .cal_off_400   = {0, 0, 0},
     .cal_off_450   = {0, 0, 0},
-    .cal_adc_100   = {790,  790,  790 },   /* 100°C ADC 值 */
+    .cal_off_pad   = 0,
     .cal_adc_200   = {1670, 1670, 1670},   /* 200°C ADC 值 */
     .cal_adc_300   = {2900, 2900, 2900},   /* 300°C ADC 值 */
     .cal_adc_350   = {3396, 3396, 3396},   /* 350°C ADC 值 */
@@ -99,6 +98,18 @@ const char *Config_GetHandleName(void)
     return handle_names[Config_GetHandleIdx()];
 }
 
+/* 按索引取型号名: 页面需要显示"非当前型号"(Cur Cal 选型、换头页预览)时用.
+ * 越界一律回落 T12, 与 Config_GetHandleIdx 同款防御.
+ * 存在意义: 此前 page/cur_cal.c 与 page/handle.c 各自复制了一份
+ * {"T12","T245","T210"}, 改一处名字要同步三处; 现统一走本函数. */
+const char *Config_GetHandleNameByIdx(uint8_t idx)
+{
+    if (idx >= HANDLE_NUM)
+        idx = HANDLE_T12;
+
+    return handle_names[idx];
+}
+
 /* 简单 CRC16 (配置页与校准页共用) */
 static uint16_t crc16(const uint8_t *p, uint16_t len)
 {
@@ -141,15 +152,18 @@ static uint16_t typecal_calc_crc(const type_cal_t *c)
     return crc16((const uint8_t *)c, (uint16_t)offsetof(type_cal_t, crc));
 }
 
-/* ===== 编译期布局守卫: cal_t 内 6 个校准数组必须"无填充连续" =====
- * Cal_GetOff/Cal_GetAdc 用 ((T*)&cal_xxx_100)[idx*HANDLE_NUM + h] 跨数组线性寻址,
+/* ===== 编译期布局守卫: cal_t 内 5 个校准数组必须"无填充连续" =====
+ * Cal_GetOff/Cal_GetAdc 用 ((T*)&cal_xxx_200)[idx*HANDLE_NUM + h] 跨数组线性寻址,
  * 依赖数组之间没有对齐填充; 一旦编译器插入填充, 寻址会静默越界. 在此编译期拦下
- * (违反即负数组长度 = 编译失败), 与 config.h 的数据页守卫同一手法. */
+ * (违反即负数组长度 = 编译失败), 与 config.h 的数据页守卫同一手法.
+ * 偏移块是 int8_t 数组, 数组之间天然无填充; 但其总长 5×3=15 B 为奇数, 其后 uint16
+ * 块需 2 字节对齐 → 末尾有 1 B 填充(已由 cal_t.cal_off_pad 显式写出, 见 config.h),
+ * 故第一条守卫的期望值要额外 +1. */
 typedef char guard_cal_off_contiguous[
-    (offsetof(cal_t, cal_adc_100) - offsetof(cal_t, cal_off_100)
-        == sizeof(int8_t) * CAL_POINT_NUM * HANDLE_NUM) ? 1 : -1];
+    (offsetof(cal_t, cal_adc_200) - offsetof(cal_t, cal_off_200)
+        == sizeof(int8_t) * CAL_POINT_NUM * HANDLE_NUM + 1) ? 1 : -1];
 typedef char guard_cal_adc_contiguous[
-    (offsetof(cal_t, crc) - offsetof(cal_t, cal_adc_100)
+    (offsetof(cal_t, crc) - offsetof(cal_t, cal_adc_200)
         == sizeof(uint16_t) * CAL_POINT_NUM * HANDLE_NUM) ? 1 : -1];
 
 /* 落盘一个数据页: 真机擦页后写入; 模拟模式仅保留 RAM 状态(仿真器擦写可能死等).
@@ -171,14 +185,53 @@ static bool save_page(uint32_t addr, const void *buf, uint16_t len)
 }
 
 /* v10 旧校准字段整体迁入独立校准页 (升级固件不丢校准).
- * 以默认校准打底(带 magic/version), 仅覆盖 6 偏移 + 6 ADC 数据;
- * 各字段在 v10 与 cal_t 内均连续排布, 分两块整体拷贝. */
+ * 以默认校准打底(带 magic/version), 仅覆盖 5 偏移 + 5 ADC 数据;
+ * 各字段在 v10 与 cal_t 内均连续排布, 分两块整体拷贝.
+ * v10 有 6 点(100/200/300/350/400/450), 现为 5 点(200~450): 从 200 起拷 5 组,
+ * 100°C 点自然被丢弃 —— 起点用 cal_off_200/cal_adc_200, 长度按 CAL_POINT_NUM(5). */
 static void cal_migrate_v10(const config_v10_t *old)
 {
     memcpy(&g_cal, &default_cal, sizeof(g_cal));
-    memcpy(g_cal.cal_off_100, old->cal_off_100, sizeof(g_cal.cal_off_100) * CAL_POINT_NUM);
-    memcpy(g_cal.cal_adc_100, old->cal_adc_100, sizeof(g_cal.cal_adc_100) * CAL_POINT_NUM);
+    memcpy(g_cal.cal_off_200, old->cal_off_200, sizeof(g_cal.cal_off_200) * CAL_POINT_NUM);
+    memcpy(g_cal.cal_adc_200, old->cal_adc_200, sizeof(g_cal.cal_adc_200) * CAL_POINT_NUM);
     (void)Cal_Save();
+}
+
+/* ==================== 载入后的字段合法性收敛 ====================
+ * 为什么需要: g_config 的字段被 work_task 直接消费 —— sleep_temp 直接作 PID
+ * setpoint、sleep_time/shutdown_time 直接乘 60 作阈值, **运行期不做二次校验**;
+ * 而 Flash 里的值可能越界(旧固件写下的 / 版本迁移漏改的 / 数据位翻转).
+ * 页面虽会钳位, 但那**只影响显示与本次编辑, 不写回 g_config** —— 用户不改动
+ * 就退出的话, 越界值会一直生效, 且界面显示与实际不一致.
+ * 故在载入后统一收敛一次, 使所有消费点看到的都是合法值.
+ *
+ * 范围常量取自 bsp/config.h 的单一来源(与 page/settings.c 的页面范围同源).
+ * 注: 目前只覆盖休眠三项(本次改动相关); 其余字段的收敛按需补充. */
+static void config_clamp(void)
+{
+    bool fixed = false;
+
+    if (g_config.sleep_time > SLEEP_TIME_MAX)
+    {
+        g_config.sleep_time = SLEEP_TIME_MAX;
+        fixed = true;
+    }
+    if (g_config.sleep_temp < SLEEP_TEMP_MIN || g_config.sleep_temp > SLEEP_TEMP_MAX)
+    {
+        g_config.sleep_temp = (g_config.sleep_temp < SLEEP_TEMP_MIN)
+                              ? (uint16_t)SLEEP_TEMP_MIN : (uint16_t)SLEEP_TEMP_MAX;
+        fixed = true;
+    }
+    if (g_config.shutdown_time > SHUTDOWN_TIME_MAX)
+    {
+        g_config.shutdown_time = SHUTDOWN_TIME_MAX;
+        fixed = true;
+    }
+
+    /* 只在确实修正过时落盘 —— 否则每次上电都白擦一次 Flash.
+     * 落盘失败不回滚: 内存已修正, 本次运行是安全的, 下次上电会再试. */
+    if (fixed)
+        (void)Config_Save();
 }
 
 void Config_Init(void)
@@ -190,6 +243,7 @@ void Config_Init(void)
     memset(&g_typecal, 0, sizeof(g_typecal));
 
     Config_Load();
+    config_clamp();   /* 收敛越界字段, 见上 */
     Cal_Init();
     TypeCal_Init();
 }
@@ -330,32 +384,32 @@ bool Config_Reset(void)
 
 /* ==================== 校准数据独立页 ==================== */
 
-/* 校准点按温度点索引 0..5 ↔ 100/200/300/350/400/450.
+/* 校准点按温度点索引 0..4 ↔ 200/300/350/400/450.
  * 各字段在 cal_t 内按型号连续排布, 用基址 + idx*HANDLE_NUM + h 统一寻址,
- * 免去 6 行逐字段判断 */
+ * 免去 5 行逐字段判断 */
 
 int8_t Cal_GetOff(uint8_t idx, uint8_t h)
 {
     if (idx >= CAL_POINT_NUM || h >= HANDLE_NUM)
         return 0;
-    return ((int8_t *)&g_cal.cal_off_100)[idx * HANDLE_NUM + h];
+    return ((int8_t *)&g_cal.cal_off_200)[idx * HANDLE_NUM + h];
 }
 
 void Cal_SetOff(uint8_t idx, uint8_t h, int8_t v)
 {
     if (idx >= CAL_POINT_NUM || h >= HANDLE_NUM)
         return;
-    ((int8_t *)&g_cal.cal_off_100)[idx * HANDLE_NUM + h] = v;
+    ((int8_t *)&g_cal.cal_off_200)[idx * HANDLE_NUM + h] = v;
 }
 
 uint16_t Cal_GetAdc(uint8_t idx, uint8_t h)
 {
     if (idx >= CAL_POINT_NUM || h >= HANDLE_NUM)
         return 0;
-    return ((uint16_t *)&g_cal.cal_adc_100)[idx * HANDLE_NUM + h];
+    return ((uint16_t *)&g_cal.cal_adc_200)[idx * HANDLE_NUM + h];
 }
 
-/* 型号校准有效性: 6 个 ADC 校准点须严格单调递增且首点非 0(对应 adc_to_temp
+/* 型号校准有效性: 5 个 ADC 校准点须严格单调递增且首点非 0(对应 adc_to_temp
  * 的防退化判定). 非法时测温会退化线性映射, 读数偏差大, 需重新校准. */
 bool Cal_IsHandleValid(uint8_t h)
 {
@@ -364,22 +418,21 @@ bool Cal_IsHandleValid(uint8_t h)
             Cal_GetAdc(1, h) > Cal_GetAdc(0, h) &&
             Cal_GetAdc(2, h) > Cal_GetAdc(1, h) &&
             Cal_GetAdc(3, h) > Cal_GetAdc(2, h) &&
-            Cal_GetAdc(4, h) > Cal_GetAdc(3, h) &&
-            Cal_GetAdc(5, h) > Cal_GetAdc(4, h));
+            Cal_GetAdc(4, h) > Cal_GetAdc(3, h));
 }
 
-/* 校准偏移的范围校验: 六个温度点 × 每型号(共 CAL_POINT_NUM*HANDLE_NUM 个)
+/* 校准偏移的范围校验: 五个温度点 × 每型号(共 CAL_POINT_NUM*HANDLE_NUM 个)
  * 必须全部落在 ±CAL_OFF_LIMIT 内.
  * 为何必须校验: 偏移经 cal_offset_interp → spline_interp **直接叠加到读温**上.
  * 越界值(如 -128)会让报温严重偏低, PID 因此持续满功率 → 实际温度远超设定(不安全方向);
  * 页面也会因 '0' + |v|/10 拼出非数字字符.
  * 正常路径(页面编辑 + Cal_SetOff)恒写入钳位后的值, 故越界只可能来自版本迁移
  * (cal_migrate_v10 的 memcpy)或"CRC 自洽但语义越界"的存量数据.
- * 布局前提: 六个偏移数组在 cal_t 内连续无填充 —— 与 Cal_GetOff/Cal_SetOff 的指针
+ * 布局前提: 五个偏移数组在 cal_t 内连续无填充 —— 与 Cal_GetOff/Cal_SetOff 的指针
  * 步进访问同一假设, 已由上面的 guard_cal_off_contiguous 编译期守卫保证. */
 static bool cal_offsets_valid(void)
 {
-    const int8_t *off = (const int8_t *)&g_cal.cal_off_100;
+    const int8_t *off = (const int8_t *)&g_cal.cal_off_200;
     uint8_t i;
 
     for (i = 0; i < (uint8_t)(CAL_POINT_NUM * HANDLE_NUM); i++)

@@ -22,3 +22,7 @@ outputs/
 # 杂项
 NUL
 *.bak
+
+# Python 缓存（build_tools 脚本运行产物）
+__pycache__/
+*.pyc

@@ -33,6 +33,10 @@
 10. 索引 0..count-1 全部出现且不重复(无空洞/无重号)
 11. 非占位项的 .name 非空(列表要显示)
 12. menu_max_num 的初始化表达式与解析出的项数一致
+13. 外部硬编码的 *_MENU_ID 宏(如 page/cur_cal.h 的 CUR_CAL_MENU_ID):
+    值必须在表项数范围内, 且由宏名推导的期望 ops 与目标节点实际 ops 一致
+    —— 重排菜单表索引时最易漏的一处. 值越界时 Menu_SetCurrentId 的范围检查会
+    **静默丢弃**该跳转(功能失效但不报错); 值落在合法范围内却指向别的节点则更隐蔽
 
 用法
 ----
@@ -288,6 +292,27 @@ def main():
             hops += 1
         if walk != MENU_NO_PARENT:
             add("[%d] 沿 parent 链 %d 步内未到达虚拟根(孤岛或父级环)" % (i, hops))
+
+    # --- 13. 外部硬编码的 *_MENU_ID 宏 ---
+    import glob
+    hdrs = []
+    for sub in ('page', 'main', 'menu', 'bsp', 'ctrl'):
+        hdrs += sorted(glob.glob(os.path.join(root, sub, '*.h')))
+    for fp in hdrs:
+        txt = open(fp, encoding='utf-8-sig').read()
+        rel = os.path.relpath(fp, root)
+        for mm in re.finditer(r'#define\s+(\w*_MENU_ID)\s+(\d+)', txt):
+            mname, mval = mm.group(1), int(mm.group(2))
+            if mval >= count:
+                add("%s = %d 越界(表项数 %d): %s 的跳转会被 Menu_SetCurrentId 静默丢弃"
+                    % (mname, mval, count, rel))
+                continue
+            exp_ops = mname[:-len('_MENU_ID')].lower() + '_ops'
+            if exp_ops in ops_defs:
+                got = ops_name(entries.get(mval, {}).get('ops'))
+                if got != exp_ops:
+                    add("%s = %d 指向节点 ops=%s, 期望 %s (%s 未随菜单表同步)"
+                        % (mname, mval, got, exp_ops, rel))
 
     if problems:
         print("menu_table 配置错误 %d 处:" % len(problems))

@@ -6,7 +6,6 @@
 #include "config.h"
 #include "temp.h"
 #include "pid.h"
-#include "heater.h"
 #include "buzzer.h"
 #include <string.h>
 

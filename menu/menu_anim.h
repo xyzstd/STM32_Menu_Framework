@@ -8,6 +8,18 @@
  * 负责选中框滑动(ANIM_BAR)与整页滑入(ANIM_PAGE)的状态机。
  * 渲染层(menu_display.c)只调用本模块的控制接口和查询接口,
  * 不关心动画内部步进/插值细节。
+ *
+ * ⚠️ 当前状态: **未接入**。本模块未加入 Project.uvprojx 构建(不参与编译/链接),
+ *    且 menu_display.h 的 MENU_ANIM_ENABLE = 0。它只是"保留备用", 不是"开箱可用"。
+ *
+ * 若要启用(需要真机调手感, 代码从未跑过), 三件事缺一不可:
+ *   1) 把 menu/menu_anim.c(与 .h)加回工程(Keil: 右键 menu 组 → Add Existing Files);
+ *   2) 在 menu_display.h 置 MENU_ANIM_ENABLE = 1;
+ *   3) **渲染层接入** —— 现在 menu_list_render 是按固定行高直接绘制的, 完全没读
+ *      AnimNav_BarY()/AnimNav_PageOffset(); 需在导航时调 AnimNav_StartBar/
+ *      StartPage, 并在绘制时用它们做偏移, 否则打开宏也不会有任何动画。
+ *      另需确保 ui_task 注册的 MenuDisplay_SetRefreshHook() 能驱动周期刷新。
+ * 代价: 约 +284 B Flash(Release-HW), 动画期间周期性重绘。
  *====================================================================*/
 
 #define ANIM_STEPS   8U        /* 每段动画帧数(20ms/帧 ≈ 160ms) */

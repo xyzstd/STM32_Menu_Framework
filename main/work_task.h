@@ -69,6 +69,10 @@ int16_t WorkTask_GetMeasuredTemp(void);
 /* 获取当前加热功率 */
 int16_t WorkTask_GetPower(void);
 
+/* 最近一次自整定结果是否已成功写入 Flash.
+ * 仅当 PID_TuneLastSucceeded() 为 true 时有意义. */
+bool WorkTask_TuneSaveSucceeded(void);
+
 /* 获取加热百分比 (0~100) */
 uint8_t WorkTask_GetPowerPercent(void);
 
