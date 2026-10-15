@@ -22,11 +22,31 @@
 #define INPUT_KEY_RESERVED_SLOTS    4u
 #define INPUT_ENCODER_MAX_AGE_MS   12u
 
-/* 队列头尾用 uint8_t, 空槽法需留 1 格; 掩码求占用量要求容量为 2 的幂. */
+/* 每轮主循环最多分发的事件数。
+ * 常规 2: 配合渲染层 UI_RENDER_COOLDOWN_MS(2ms) 合并窗口, 快速旋转时逐格跟手。
+ * 队列中已有按键待处理时放宽到 8: 按键**不插队** —— 队列里积压的旋转是"按键之前
+ * 产生、且尚未显示"的输入(menu_notify 是 dispatch 与 UI_RequestRefresh 绑定的),
+ * 让按键插到它们前面会把按键落到过期的选中项上(点错目标), 随后那几格旋转再落进
+ * 新页面, 与"进子菜单卡一格"是同一类错位。所以只加速排空、不改顺序, 使按键延迟
+ * 从 "N 轮" 降到 "约 1 轮"。放宽期间渲染仍受 2ms 合并窗口约束, 不会连刷。 */
+#define INPUT_DRAIN_NORMAL  2u
+#define INPUT_DRAIN_BURST   8u
+
+/* 消费上限守卫: 放宽值必须严格大于常规值(否则"按键在场时加速排空"名不副实,
+ * 等于没放宽), 且常规值至少为 1(否则队列永不被消费). 违反即负数组长度 = 编译失败. */
+typedef char input_drain_budget_must_be_valid[
+    (INPUT_DRAIN_NORMAL >= 1u && INPUT_DRAIN_NORMAL < INPUT_DRAIN_BURST) ? 1 : -1];
+
+/* 队列头尾用 uint8_t, 空槽法需留 1 格; 掩码求占用量要求容量为 2 的幂.
+ * 另加两条, 守卫"按键永不因编码器刷太快而进不了队"这一性质:
+ *   - INPUT_KEY_RESERVED_SLOTS >= 1: 预留为 0 时下面的"容量 > 预留+1"依然成立,
+ *     守卫形同虚设, 而编码器会一路填满队列, 按键在队满时照样被丢 —— 静默失效.
+ *   - 容量 > 预留+1: 保证"编码器可占格数"为正, 且至少留 1 格空槽给满/空判定. */
 typedef char input_evt_queue_size_must_be_valid[
     (INPUT_EVT_QUEUE_SIZE >= 2u &&
      INPUT_EVT_QUEUE_SIZE <  256u &&   /* uint8_t head/tail 无法表示容量 256 */
      (INPUT_EVT_QUEUE_SIZE & (INPUT_EVT_QUEUE_SIZE - 1u)) == 0u &&
+     INPUT_KEY_RESERVED_SLOTS >= 1u &&
      INPUT_EVT_QUEUE_SIZE > INPUT_KEY_RESERVED_SLOTS + 1u) ? 1 : -1];
 
 typedef struct {
@@ -204,17 +224,21 @@ static void input_scan(void)
 }
 
 
-/* 主循环每轮最多分发 2 个新鲜事件。编码器旧事件超龄即丢弃；否则在 Flash/长测量
+/* 主循环每轮分发事件: 常规上限 INPUT_DRAIN_NORMAL 个(配合渲染合并窗口逐格跟手),
+ * 队列中已有按键待处理时放宽到 INPUT_DRAIN_BURST 个 —— 顺序完全不变, 只是把排在
+ * 按键前面的积压旋转快速吐完(见 INPUT_DRAIN_* 处说明)。
+ * 编码器旧事件超龄即丢弃；否则在 Flash/长测量
  * 阻塞恢复后，队列会把过期旋转逐格补执行，表现为突然跳格，甚至在页面已变后误操作.
- * 按键事件有预留槽且不超龄丢弃；过期旋转在这里快速跳过，不占本轮 2 个有效事件额度.
+ * 按键事件有预留槽且不超龄丢弃；过期旋转在这里快速跳过，不占本轮有效事件额度.
  * 检测到跨页面/列表上下文后清空剩余队列，并重同步编码器半格相位，避免旧上下文积压输入带入新页面. */
 void Input_Process(void)
 {
     input_evt_t evt;
     menu_cmd_t cmd;
     uint8_t n = 0;
+    uint8_t budget = Input_HasKeyPending() ? INPUT_DRAIN_BURST : INPUT_DRAIN_NORMAL;
 
-    while (n < 2 && evt_dequeue(&evt))
+    while (n < budget && evt_dequeue(&evt))
     {
         uint16_t now16 = (uint16_t)Timer_GetTick();
         uint16_t age16 = (uint16_t)(now16 - evt.tick16);
@@ -232,16 +256,14 @@ void Input_Process(void)
         menu_notify(&cmd);
 
         if (menu_ctx() != ctx_before)
-        {
-            Input_ClearEvents();     /* 上下文已变: 丢弃仍排队的旧输入 */
-            Input_ResyncEncoder();   /* 同时丢弃编码器未满一格的残留相位 */
-        }
+            Input_ResetForJump();   /* 上下文已变: 清积压事件 + 重同步编码器相位 */
     }
 }
 
 
-/* 重同步编码器相位(丢弃未满一格的残留计数), 供菜单跳转后调用.
- * 与 Input_ClearEvents 同层暴露: 页面/调度层(如 page/cur_cal.c、main/ui_task.c)
+/* 重同步编码器相位(丢弃未满一格的残留计数).
+ * 常规调用路径是 Input_ResetForJump(它同时清队列) —— 单独用本函数只在"不需要
+ * 丢事件、只想丢半格残留"的场合。与 Input_ClearEvents 同层暴露: 页面/调度层
  * 只依赖 input.h, 不直接触碰 bsp/encoder.h. */
 void Input_ResyncEncoder(void)
 {
@@ -259,4 +281,39 @@ void Input_ResyncEncoder(void)
 void Input_ClearEvents(void)
 {
     evt_q.head = evt_q.tail;   /* 消费到队尾 = 逻辑清空; 生产者无感知 */
+}
+
+
+/* 页面切换后的输入复位(见 input.h): 清队列 + 重同步编码器相位。
+ * 只是把两件事打包, 本身不做事 —— 目的是让"跳转后复位"成为一个不可拆错的动作:
+ * 原先 ui_task 故障跳转、CurCal_BootEnter、input.c 的 ctx 变化路径各自手写这两行,
+ * 三份重复且顺序不一(前两处是"先清后跳", 会漏掉跳转落盘期间入队的事件)。 */
+void Input_ResetForJump(void)
+{
+    Input_ClearEvents();
+    Input_ResyncEncoder();
+}
+
+
+/* 队列中是否有按键事件待处理(见 input.h): 只读扫描, 不改 head/tail。
+ * 并发安全: 快照 head 与 tail 后只读 [head, tail) 区间 —— 生产者(1ms 中断)是先写
+ * buf[tail] 再推进 tail, 故该区间内的槽位必已写完; 扫描期间生产者只会往更后面追加,
+ * 不会改写本区间。tail 快照之后新入队的按键本次看不到, 下一轮即见 —— 作为"是否放宽
+ * 本轮消费上限"的启发式判据, 这个时间差无影响。 */
+bool Input_HasKeyPending(void)
+{
+    uint8_t i   = evt_q.head;
+    uint8_t end = evt_q.tail;
+
+    while (i != end)
+    {
+        uint8_t e = evt_q.buf[i].event;
+
+        if (e == MENU_EVENT_CLICK || e == MENU_EVENT_LPRESS)
+            return true;
+
+        i = (uint8_t)((i + 1u) % INPUT_EVT_QUEUE_SIZE);
+    }
+
+    return false;
 }

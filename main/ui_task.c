@@ -62,9 +62,12 @@ void UI_Task_Process(void)
         {
             /* 调节态的清理不必在此手工做: 若当前停在单参数页上, Menu_SetCurrentId
              * 会经 menu_exit_handler 调该页 ops->exit(内含 param_exit 落盘)。 */
-            Input_ClearEvents(); /* 丢弃原页面积压事件, 防 HOME 错位消费(误下钻/恢复/调温) */
-            Input_ResyncEncoder(); /* 故障跳转非事件触发: 一并重同步编码器相位, 防跳转后第一格被残留吃掉 */
             Menu_SetCurrentId(MENU_HOME_ID);
+            /* 输入复位必须在**跳转之后**: 上面这次跳转会经 exit 落盘(参数页 dirty 时
+             * param_exit → Config_Save() 擦写 Flash 25~50ms), 期间 TIM2 照常把编码器/
+             * 按键事件入队 —— 先清后跳会漏掉这一批, 它们会被 HOME 错位消费
+             * (误下钻/误恢复/误调温), 正是本兜底想防的事。 */
+            Input_ResetForJump();
             UI_RequestRefresh();
         }
         ui_fault_prev = fault;
@@ -77,11 +80,11 @@ void UI_Task_Process(void)
     if (WorkTask_IsBootCalPending() && !WorkTask_HasFault() &&
         Menu_GetCurrentId() == MENU_HOME_ID)
     {
-        /* 与上方故障上升沿路径对称: 跳页前丢弃积压事件,
-         * 防止引导切页后残留 UP/DOWN 意外切换 Tip Cal 预选型号(cal_lock=false)。
+        /* 输入复位不在此做: CurCal_BootEnter 会在**跳转之后**自己调
+         * Input_ResetForJump(清队列 + 重同步编码器相位), 已足以覆盖"残留 UP/DOWN
+         * 意外切换 Tip Cal 预选型号(cal_lock=false)"。此处再清一次只是重复, 且
+         * "先清后跳"的顺序还会漏掉跳转落盘期间入队的事件。
          * (调节态清理同故障路径, 由 Menu_SetCurrentId → menu_exit_handler 完成。) */
-        Input_ClearEvents();
-        Input_ResyncEncoder(); /* 引导跳转非事件触发: 一并重同步编码器相位 */
         CurCal_BootEnter();
         UI_RequestRefresh();
     }

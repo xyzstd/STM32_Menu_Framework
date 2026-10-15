@@ -296,9 +296,12 @@ void CurCal_BootEnter(void)
         cal_lock = false;
         cal_idx  = WorkTask_MatchTipType(WorkTask_GetTipCur());
     }
-    Input_ClearEvents();   /* 跳转前丢弃积压事件, 防目标页错位消费 */
-    Input_ResyncEncoder(); /* 非事件触发跳转: 一并重同步编码器相位 */
     Menu_SetCurrentId(CUR_CAL_MENU_ID);
+    /* 输入复位必须在**跳转之后**: 跳转会经 menu_exit_handler 调当前页的 exit, 若那
+     * 是参数页且 dirty 会落盘(Flash 擦写 25~50ms), 期间 TIM2 照常把编码器/按键事件
+     * 入队 —— 先清后跳会漏掉这一批, 它们会被本页错位消费(误切 Tip Cal 预选型号,
+     * cal_lock=false 时尤其明显)。详见 Input_ResetForJump 的说明。 */
+    Input_ResetForJump();
 }
 
 const menu_ops_t cur_cal_ops = {
