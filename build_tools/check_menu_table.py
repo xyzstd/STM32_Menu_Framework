@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""构建期校验 menu/menu_table.c —— 与内核 menu_validate_table() 逐条对齐.
+"""构建期校验 menu/menu_table.c —— 表内 parent/child 关系的**唯一**防线.
 
 为什么需要它
 ------------
-菜单表配错(索引 0 不是占位虚拟根 / HOME 不在索引 1 / parent-child 不一致等)时,
-内核 menu_validate_table() 会失败并**静默降级**: 保持虚拟根+列表态, 所有导航入口
-停用 —— 现象只有"上电后按键完全无反应", 没有日志也没有提示, 极难定位.
+菜单表配错(索引 0 不是占位虚拟根 / HOME 不在索引 1 / parent-child 不一致等)会导致
+导航异常甚至越界访问. 内核不再保留运行期表校验(为简洁移除), 故本脚本是唯一防线:
+改表即报错, 不必上机.
 
 而 C99 下 const 数组成员**不是整数常量表达式**, menu_table[3].first_child 这类
 取值不能用于数组长度或 case 标签, 所以表内 parent/child 关系无法用编译期断言覆盖
 (menu_table.c 里只放了"项数不超索引宽度"这类由 sizeof 得出的守卫).
 
-于是把同样的校验前移到构建期: 改表即报错, 不必上机.
+于是把校验前移到构建期.
 
-检查项(与 menu_validate_table 一致)
-----------------------------------
+检查项
+------
  1. 项数 > MENU_HOME_ID, 且 <= 255(索引为 uint8_t)
  2. 索引 0 是占位虚拟根: parent=0, ops=NULL, child_num!=0, first_child!=0,
     且 [first_child, first_child+child_num) 覆盖索引 1(含边界不越界)

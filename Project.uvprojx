@@ -708,18 +708,8 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>sys</GroupName>
+          <GroupName>basetime</GroupName>
           <Files>
-            <File>
-              <FileName>delay.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\sys\delay.c</FilePath>
-            </File>
-            <File>
-              <FileName>delay.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\sys\delay.h</FilePath>
-            </File>
             <File>
               <FileName>timer.c</FileName>
               <FileType>1</FileType>
@@ -1041,9 +1031,14 @@
               <FilePath>.\main\ui_task.h</FilePath>
             </File>
             <File>
-              <FileName>stm32f10x_conf.h</FileName>
+              <FileName>work_task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\main\work_task.c</FilePath>
+            </File>
+            <File>
+              <FileName>work_task.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\main\stm32f10x_conf.h</FilePath>
+              <FilePath>.\main\work_task.h</FilePath>
             </File>
             <File>
               <FileName>stm32f10x_it.c</FileName>
@@ -1056,14 +1051,9 @@
               <FilePath>.\main\stm32f10x_it.h</FilePath>
             </File>
             <File>
-              <FileName>work_task.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\main\work_task.c</FilePath>
-            </File>
-            <File>
-              <FileName>work_task.h</FileName>
+              <FileName>stm32f10x_conf.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\main\work_task.h</FilePath>
+              <FilePath>.\main\stm32f10x_conf.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -1771,18 +1761,8 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>sys</GroupName>
+          <GroupName>basetime</GroupName>
           <Files>
-            <File>
-              <FileName>delay.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\sys\delay.c</FilePath>
-            </File>
-            <File>
-              <FileName>delay.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\sys\delay.h</FilePath>
-            </File>
             <File>
               <FileName>timer.c</FileName>
               <FileType>1</FileType>
@@ -2104,9 +2084,14 @@
               <FilePath>.\main\ui_task.h</FilePath>
             </File>
             <File>
-              <FileName>stm32f10x_conf.h</FileName>
+              <FileName>work_task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\main\work_task.c</FilePath>
+            </File>
+            <File>
+              <FileName>work_task.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\main\stm32f10x_conf.h</FilePath>
+              <FilePath>.\main\work_task.h</FilePath>
             </File>
             <File>
               <FileName>stm32f10x_it.c</FileName>
@@ -2119,14 +2104,9 @@
               <FilePath>.\main\stm32f10x_it.h</FilePath>
             </File>
             <File>
-              <FileName>work_task.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\main\work_task.c</FilePath>
-            </File>
-            <File>
-              <FileName>work_task.h</FileName>
+              <FileName>stm32f10x_conf.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\main\work_task.h</FilePath>
+              <FilePath>.\main\stm32f10x_conf.h</FilePath>
             </File>
           </Files>
         </Group>
