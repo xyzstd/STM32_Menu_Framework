@@ -1,4 +1,5 @@
-﻿#include "stm32f10x.h"
+﻿#include "ui_task.h"
+#include "stm32f10x.h"
 #include "timer.h"
 #include "menu_display.h"
 #include "menu.h"
@@ -22,6 +23,68 @@ static uint32_t ui_last_render_tick = 0;
 static volatile bool ui_refresh_request = false;
 static bool ui_fault_prev = false;   /* 上一轮故障态, 用于上升沿检测 */
 static bool toast_pending_prev = false;   /* 上一轮提示框是否仍在显示 */
+
+
+/* 渲染一帧并记录节拍: 清请求 → 更新时间戳 → 取本页要求的刷新周期 → 叠加提示框.
+ * 两条触发路径(事件请求 / 周期到期)共用, 免得同一段六行写两遍、改一处漏一处. */
+static void ui_render(uint32_t now)
+{
+    ui_refresh_request = false;
+    ui_last_render_tick = now;
+    ui_refresh_tick     = now;
+    ui_refresh_period   = MenuDisplay_Render();
+    (void)Toast_Overlay();   /* 渲染后叠加保存框 */
+}
+
+/* 锁存故障兜底: 任意页面发生故障(热电偶/过温/加热器)时回到常驻页 HOME 统一处理.
+ * HOME 显示故障码, 长按走 WorkTask_Recover. 蜂鸣报警已由 work_task 在锁存点触发,
+ * 此处只管导航. 仅上升沿触发一次. */
+static void ui_watch_fault(bool fault)
+{
+    if (fault && !ui_fault_prev)
+    {
+        /* 调节态的清理不必在此手工做: 若当前停在单参数页上, Menu_SetCurrentId
+         * 会经 menu_exit_handler 调该页 ops->exit(内含 param_exit 落盘)。 */
+        Menu_SetCurrentId(MENU_HOME_ID);
+        /* 输入复位必须在**跳转之后**: 上面这次跳转会经 exit 落盘(参数页 dirty 时
+         * param_exit → Config_Save() 擦写 Flash 25~50ms), 期间 TIM2 照常把编码器/
+         * 按键事件入队 —— 先清后跳会漏掉这一批, 它们会被 HOME 错位消费
+         * (误下钻/误恢复/误调温), 正是本兜底想防的事。 */
+        Input_ResetForJump();
+        UI_RequestRefresh();
+    }
+    ui_fault_prev = fault;
+}
+
+/* 首次冷态标定引导: 上电自检通过且当前型号未标定时, 自动进入 Cur Cal 引导页
+ * (First Cal), 用户标定完成或跳过后清除引导标志.
+ * 仅当处于 HOME 且无故障时触发一次 —— 进入 Cur Cal 后当前页即离开 HOME,
+ * 不会重复触发; 故障存在时让位给 ui_watch_fault. */
+static void ui_watch_boot_cal(bool fault)
+{
+    if (!WorkTask_IsBootCalPending() || fault || Menu_GetCurrentId() != MENU_HOME_ID)
+        return;
+
+    /* 输入复位不在此做: CurCal_BootEnter 会在**跳转之后**自己调
+     * Input_ResetForJump(清队列 + 重同步编码器相位), 已足以覆盖"残留 UP/DOWN
+     * 意外切换 Tip Cal 预选型号(cal_lock=false)"。此处再清一次只是重复, 且
+     * "先清后跳"的顺序还会漏掉跳转落盘期间入队的事件。 */
+    CurCal_BootEnter();
+    UI_RequestRefresh();
+}
+
+/* 提示框到期: 上一帧还在、现在没了 → 请求一帧重绘, 把叠加框擦掉
+ * (页面重绘后 Toast_Overlay 不再画). Toast_Pending() 有副作用(到期会顺手清
+ * 状态), 故每帧只取一次, 别在条件里再调一遍. */
+static void ui_watch_toast(void)
+{
+    bool pending = Toast_Pending();
+
+    if (toast_pending_prev && !pending)
+        UI_RequestRefresh();
+
+    toast_pending_prev = pending;
+}
 
 
 void UI_RequestRefresh(void)
@@ -52,70 +115,22 @@ void UI_Task_Process(void)
 {
     uint32_t now = Timer_GetTick();
 
-    /* 锁存故障 UI 兜底: 任意页面发生故障(热电偶/过温/加热器)时回到常驻页 HOME
-     * 统一处理. 蜂鸣报警已由 work_task 锁存点全局触发; HOME 显示故障码,
-     * 长按走 WorkTask_Recover 重跑安全检测状态机. 仅上升沿触发一次. */
-    {
-        bool fault = WorkTask_HasFault();
+    bool     fault = WorkTask_HasFault();
 
-        if (fault && !ui_fault_prev)
-        {
-            /* 调节态的清理不必在此手工做: 若当前停在单参数页上, Menu_SetCurrentId
-             * 会经 menu_exit_handler 调该页 ops->exit(内含 param_exit 落盘)。 */
-            Menu_SetCurrentId(MENU_HOME_ID);
-            /* 输入复位必须在**跳转之后**: 上面这次跳转会经 exit 落盘(参数页 dirty 时
-             * param_exit → Config_Save() 擦写 Flash 25~50ms), 期间 TIM2 照常把编码器/
-             * 按键事件入队 —— 先清后跳会漏掉这一批, 它们会被 HOME 错位消费
-             * (误下钻/误恢复/误调温), 正是本兜底想防的事。 */
-            Input_ResetForJump();
-            UI_RequestRefresh();
-        }
-        ui_fault_prev = fault;
-    }
+    /* 三个边沿检测各管一件事, 与渲染决策分开读 */
+    ui_watch_fault(fault);      /* 锁存故障 → 回 HOME 兜底 */
+    ui_watch_boot_cal(fault);   /* 首次标定 → 自动进引导页 */
+    ui_watch_toast();           /* 提示框到期 → 擦掉叠加框 */
 
-    /* 首次冷态标定引导: 上电自检通过且当前型号未标定时, 自动进入 Cur Cal
-     * 引导页 (First Cal), 用户标定完成或跳过后清除引导标志.
-     * 仅当处于 HOME 且无故障时触发一次(进入 Cur Cal 后当前页即离开 HOME,
-     * 不会重复触发); 故障存在时让位给上方故障兜底处理. */
-    if (WorkTask_IsBootCalPending() && !WorkTask_HasFault() &&
-        Menu_GetCurrentId() == MENU_HOME_ID)
-    {
-        /* 输入复位不在此做: CurCal_BootEnter 会在**跳转之后**自己调
-         * Input_ResetForJump(清队列 + 重同步编码器相位), 已足以覆盖"残留 UP/DOWN
-         * 意外切换 Tip Cal 预选型号(cal_lock=false)"。此处再清一次只是重复, 且
-         * "先清后跳"的顺序还会漏掉跳转落盘期间入队的事件。
-         * (调节态清理同故障路径, 由 Menu_SetCurrentId → menu_exit_handler 完成。) */
-        CurCal_BootEnter();
-        UI_RequestRefresh();
-    }
-
-
-    /* 提示框到期: Toast_Pending() 会顺手清掉到期状态, 这里发现"上一帧还在、
-     * 现在没了"就请求一帧重绘, 把叠加框擦掉(页面重绘后 Toast_Overlay 不再画). */
-    if (toast_pending_prev && !Toast_Pending())
-        UI_RequestRefresh();
-    toast_pending_prev = Toast_Pending();
-
-    if(ui_refresh_request)
+    if (ui_refresh_request)
     {
         /* 合并帧: 距上次渲染不足窗口则保留请求稍后渲染一次最新状态,
          * 防止快速旋转时每格都全量重绘抢占输入; 到点消费并重绘. */
-        if((now - ui_last_render_tick) < UI_RENDER_COOLDOWN_MS)
-            return;
-        ui_refresh_request = false;
-        ui_last_render_tick = now;
-        ui_refresh_tick = now;
-        ui_refresh_period = MenuDisplay_Render();
-        (void)Toast_Overlay();   /* 渲染后叠加保存框 */
+        if ((now - ui_last_render_tick) >= UI_RENDER_COOLDOWN_MS)
+            ui_render(now);
     }
-    else if(ui_refresh_period != 0)
+    else if (ui_refresh_period != 0 && (now - ui_refresh_tick) >= ui_refresh_period)
     {
-        if((now - ui_refresh_tick) >= ui_refresh_period)
-        {
-            ui_refresh_tick = now;
-            ui_last_render_tick = now;
-            ui_refresh_period = MenuDisplay_Render();
-            (void)Toast_Overlay();   /* 渲染后叠加保存框 */
-        }
+        ui_render(now);   /* 本页要求的周期刷新到期 */
     }
 }

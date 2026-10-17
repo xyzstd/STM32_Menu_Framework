@@ -20,6 +20,9 @@
 #define INPUT_EVT_QUEUE_SIZE       32u
 #define INPUT_EVT_QUEUE_MASK       (INPUT_EVT_QUEUE_SIZE - 1u)
 #define INPUT_KEY_RESERVED_SLOTS    4u
+/* 编码器可占用格数: 容量 − 1 个空槽判定位 − 按键预留槽.
+ * 命名出来, 免得 evt_enqueue 里每次现算三个常量相减(读者要自己验算式). */
+#define INPUT_ENCODER_MAX_SLOTS    (INPUT_EVT_QUEUE_SIZE - 1u - INPUT_KEY_RESERVED_SLOTS)
 #define INPUT_ENCODER_MAX_AGE_MS   12u
 
 /* 每轮主循环最多分发的事件数。
@@ -77,37 +80,39 @@ static struct{
     volatile uint8_t tail;
 }evt_q;
 
-static void evt_enqueue(uint8_t event, int8_t step);
-static bool evt_dequeue(input_evt_t *out);
 
-static void menu_notify(menu_cmd_t *cmd);
+/* 队列占用量(含按键预留槽). 空槽法下最大为 SIZE-1.
+ * 容量是 2 的幂(编译期守卫), 故用掩码而非取模. */
+static inline uint8_t evt_used(void)
+{
+    return (uint8_t)((uint8_t)(evt_q.tail - evt_q.head) & INPUT_EVT_QUEUE_MASK);
+}
 
-static uint16_t menu_ctx(void);
-
-static void on_key_event(key_event_t evt);
-
-static void encoder_process(void);
-
-static void input_scan(void);
-
+/* 按键事件 = 需要预留槽的那一类: 旋转可以丢, 按键不能丢 */
+static inline bool is_key_event(uint8_t event)
+{
+    return event == MENU_EVENT_CLICK || event == MENU_EVENT_LPRESS;
+}
 
 static void evt_enqueue(uint8_t event, int8_t step)
 {
-    uint8_t next = (uint8_t)((evt_q.tail + 1u) % INPUT_EVT_QUEUE_SIZE);
-    uint8_t used = (uint8_t)((uint8_t)(evt_q.tail - evt_q.head) & INPUT_EVT_QUEUE_MASK);
-    bool is_key_event = (event == MENU_EVENT_CLICK || event == MENU_EVENT_LPRESS);
+    uint8_t next = (uint8_t)((evt_q.tail + 1u) & INPUT_EVT_QUEUE_MASK);
+    input_evt_t *slot;
 
     /* 编码器不能占用预留槽: 主循环短时被 Flash/测量流程阻塞时，按键仍有位置入队. */
-    if (!is_key_event && used >= INPUT_EVT_QUEUE_SIZE - 1 - INPUT_KEY_RESERVED_SLOTS)
+    if (!is_key_event(event) && evt_used() >= INPUT_ENCODER_MAX_SLOTS)
         return;
 
     if (next == evt_q.head)
         return;   /* 极端情况下连按键预留槽也耗尽: 丢弃新事件，不改写消费者队列内容 */
 
-    evt_q.buf[evt_q.tail].tick16 = (uint16_t)Timer_GetTick();
-    evt_q.buf[evt_q.tail].step   = (int8_t)step;
-    evt_q.buf[evt_q.tail].event  = event;
-    evt_q.tail = next;
+    slot = &evt_q.buf[evt_q.tail];
+
+    slot->tick16 = (uint16_t)Timer_GetTick();
+    slot->step   = (int8_t)step;
+    slot->event  = event;
+
+    evt_q.tail = next;   /* 最后推进 tail 才算发布: 在此之前消费者看不到本槽 */
 }
 
 static bool evt_dequeue(input_evt_t *out)
@@ -116,10 +121,21 @@ static bool evt_dequeue(input_evt_t *out)
         return false;
 
     *out = evt_q.buf[evt_q.head];
-    evt_q.head = (uint8_t)((evt_q.head + 1) % INPUT_EVT_QUEUE_SIZE);
+    evt_q.head = (uint8_t)((evt_q.head + 1u) & INPUT_EVT_QUEUE_MASK);
     return true;
 }
 
+
+/* 列表态的方向反转: 正转(UP)在列表里是"下移". UP/DOWN 之外原样返回,
+ * 调用方不必先判类型 —— 把"只对方向事件生效"这一条件收进函数本身. */
+static inline menu_event_t menu_list_dir(menu_event_t event)
+{
+    if (event == MENU_EVENT_UP)
+        return MENU_EVENT_DOWN;
+    if (event == MENU_EVENT_DOWN)
+        return MENU_EVENT_UP;
+    return event;
+}
 
 /* 事件出口(主循环上下文): 唤醒 + 方向映射 + 分发 + 请求刷新.
  * 编码器入队语义为原始方向: 正向=UP(增大), 反向=DOWN. 消费时映射:
@@ -127,13 +143,10 @@ static bool evt_dequeue(input_evt_t *out)
  *   - 页面态(HANDLER, 含列表内就地调节项): 原样, 正转=UP=增大. */
 static void menu_notify(menu_cmd_t *cmd)
 {
-    uint8_t event = cmd->event;
-
     WorkTask_MarkActivity();
 
-    if(Menu_GetState() == MENU_STATE_NORMAL &&
-       (event == MENU_EVENT_UP || event == MENU_EVENT_DOWN))
-        cmd->event = (event == MENU_EVENT_UP) ? MENU_EVENT_DOWN : MENU_EVENT_UP;
+    if (Menu_GetState() == MENU_STATE_NORMAL)
+        cmd->event = menu_list_dir(cmd->event);
 
     Menu_EventDispatch(cmd);
     UI_RequestRefresh();
@@ -158,15 +171,16 @@ static void on_key_event(key_event_t evt)
 static uint16_t menu_ctx(void)
 {
     uint8_t id = Menu_GetCurrentId();
+    menu_state_t state = Menu_GetState();
 
-    if (Menu_GetState() == MENU_STATE_NORMAL)
+    /* NORMAL 态的身份是"当前列表的父级": 同一列表内移动选中项, 指纹不变. */
+    if (state == MENU_STATE_NORMAL)
     {
         const menu_item_t *item = Menu_GetItem(id);
-        id = (item != NULL) ? item->parent : 0xFFU;   /* 同一列表 = 共同父级 */
-        return (uint16_t)((uint16_t)MENU_STATE_NORMAL << 8 | id);
+        id = (item != NULL) ? item->parent : 0xFFU;
     }
 
-    return (uint16_t)((uint16_t)MENU_STATE_HANDLER << 8 | id);
+    return (uint16_t)((uint16_t)state << 8 | id);
 }
 
 
@@ -177,7 +191,8 @@ static uint16_t menu_ctx(void)
 static void encoder_process(void)
 {
     int16_t n = Encoder_GetSteps();
-    int16_t i;
+    uint8_t event;
+    uint8_t count;
 
     if (n == 0)
         return;
@@ -187,20 +202,13 @@ static void encoder_process(void)
     if (n > ENC_MAX_EVENTS_PER_POLL || n < -ENC_MAX_EVENTS_PER_POLL)
         return;
 
-    for (i = 0; i < n; i++)
-        evt_enqueue(MENU_EVENT_UP, 1);
-    for (i = 0; i > n; i--)
-        evt_enqueue(MENU_EVENT_DOWN, 1);
-}
+    /* 符号只决定方向, 次数统一取绝对值: 原来一正一负两个 for(后者 `i > n; i--`
+     * 是从 0 数到 |n|)要读者先算出各跑几次才敢确认. n 已限幅在 ±4 内, 取负不溢出. */
+    event = (n > 0) ? MENU_EVENT_UP : MENU_EVENT_DOWN;
+    count = (uint8_t)((n > 0) ? n : -n);
 
-
-void Input_Init(void)
-{
-    Encoder_Init();
-    Key_Init(&key, GPIOB, GPIO_Pin_8, on_key_event);
-    /* 把 1ms 采样挂到定时器节拍上: 由本层主动注册, 而不是让 sys/timer.c
-     * 反过来 include input.h 并直接调 Input_Scan —— 后者会让 sys/ 依赖 main/. */
-    Timer_SetTickCallback(input_scan);
+    while (count--)
+        evt_enqueue(event, 1);
 }
 
 
@@ -224,39 +232,64 @@ static void input_scan(void)
 }
 
 
-/* 主循环每轮分发事件: 常规上限 INPUT_DRAIN_NORMAL 个(配合渲染合并窗口逐格跟手),
- * 队列中已有按键待处理时放宽到 INPUT_DRAIN_BURST 个 —— 顺序完全不变, 只是把排在
- * 按键前面的积压旋转快速吐完(见 INPUT_DRAIN_* 处说明)。
- * 编码器旧事件超龄即丢弃；否则在 Flash/长测量
- * 阻塞恢复后，队列会把过期旋转逐格补执行，表现为突然跳格，甚至在页面已变后误操作.
- * 按键事件有预留槽且不超龄丢弃；过期旋转在这里快速跳过，不占本轮有效事件额度.
- * 检测到跨页面/列表上下文后清空剩余队列，并重同步编码器半格相位，避免旧上下文积压输入带入新页面. */
+/* 事件年龄(ms): tick16 是入队时刻的低 16 位, 无符号差值天然抗回绕 */
+static inline uint16_t evt_age_ms(const input_evt_t *evt)
+{
+    return (uint16_t)((uint16_t)Timer_GetTick() - evt->tick16);
+}
+
+/* 旋转事件 = 带"过期"语义的那一类(按键永不丢弃) */
+static inline bool is_encoder_evt(const input_evt_t *evt)
+{
+    return evt->event == MENU_EVENT_UP || evt->event == MENU_EVENT_DOWN;
+}
+
+/* 分发一条事件, 返回 true = 菜单上下文已变(调用方需复位输入) */
+static bool input_dispatch(const input_evt_t *evt)
+{
+    menu_cmd_t cmd;
+    uint16_t ctx_before = menu_ctx();
+
+    cmd.event = (menu_event_t)evt->event;
+    cmd.step  = evt->step;
+
+    menu_notify(&cmd);
+
+    return menu_ctx() != ctx_before;
+}
+
+
+void Input_Init(void)
+{
+    Encoder_Init();
+    Key_Init(&key, GPIOB, GPIO_Pin_8, on_key_event);
+    /* 把 1ms 采样挂到定时器节拍上: 由本层主动注册, 而不是让 sys/timer.c
+     * 反过来 include input.h 并直接调 Input_Scan —— 后者会让 sys/ 依赖 main/. */
+    Timer_SetTickCallback(input_scan);
+}
+
+
+/* 主循环每轮出队并分发事件. 三条规则, 与下面的编号一一对应:
+ *   ① 过期旋转(超 INPUT_ENCODER_MAX_AGE_MS)直接丢弃, 不占本轮额度、不在阻塞恢复后补执行;
+ *   ② 每轮消费上限 INPUT_DRAIN_NORMAL, 队列中有按键待处理时放宽到 INPUT_DRAIN_BURST;
+ *   ③ 分发后若菜单上下文指纹变化, 调 Input_ResetForJump 复位输入(清队列 + 重同步相位). */
 void Input_Process(void)
 {
     input_evt_t evt;
-    menu_cmd_t cmd;
     uint8_t n = 0;
     uint8_t budget = Input_HasKeyPending() ? INPUT_DRAIN_BURST : INPUT_DRAIN_NORMAL;
 
     while (n < budget && evt_dequeue(&evt))
     {
-        uint16_t now16 = (uint16_t)Timer_GetTick();
-        uint16_t age16 = (uint16_t)(now16 - evt.tick16);
-        uint16_t ctx_before;
+        /* ① 过期旋转丢弃: 不让旧输入在阻塞恢复后突然执行 */
+        if (is_encoder_evt(&evt) && evt_age_ms(&evt) > INPUT_ENCODER_MAX_AGE_MS)
+            continue;
 
-        if ((evt.event == MENU_EVENT_UP || evt.event == MENU_EVENT_DOWN) &&
-             age16 > INPUT_ENCODER_MAX_AGE_MS)
-            continue;   /* 丢弃过期旋转，不让旧输入在阻塞恢复后突然执行 */
+        n++;   /* ② 只有真正分发的才计入本轮额度 */
 
-        cmd.event = (menu_event_t)evt.event;
-        cmd.step  = evt.step;
-        ctx_before = menu_ctx();
-
-        n++;
-        menu_notify(&cmd);
-
-        if (menu_ctx() != ctx_before)
-            Input_ResetForJump();   /* 上下文已变: 清积压事件 + 重同步编码器相位 */
+        /* ③ 上下文已变: 清积压事件 + 重同步编码器相位 */
+        if (input_dispatch(&evt))
+            Input_ResetForJump();
     }
 }
 
@@ -307,12 +340,10 @@ bool Input_HasKeyPending(void)
 
     while (i != end)
     {
-        uint8_t e = evt_q.buf[i].event;
-
-        if (e == MENU_EVENT_CLICK || e == MENU_EVENT_LPRESS)
+        if (is_key_event(evt_q.buf[i].event))
             return true;
 
-        i = (uint8_t)((i + 1u) % INPUT_EVT_QUEUE_SIZE);
+        i = (uint8_t)((i + 1u) & INPUT_EVT_QUEUE_MASK);
     }
 
     return false;

@@ -32,16 +32,8 @@ void MenuDisplay_SetRefreshHook(void (*hook)(void))
 #endif
 }
 
-static void menu_window_reset(uint8_t index, uint8_t first, uint8_t count);
-static void menu_list_advance(uint8_t index, uint8_t first, uint8_t count);
-
-static void menu_draw_dot(int16_t yc);
-static void menu_draw_chevron(int16_t y);
-static void menu_reverse_row(int16_t y);
-
-static void menu_list_render(uint8_t first, uint8_t count, uint8_t index);
-static menu_period_t menu_list_display(void);
-static menu_period_t menu_page_display(void);
+/* 本文件的 static 函数均按依赖序定义(被调用者在前), 故无需前置声明.
+ * 新增函数时放在调用者之前即可 —— 否则 AC5 会因隐式声明直接报错(硬失败, 不静默). */
 
 
 /* 窗口复位: 顶行定格选中项, 高亮落在首行.
@@ -55,6 +47,22 @@ static void menu_window_reset(uint8_t index, uint8_t first, uint8_t count)
     win_top    = index;
     win_cursor = 0;
     win_prev   = index;
+}
+
+/* 选中项在两帧之间的移动方向: +1 下移 / -1 上移 / 0 未动.
+ * 首末位置必须按"环回值"识别 —— count-1→0 是下滚环回、0→count-1 是上卷环回;
+ * 只比大小会把这两者判成"跨 count-1 格的大跳", 动画方向就反了. */
+static int8_t menu_move_dir(uint8_t prev, uint8_t index, uint8_t count)
+{
+    if (prev == count - 1 && index == 0)
+        return 1;
+    if (prev == 0 && index == count - 1)
+        return -1;
+    if (index > prev)
+        return 1;
+    if (index < prev)
+        return -1;
+    return 0;
 }
 
 /* 环形窗口状态推进: 依当前选中下标(index)与上一帧(win_prev)更新 win_top/win_cursor。 */
@@ -72,31 +80,24 @@ static void menu_list_advance(uint8_t index, uint8_t first, uint8_t count)
     if (count > 1)
     {
         int16_t jump = (int16_t)index - (int16_t)win_prev;
+        /* 首末环回(|jump| == count-1): 仍走逐格滚动, 保留慢速环回的连贯动画 */
+        bool    wrap = (jump == (int16_t)(count - 1) || jump == -(int16_t)(count - 1));
 
         /* 快速旋转跳变(两帧间选中项跨多格, 且非首末环回): 跳过逐格动画,
-         * 保持高亮所在行不变, 窗口整体跟随选中项滑动, 消除"先到顶再掉回"的错位抖动.
-         * 首末环回(|jump|==count-1)仍走逐格滚动, 保留慢速环回的连贯动画. */
-        if (jump != (int16_t)(count - 1) && jump != -(int16_t)(count - 1))
+         * 保持高亮所在行不变, 窗口整体跟随选中项滑动, 消除"先到顶再掉回"的错位抖动. */
+        if (!wrap && (jump > 1 || jump < -1))
         {
-            if (jump > 1 || jump < -1)
-            {
-                int16_t top = (int16_t)index - (int16_t)win_cursor;
+            int16_t top = (int16_t)index - (int16_t)win_cursor;
 
-                while (top < 0)
-                    top += (int16_t)count;
-                win_top    = (uint8_t)(top % (int16_t)count);
-                win_prev   = index;
-                return;
-            }
+            while (top < 0)
+                top += (int16_t)count;
+            win_top    = (uint8_t)(top % (int16_t)count);
+            win_prev   = index;
+            return;
         }
 
         /* 移动方向仅 ±1, 首末处由环回值识别(跨界方向不歧义) */
-        int8_t dir = 0;
-
-        if      (win_prev == count - 1 && index == 0)          dir =  1;  /* 尾→首(下滚环回) */
-        else if (win_prev == 0 && index == count - 1)          dir = -1;  /* 首→尾(上卷环回) */
-        else if (index > win_prev)                             dir =  1;
-        else if (index < win_prev)                             dir = -1;
+        int8_t dir = menu_move_dir(win_prev, index, count);
 
         if (dir > 0)
         {
@@ -175,21 +176,22 @@ static void menu_reverse_row(int16_t y)
     {
         int16_t left  = x;
         int16_t right = x + width - 1;
-        int16_t dx    = 0;
+        /* 本行到最近圆心的垂直距离; < 0 表示不在圆角区(整行实心) */
+        int16_t dy    = -1;
 
         if (yy < radius)
-        {
-            int16_t dy = radius - 1 - yy;
-            while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius)
-                dx++;
-            left  = x + radius - dx;
-            right = x + width - radius + dx - 1;
-        }
+            dy = radius - 1 - yy;
         else if (yy >= height - radius)
+            dy = yy - (height - radius);
+
+        if (dy >= 0)
         {
-            int16_t dy = yy - (height - radius);
+            /* 圆角行: 由圆心距反解本行左右内缩量 dx */
+            int16_t dx = 0;
+
             while ((dx + 1) * (dx + 1) + dy * dy <= radius * radius)
                 dx++;
+
             left  = x + radius - dx;
             right = x + width - radius + dx - 1;
         }
@@ -206,6 +208,16 @@ static void menu_reverse_row(int16_t y)
 }
 
 
+/* 第 r 行显示列表里的第几项(相对 first). 长列表按环形窗口取模; 短列表直接顺序
+ * 排, 返回值 >= count 表示该行无内容(末尾留空), 由调用方 break. */
+static uint8_t menu_row_index(uint8_t r, uint8_t count)
+{
+    if (count > MENU_LINES_PER_PAGE)
+        return (uint8_t)((win_top + r) % count);
+
+    return r;
+}
+
 /* 列表渲染: 按已推进的窗口(win_top/win_cursor)绘制当前帧, 环形取模显示可见项 */
 static void menu_list_render(uint8_t first, uint8_t count, uint8_t index)
 {
@@ -215,16 +227,10 @@ static void menu_list_render(uint8_t first, uint8_t count, uint8_t index)
 
     for (uint8_t r = 0; r < lines_per_page; r++)
     {
-        uint8_t idx;
+        uint8_t idx = menu_row_index(r, count);
 
-        if (count > lines_per_page)
-            idx = (uint8_t)((win_top + r) % count);   /* 环形可见窗口 */
-        else
-        {
-            if (r >= count)                          /* 短列表: 末尾行留空 */
-                break;
-            idx = r;
-        }
+        if (idx >= count)   /* 短列表: 末尾行留空 */
+            break;
 
         uint8_t id = first + idx;
         const menu_item_t *item = Menu_GetItem(id);
