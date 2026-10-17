@@ -1,34 +1,21 @@
-﻿#include "stm32f10x.h"
+#include "stm32f10x.h"
 #include "key.h"
 
-static uint8_t is_key_pressed(key_info_t *key);
-static void update_timer(key_info_t *key);
-static void reset_timer(key_info_t *key);
-static void process_key_arm(key_info_t *key);
-static void process_key_idle(key_info_t *key);
-static void process_key_debounce(key_info_t *key);
-static void process_key_pressed(key_info_t *key);
-static void process_pressed_release(key_info_t *key);
-static void process_key_click_judge(key_info_t *key);
 
-
-/* 按键状态机(单键), 由 Key_Scan 以固定间隔调用(见 input.c 的 KEY_SCAN_MS = 5ms):
- * 各计时阈值的单位都是"扫描次数" —— KEY_DELAY_TIME=4 即 20ms, KEY_LONG_TIME=80 即
- * 400ms, KEY_ARM_LEVEL_TIME=40 即 200ms. */
 void Key_Init(key_info_t *key, GPIO_TypeDef *gpio, uint16_t pin, void (*callback)(key_event_t))
 {
     GPIO_InitTypeDef gpio_init_struct;
 
-    if (!key)
+    if(!key)
         return;
-    if (!callback)
+    if(!callback)
         return;
 
-    if (gpio == GPIOA)
+    if(gpio == GPIOA)
         RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
-    else if (gpio == GPIOB)
+    else if(gpio == GPIOB)
         RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
-    else if (gpio == GPIOC)
+    else if(gpio == GPIOC)
         RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
 
     gpio_init_struct.GPIO_Mode  = GPIO_Mode_IPU;
@@ -36,7 +23,7 @@ void Key_Init(key_info_t *key, GPIO_TypeDef *gpio, uint16_t pin, void (*callback
     gpio_init_struct.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(gpio, &gpio_init_struct);
 
-    key->state = KEY_STATE_ARM;   /* 上电先装填: 等引脚稳定为高, 之后才进入正常按键逻辑 */
+    key->state = KEY_STATE_ARM;
     key->timer = 0;
     key->rel_cnt = 0;
     key->gpiox = gpio;
@@ -51,96 +38,79 @@ static uint8_t is_key_pressed(key_info_t *key)
 }
 
 
-/* 定时器管理: 每次扫描递增, 封顶 255 防 uint8_t 溢出 */
 static void update_timer(key_info_t *key)
 {
-    if (key->timer < 255)
+    if(key->timer < 255)
         key->timer++;
 }
 
-/* 复位定时器 */
 static void reset_timer(key_info_t *key)
 {
     key->timer = 0;
 }
 
-/* 状态机处理函数: 上电装填状态
- * 上电后必须先连续见到稳定高电平(KEY_ARM_LEVEL_TIME 次扫描)才允许进入正常按键逻辑.
- * 消除上电瞬间 PB8 因电源上升、按键线 RC 充电或 EMI 造成的低电平被误确认成一次按下
- * 再释放、从而自发产生 CLICK 的问题(表现为开机自动跳进菜单). 期间读到低电平即重新
- * 计时, 故与 RC 充电时间长短无关. */
+
 static void process_key_arm(key_info_t *key)
 {
     update_timer(key);
 
-    if (is_key_pressed(key))   /* 仍为低电平: 继续等待 */
+    if(is_key_pressed(key))
     {
         reset_timer(key);
         return;
     }
 
-    if (key->timer >= KEY_ARM_LEVEL_TIME)
-    {
-        key->state = KEY_STATE_IDLE;   /* 引脚已稳定为高, 进入正常按键逻辑 */
-    }
+    if(key->timer >= KEY_ARM_LEVEL_TIME)
+        key->state = KEY_STATE_IDLE;
 }
 
-/* 状态机处理函数: 空闲状态 */
 static void process_key_idle(key_info_t *key)
 {
-    if (is_key_pressed(key))
+    if(is_key_pressed(key))
     {
-        key->state = KEY_STATE_DEBOUNCE;   /* 切换到消抖状态 */
+        key->state = KEY_STATE_DEBOUNCE;
         reset_timer(key);
     }
 }
 
-/* 状态机处理函数: 消抖状态(按下侧确认, 与释放侧的 rel_cnt 同为"连续 N 次读数"门槛)
- * timer 在本态作"连续低电平计数": 中途读到高电平即退回 IDLE, 计数随之作废(下次进入
- * 本态时由入口清零)。按下侧无需另开计数器 —— 本态未占用 timer, 长按计时要到 PRESSED
- * 才开始, 与释放侧"PRESSED 里 timer 已被长按占用、故必须用 rel_cnt"的情形不同。 */
 static void process_key_debounce(key_info_t *key)
 {
-    if (is_key_pressed(key))
+    if(is_key_pressed(key))
     {
         update_timer(key);
 
-        if (key->timer >= KEY_DELAY_TIME)
+        if(key->timer >= KEY_DELAY_TIME)
         {
-            key->state = KEY_STATE_PRESSED;   /* 连续 KEY_DELAY_TIME 次为低: 确认按下 */
+            key->state = KEY_STATE_PRESSED;
             reset_timer(key);
         }
     }
     else
     {
-        key->state = KEY_STATE_IDLE;          /* 中途读高: 抖动, 返回空闲状态 */
+        key->state = KEY_STATE_IDLE;
     }
 }
 
-/* 状态机处理函数: 按下状态 */
+
 static void process_key_pressed(key_info_t *key)
 {
     update_timer(key);
- 
-    if (is_key_pressed(key))
-    {
-        key->rel_cnt = 0;   /* 仍按下: 清零松手确认计数(高电平毛刺被此处吸收) */
 
-        if (key->timer >= KEY_LONG_TIME)   /* 按下时间超过 KEY_LONG_TIME: 判定为长按 */
+    if(is_key_pressed(key))
+    {
+        key->rel_cnt = 0;
+
+        if(key->timer >= KEY_LONG_TIME)
         {
             key->event_callback(KEY_EVENT_LONG_PRESS);
-            key->rel_cnt = 0;   /* 释放确认计数从 0 起(WAIT_RELEASE 用它做松手消抖) */
+            key->rel_cnt = 0;
             key->state = KEY_STATE_WAIT_RELEASE;
         }
     }
-    else   /* 读到高电平: 需连续 KEY_DELAY_TIME 次确认才算真松手(与按下侧同款门槛) */
+    else
     {
-        /* 释放侧此前零消抖: 一次高电平毛刺即判松手 → CLICK_JUDGE 在不看引脚的情况下
-         * 立即发 CLICK, 而按键实际仍按着 → 再松手又发一次 CLICK(一次按压两个事件).
-         * 改为要求连续 KEY_DELAY_TIME 次高电平; 确认前一直留在本态, timer 继续走,
-         * 故长按计时不受影响(这是不复用 timer 做释放计数的原因). */
         key->rel_cnt++;
-        if (key->rel_cnt >= KEY_DELAY_TIME)
+        if(key->rel_cnt >= KEY_DELAY_TIME+1)
         {
             key->rel_cnt = 0;
             key->state = KEY_STATE_CLICK_JUDGE;
@@ -149,19 +119,12 @@ static void process_key_pressed(key_info_t *key)
     }
 }
 
-/* 状态机处理函数: 长按后等待松手(无事件, 仅回空闲).
- * 需连续 KEY_DELAY_TIME 次高电平才确认松手 —— 原实现"一次高电平即回 IDLE"缺了这道
- * 门槛: 长按松手瞬间的触点回弹(低电平)会立刻被 IDLE→DEBOUNCE 当成"新按下", 确认后
- * 松手再补发一次 CLICK, 即"长按有时附带点击"(一次按压出 LPRESS+CLICK 两个事件).
- * 与按下侧(DEBOUNCE)、普通释放侧(PRESSED 的 rel_cnt)同款"连续 N 次"门槛.
- * 副作用: 若松手后按键持续交替抖动, 会停在 WAIT_RELEASE(不发事件)直到稳定 —— 属
- * fail-safe: 宁可暂不响应, 也不再误发 CLICK. */
 static void process_pressed_release(key_info_t *key)
 {
-    if (!is_key_pressed(key))
+    if(!is_key_pressed(key))
     {
         key->rel_cnt++;
-        if (key->rel_cnt >= KEY_DELAY_TIME)
+        if(key->rel_cnt >= KEY_DELAY_TIME)
         {
             key->rel_cnt = 0;
             key->state = KEY_STATE_IDLE;
@@ -169,24 +132,23 @@ static void process_pressed_release(key_info_t *key)
     }
     else
     {
-        key->rel_cnt = 0;   /* 仍按着 / 回弹到低电平: 释放计数作废 */
+        key->rel_cnt = 0;
     }
 }
 
-/* 状态机处理函数: 松手后等待单击判定
- * ENABLE_DCLICK=1 时按 KEY_DOUBLE_TIME 区分单击/双击; =0 时本态只看一眼即发 CLICK. */
+
 static void process_key_click_judge(key_info_t *key)
 {
 #if defined(ENABLE_DCLICK) && ENABLE_DCLICK==1
     update_timer(key);
 
-    if (is_key_pressed(key))   /* 再次按下: 可能是双击 */
+    if(is_key_pressed(key))
     {
-        if (key->timer <= KEY_DOUBLE_TIME)
+        if(key->timer <= KEY_DOUBLE_TIME)
             key->event_callback(KEY_EVENT_DOUBLE_CLICK);
         key->state = KEY_STATE_WAIT_RELEASE;
     }
-    else if (key->timer > KEY_DOUBLE_TIME)   /* 超时: 认为是单击 */
+    else if(key->timer > KEY_DOUBLE_TIME)
     {
 #endif
         key->event_callback(KEY_EVENT_CLICK);
@@ -196,14 +158,18 @@ static void process_key_click_judge(key_info_t *key)
 #endif
 }
 
-/* 主按键扫描函数: 状态机核心逻辑 */
+
 void Key_Scan(key_info_t *key)
 {
-    if (!key)
+    if(!key)
         return;
 
-    switch (key->state)
+    switch(key->state)
     {
+        case KEY_STATE_ARM:
+            process_key_arm(key);
+            break;
+
         case KEY_STATE_IDLE:
             process_key_idle(key);
             break;
@@ -222,10 +188,6 @@ void Key_Scan(key_info_t *key)
 
         case KEY_STATE_CLICK_JUDGE:
             process_key_click_judge(key);
-            break;
-
-        case KEY_STATE_ARM:
-            process_key_arm(key);
             break;
 
         default:

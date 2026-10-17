@@ -184,7 +184,8 @@ const uint8_t menu_max_num = sizeof(menu_table) / sizeof(menu_table[0]);
  * 表内 parent/child 关系**无法在此断言**: C99 下 const 数组成员不是整数常量表达式,
  * menu_table[3].first_child + menu_table[3].child_num 不能用于数组长度或 case 标签.
  * 那部分由构建期脚本 build_tools/check_menu_table.py 静态解析本文件覆盖(改表即报,
- * 不必上机); 内核的 menu_validate_table 则作为现场运行期兜底保留. */
+ * 不必上机)。**构建期脚本是唯一防线**: 内核已不保留运行期表校验(为简洁移除),
+ * 故新增/改动表项后必须重跑该脚本. */
 #define MENU_TABLE_COUNT (sizeof(menu_table) / sizeof(menu_table[0]))
 
 typedef char menu_table_count_guard[(MENU_TABLE_COUNT <= 255u) ? 1 : -1];

@@ -7,20 +7,12 @@ typedef struct{
 
 static menu_ctrl_t menu_ctrl;
 
-/* 表校验: 只读、无副作用. **无条件编译** —— 是否占空间交给链接器按引用决定
- * (OneElfS=1, 每函数独立段):
- *   - Menu_Init 在 MENU_DEBUG_ASSERT 下用它做启动断言;
- *   - 应用可经 Menu_IsValid() 在量产固件里主动查询表是否配错.
- * 二者都不引用它时, 它会与 Menu_IsValid 一起被丢弃, 不占 Flash. */
-static bool menu_validate_table(void);
-
-static const menu_item_t *menu_current_item(void);
-
-static void menu_activate(void);
-static void menu_exit_handler(void);
 
 static void menu_state_normal(const menu_cmd_t *cmd);
 static void menu_state_handler(const menu_cmd_t *cmd);
+
+static void menu_enter_handler(void);
+static void menu_exit_handler(void);
 
 static void menu_move_up(void);
 static void menu_move_down(void);
@@ -30,54 +22,9 @@ static void menu_back(void);
 
 void Menu_Init(void)
 {
-	/* current 必须**无条件**初始化: 原先它被放在下面的 #if 里, 默认构建
-	 * (MENU_DEBUG_ASSERT=0) 会把该赋值整行编掉, 只剩"文件级 static 零初始化 +
-	 * MENU_NO_PARENT==0"碰巧成立 —— 与紧邻 state 的显式赋值也不对称. */
-	menu_ctrl.current = MENU_NO_PARENT;
-	menu_ctrl.state   = MENU_STATE_NORMAL;
-	
-#if MENU_DEBUG_ASSERT
-    /* 局部量**不可加 static**: C 要求 static 存储期对象用常量表达式初始化, 函数
-     * 调用会报 "error #59: function call is not allowed in a constant expression".
-     * Menu_Init 只调用一次, 普通局部量即可(原先加 static 使本开关无法编译). */
-    bool menu_table_valid = menu_validate_table();
-    /* 表配错时这里是唯一"能看见"的时机: 正常路径会静默降级, 现象只有
-     * "上电后按键完全无反应", 没有任何日志/提示.
-     * 陷阱动作由 MENU_ASSERT_TRAP() 决定(默认纯自旋; 应用可重定义为"自旋+喂狗",
-     * 见 menu.h) —— 内核自身不引用看门狗, 以免破坏整目录复用. */
-    if (!menu_table_valid)
-        MENU_ASSERT_TRAP();
-
-    /* 菜单表损坏时保持虚拟根+列表态: 所有导航入口停用, 避免按错误 parent/child
-     * 范围访问表或调用错误页面回调. 应用可用 Menu_IsValid() 主动查询本状态. */
-    if (!menu_table_valid)
-        return;
-#endif
-
+    menu_ctrl.state   = MENU_STATE_NORMAL;
     menu_ctrl.current = MENU_HOME_ID;
-    menu_activate();
-}
-
-
-void *Menu_GetUserData(const menu_item_t *item)
-{
-    return (item->user_data) ? item->user_data : (void *)item;
-}
-
-
-void Menu_EventDispatch(const menu_cmd_t *cmd)
-{
-#if MENU_DEBUG_ASSERT	
-	if(!menu_validate_table())
-		return;
-#endif
-    if (!cmd)
-        return;
-
-    if(menu_ctrl.state==MENU_STATE_HANDLER)
-        menu_state_handler(cmd);
-    else
-        menu_state_normal(cmd);
+    menu_enter_handler();
 }
 
 
@@ -93,47 +40,6 @@ menu_state_t Menu_GetState(void)
 }
 
 
-/* 强制跳转(见 menu.h 注释): 仅做"离开当前页 → 定位 → 常驻页激活"三步,
- * 不改动列表滚动/差量渲染等既有逻辑; 渲染层经 GetCurrentId/GetState 自动适配. */
-void Menu_SetCurrentId(uint8_t id)
-{
-#if MENU_DEBUG_ASSERT	
-	if(!menu_validate_table())
-		return;
-#endif
-
-    /* 0 = 占位虚拟根(ops=NULL, 且不属于任何列表): 若置为 current, 渲染层
-     * Menu_GetSiblingRange(0) 返回 false → menu_list_display 不渲染, 画面冻结在
-     * 上一帧. 连同越界一并拦截. (MENU_NO_PARENT/MENU_NO_CHILD 同为 0, 是哨兵值.) */
-    if(id == 0 || id >= menu_max_num)
-        return;
-
-    /* 真无操作才提前返回: 仅当"已在目标节点 且 该节点已是活动 handler 态".
-     * 旧实现只比 id, 于是调用方若已parked在目标索引(如 CurCal_BootEnter 在
-     * current 恰为 Cur Cal 时), 调用被静默丢弃, 而调用方已经把副作用状态
-     * (cal_boot/cal_idx 等)改好了 —— 结果既没激活页面, 标志又留在半途,
-     * 直到某次无关的 exit 才被当成"跳过引导"误处理. */
-    if(id == menu_ctrl.current && menu_ctrl.state == MENU_STATE_HANDLER)
-        return;
-
-    if(menu_ctrl.state == MENU_STATE_HANDLER)
-        menu_exit_handler();   /* 离开当前页面: 调 exit 回调, 回落 NORMAL */
-
-    /* exit 回调内若自行跳页(重入 Menu_SetCurrentId), 会重新激活为 HANDLER;
-     * 此时当前节点已被它接管, 不再覆盖 —— 否则会把内层跳转的目标冲掉.
-     * (menu_exit_handler 已先置 NORMAL, 故非重入时此处 state 必为 NORMAL.) */
-    if(menu_ctrl.state == MENU_STATE_HANDLER)
-        return;
-
-    menu_ctrl.current = id;
-
-    /* 目标是否为可激活页面(常驻页 DIRECT_HANDLER, 或带 display+handler 的叶子页
-     * 如 Cur Cal 引导页)统一交给 menu_activate 判定, 此处不再重复条件 ——
-     * 不可激活(无 ops / 缺 display / 缺 handler)时 menu_activate 保持列表态. */
-    menu_activate();
-}
-
-
 const menu_item_t *Menu_GetItem(uint8_t id)
 {
     if(id>=menu_max_num)
@@ -143,163 +49,76 @@ const menu_item_t *Menu_GetItem(uint8_t id)
 }
 
 
-/* 启动期验证只读菜单表, 不调用页面回调、不依赖 UI。
- * 校验父->子与子->父双向一致、半开范围不越界、树无孤岛/环, 并检查可激活 ops 契约.
- * 返回 false 时 Menu_Init 留在虚拟根, 且拒绝所有事件/强制跳转(安全失败).
- * **无条件编译**: 是否占空间交给链接器按引用决定(见文件头部前置声明处说明). */
-static bool menu_validate_table(void)
+void *Menu_GetUserData(const menu_item_t *item)
 {
-    const menu_item_t *item;
-    const menu_item_t *parent;
-    uint16_t id, child, end, walk, hops;
-    uint8_t known_flags = MENU_FLAG_DIRECT_HANDLER;
+    return (item->user_data) ? item->user_data : (void *)item;
+}
 
-    if (menu_max_num <= MENU_HOME_ID)
-        return false;
 
-    /* 根节点是占位容器, 必须覆盖 HOME 节点. */
-    item = &menu_table[MENU_NO_PARENT];
+void Menu_SetCurrentId(uint8_t id)
+{
+
+    if(id == MENU_NO_PARENT || id >= menu_max_num)
+        return;
+
+    if(id == menu_ctrl.current && menu_ctrl.state == MENU_STATE_HANDLER)
+        return;
+
+    if(menu_ctrl.state == MENU_STATE_HANDLER)
+    {
+        menu_exit_handler();
+
+        if(menu_ctrl.state == MENU_STATE_HANDLER)
+            return;
+    }
+
+    menu_ctrl.current = id;
+
+    menu_enter_handler();
+}
+
+
+static inline bool menu_ops_activatable(const menu_ops_t *ops)
+{
+    return ops != NULL && ops->display != NULL && ops->handler != NULL;
+}
+
+
+static inline uint16_t menu_child_end(const menu_item_t *item)
+{
+    uint16_t end;
+
+    if(item == NULL || item->child_num == MENU_LEAF ||
+        item->first_child == MENU_NO_CHILD)
+        return 0u;
+
     end = (uint16_t)item->first_child + item->child_num;
-    if (item->parent != MENU_NO_PARENT || item->ops != NULL ||
-        item->child_num == 0 || item->first_child == MENU_NO_CHILD ||
-        end > menu_max_num || MENU_HOME_ID < item->first_child || MENU_HOME_ID >= end)
-        return false;
+    if(item->first_child >= menu_max_num || end > menu_max_num)
+        return 0u;
 
-    /* HOME 是内核启动目标, 必须是挂在虚拟根下的可激活常驻页. */
-    item = &menu_table[MENU_HOME_ID];
-    if (item->parent != MENU_NO_PARENT ||
-        (item->flags & MENU_FLAG_DIRECT_HANDLER) == 0 ||
-        item->ops == NULL || item->ops->display == NULL || item->ops->handler == NULL)
-        return false;
-
-    for (id = 0; id < menu_max_num; id++)
-    {
-        item = &menu_table[id];
-
-        if (item->flags & (uint8_t)~known_flags)
-            return false;
-
-        /* 一旦提供 ops, 必须同时具备渲染与事件处理, 否则 HANDLER 页无法完整工作. */
-        if (item->ops != NULL &&
-            (item->ops->display == NULL || item->ops->handler == NULL))
-            return false;
-
-        if ((item->flags & MENU_FLAG_DIRECT_HANDLER) && item->ops == NULL)
-            return false;
-
-        if (item->child_num == 0)
-        {
-            if (item->first_child != MENU_NO_CHILD)
-                return false;
-        }
-        else
-        {
-            if (item->first_child == MENU_NO_CHILD)
-                return false;
-
-            end = (uint16_t)item->first_child + item->child_num;
-            if (item->first_child >= menu_max_num || end > menu_max_num)
-                return false;
-
-            /* 子节点声明的 parent 必须反向指回当前节点. */
-            for (child = item->first_child; child < end; child++)
-            {
-                if (child == MENU_NO_PARENT || menu_table[child].parent != id)
-                    return false;
-            }
-        }
-
-        if (id == MENU_NO_PARENT)
-            continue;
-
-        if (item->parent >= menu_max_num || item->parent == id)
-            return false;
-
-        parent = &menu_table[item->parent];
-        end = (uint16_t)parent->first_child + parent->child_num;
-        if (parent->child_num == 0 || parent->first_child == MENU_NO_CHILD ||
-            end > menu_max_num || id < parent->first_child || id >= end)
-            return false;
-    }
-
-    /* 每个真实节点沿 parent 链必须在有限步内到达虚拟根, 防孤岛和父级环. */
-    for (id = 1; id < menu_max_num; id++)
-    {
-        walk = id;
-        for (hops = 0; walk != MENU_NO_PARENT && hops < menu_max_num; hops++)
-            walk = menu_table[walk].parent;
-        if (walk != MENU_NO_PARENT)
-            return false;
-    }
-
-    return true;
-}
-
-/* 菜单表是否通过校验(见 menu.h): 供应用在量产固件里主动查询, 把"按键完全无反应"
- * 这一静默降级状态变成可观测的提示(与 MENU_DEBUG_ASSERT 互补: 那个给调试期).
- * 与 menu_validate_table 一同"按需链接": 无人调用时两者都被链接器丢弃, 不占空间;
- * 一旦调用即引入校验函数(实测 Release-HW 约 +328 B). */
-bool Menu_IsValid(void)
-{
-    return menu_validate_table();
+    return end;
 }
 
 
-static const menu_item_t *menu_current_item(void)
+void Menu_EventDispatch(const menu_cmd_t *cmd)
 {
-    if(menu_ctrl.current>=menu_max_num)
-        return NULL;
-
-    return &menu_table[menu_ctrl.current];
-}
-
-
-/* 激活当前节点为处理页: 切 HANDLER + 调 enter。
- * 不修改 current, 不做事件路由 —— 事件统一由 menu_state_handler 分发。
- *
- * 可激活契约(单点把关): 页面须同时提供 display(可渲染) 与 handler(可响应事件).
- * 只有 display 而无 handler 的页面在 HANDLER 态无法响应任何事件(既不能长按退出,
- * 也处理不了 CLICK/UP/DOWN), 属无效配置 —— 一律不激活, 回落列表态.
- * menu_state_handler 与 Menu_SetCurrentId 都经本函数进入 HANDLER, 故契约在此唯一判定. */
-static void menu_activate(void)
-{
-    const menu_item_t *item=menu_current_item();
-
-    if(!item||!item->ops)
+    if(!cmd)
         return;
 
-    if(!item->ops->display || !item->ops->handler)
-    {
-        menu_ctrl.state=MENU_STATE_NORMAL;
-        return;
-    }
-
-    menu_ctrl.state=MENU_STATE_HANDLER;
-
-    if(item->ops->enter)
-        item->ops->enter(Menu_GetUserData(item));
-}
-
-
-static void menu_exit_handler(void)
-{
-    const menu_item_t *item=menu_current_item();
-
-    menu_ctrl.state=MENU_STATE_NORMAL;
-
-    if(item&&item->ops&&item->ops->exit)
-        item->ops->exit(Menu_GetUserData(item));
+    if(menu_ctrl.state==MENU_STATE_HANDLER)
+        menu_state_handler(cmd);
+    else
+        menu_state_normal(cmd);
 }
 
 
 static void menu_state_handler(const menu_cmd_t *cmd)
 {
-    const menu_item_t *item=menu_current_item();
+    const menu_item_t *item=Menu_GetItem(menu_ctrl.current);
     menu_result_t ret=MENU_RET_OK;
-    bool has_children;   /* 是否下钻子列表: 先取, 避免依赖"退出 handler 后 current 不变"的隐式约定 */
-    uint8_t acted_id;    /* 派发时所在节点 id, 供下面判断 handler 是否已经自行跳页 */
+    uint8_t acted_id;
 
-    if(!item||!item->ops)
+    if(item==NULL || !menu_ops_activatable(item->ops))
     {
         menu_ctrl.state=MENU_STATE_NORMAL;
         return;
@@ -307,35 +126,18 @@ static void menu_state_handler(const menu_cmd_t *cmd)
 
     acted_id = menu_ctrl.current;
 
-    switch(cmd->event)
-    {
-        case MENU_EVENT_UP:
-        case MENU_EVENT_DOWN:
-        case MENU_EVENT_CLICK:
-        case MENU_EVENT_LPRESS:
-            if(item->ops->handler)
-                ret=item->ops->handler(cmd, Menu_GetUserData(item));
-            break;
+    if(cmd->event <= MENU_EVENT_LPRESS)
+        ret = item->ops->handler(cmd, Menu_GetUserData(item));
 
-        default:
-            break;
-    }
-
-    /* handler 有权调 Menu_SetCurrentId 自行跳页(如手柄页跳 Cur Cal、故障跳 HOME).
-     * 那种情况下当前节点与状态已被它接管, 此处若再按旧 item 收尾, 就会对新页面
-     * 做一次"没有配对 enter 的 exit"(不平衡), 并按旧节点的 child_num 误下钻.
-     * 现状两个跳转点都返回 MENU_RET_OK 才没暴露; 显式加护栏, 不再依赖调用方自觉. */
     if(menu_ctrl.current != acted_id || menu_ctrl.state != MENU_STATE_HANDLER)
         return;
-
-    has_children = (item->child_num > 0);
 
     if(ret==MENU_RET_DONE)
     {
         menu_exit_handler();
 
-        if(has_children)
-            menu_enter();   /* 常驻页(如 HOME): 下钻到子列表首项; 叶子则已回父列表 */
+        if(menu_ctrl.current == acted_id && item->child_num > 0)
+            menu_enter();
     }
 }
 
@@ -366,17 +168,44 @@ static void menu_state_normal(const menu_cmd_t *cmd)
 }
 
 
+static void menu_enter_handler(void)
+{
+    const menu_item_t *item=Menu_GetItem(menu_ctrl.current);
+
+    if(item==NULL || !menu_ops_activatable(item->ops))
+    {
+        menu_ctrl.state=MENU_STATE_NORMAL;
+        return;
+    }
+
+    menu_ctrl.state=MENU_STATE_HANDLER;
+
+    if(item->ops->enter)
+        item->ops->enter(Menu_GetUserData(item));
+}
+
+
+static void menu_exit_handler(void)
+{
+    const menu_item_t *item=Menu_GetItem(menu_ctrl.current);
+
+    menu_ctrl.state=MENU_STATE_NORMAL;
+
+    if(item&&item->ops&&item->ops->exit)
+        item->ops->exit(Menu_GetUserData(item));
+}
+
+
 static void menu_enter(void)
 {
-    const menu_item_t *item=menu_current_item();
+    const menu_item_t *item=Menu_GetItem(menu_ctrl.current);
 
     if(!item)
         return;
 
     if(item->child_num)
     {
-        uint16_t end = (uint16_t)item->first_child + item->child_num;
-        if(item->first_child >= menu_max_num || end > menu_max_num)
+        if(menu_child_end(item) == 0u)
             return;
 
         menu_ctrl.state = MENU_STATE_NORMAL;
@@ -384,37 +213,27 @@ static void menu_enter(void)
     }
     else if(item->ops)
     {
-        /* 叶子项: 激活为 handler */
-        menu_activate();
+        menu_enter_handler();
     }
 }
 
 static void menu_back(void)
 {
-    const menu_item_t *item=menu_current_item();
+    const menu_item_t *item=Menu_GetItem(menu_ctrl.current);
     const menu_item_t *target;
 
     if(!item)
         return;
 
-    /* 契约: menu_back 仅由 menu_state_normal(LPRESS) 调用, 进入时 state 必为 NORMAL,
-     * 故此处无需再置位 (若将来新增调用点, 需自行保证前置状态为 NORMAL). */
-
-    /* 防御菜单表 parent 越界配置: 越界则保持原节点(显示层 GetSiblingRange 兜底), 不写入非法 current */
     if(item->parent >= menu_max_num)
         return;
 
-    /* 不变式: NORMAL 态 current 必为真实列表项, 其父级恒为真实节点(非占位虚拟根)。
-     * DIRECT_HANDLER 节点(如 HOME)永远处于 handler 态、不会滞留 NORMAL, 故 current 的 parent 不可能为 0。 */
     menu_ctrl.current=item->parent;
-    
 
-    /* 回到常驻页(如 HOME): 直接激活为 handler, 保持常驻显示。
-     * 上一步已校验 parent < menu_max_num, 故 menu_current_item() 的越界分支
-     * 不会命中, target 必非空 —— 无需再判空. */
-    target=menu_current_item();
+
+    target=Menu_GetItem(menu_ctrl.current);
     if(target->flags & MENU_FLAG_DIRECT_HANDLER)
-        menu_activate();
+        menu_enter_handler();
 }
 
 
@@ -456,28 +275,17 @@ bool Menu_GetSiblingRange(uint8_t id,uint8_t *first,uint8_t *last)
         return false;
 
     item=Menu_GetItem(id);
-
     if(!item)
         return false;
 
-    /* 常驻页(HOME)通过占位虚拟根拥有真实父级(idx 0), 故此处无需对"无父"特判:
-     * 唯一的无父节点是虚拟根本身, 其 parent = MENU_NO_PARENT = 0 指向自身(idx 0),
-     * Menu_GetItem(0) 是合法节点, 不会被 !parent 拦下; 真正兜底的是下方
-     * "id 必须是该列表成员"的范围校验 —— 虚拟根 first_child=1/child_num=1,
-     * 而它自身 id=0 落在 [1,2) 之外, 故返回 false. */
     parent=Menu_GetItem(item->parent);
-
-    /* 父节点必须确实拥有子列表 */
-    if(!parent || parent->child_num==0 || parent->first_child==MENU_NO_CHILD)
+    if(!parent)
         return false;
 
-    /* 子列表半开区间 [first, end) */
-    end=(uint16_t)parent->first_child + parent->child_num;
-
-    if(end>menu_max_num)
+    end = menu_child_end(parent);
+    if(end == 0u)
         return false;
 
-    /* 防御: id 必须是该列表成员, 防陈旧 current 产生越界移动 */
     if(id<parent->first_child || id>=end)
         return false;
 
@@ -486,4 +294,3 @@ bool Menu_GetSiblingRange(uint8_t id,uint8_t *first,uint8_t *last)
 
     return true;
 }
-

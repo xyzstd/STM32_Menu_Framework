@@ -36,10 +36,6 @@ typedef enum {
 typedef struct {
     void (*event_callback)(key_event_t event); /* 事件回调函数 */
     GPIO_TypeDef *gpiox;                       /* 按键所在 GPIO */
-    /* 按键引脚: 存 **GPIO_Pin_x 掩码**(如 GPIO_Pin_8 = 0x0100), 必须 16 位.
-     * 不可改成 uint8_t: 只有 GPIO_Pin_0..7(0x0001..0x0080) 装得下, Pin8~15
-     * (0x0100..0x8000) 会被截断成 0 → GPIO_Init 不配置任何引脚, 且读回恒为低,
-     * 表现为"按键一直按下". 全工程其它 GPIO 用法也都是掩码, 保持一致. */
     uint16_t key_pin;
     key_state_t state;                         /* 当前按键状态 */
     uint8_t timer;                             /* 计时器(扫描次数) */
