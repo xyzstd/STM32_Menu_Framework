@@ -4,6 +4,7 @@
 #include "config.h"
 #include "work_task.h"
 #include "pid_controller.h"
+#include "buzzer.h"
 
 /* 多点温度校准: 200/300/350/400/450°C 五个温度点各设一个偏移量
  * 实际温度 = 五点插值基准温度 + 按温度区间插值的偏移
@@ -212,9 +213,12 @@ static void calibrate_exit(void *user_data)
 
         for (i = 0; i < CAL_POINT_NUM; i++)
             Cal_SetOff(i, h, (int8_t)off[i]);   /* int16 → int8 需显式回缩 */
-        /* 只写校准独立页, 不动用户设置. 返回值暂不向用户上报(本页无"已保存"
-         * 提示, 见 F16); (void) 显式表明"有意忽略"而非漏检. */
-        (void)Cal_Save();
+        /* 只写校准独立页, 不动用户设置.
+         * 偏移经 cal_offset_interp 直接叠加到读温, 是影响控温准确性的数据 ——
+         * 落盘失败必须告警(与 param/pid/settings/cur_cal 页同一口径):
+         * 静默失败会让用户看到新偏移已生效、重启后却全部丢失且无从察觉. */
+        if (!Cal_Save())
+            Buzzer_Beep(BUZZER_EVENT_ALARM);
         dirty = false;
     }
 

@@ -60,18 +60,31 @@ void PID_Controller_Init(void)
     PID_Controller_Reload();
 }
 
+/* 增益合法性钳位: Flash 里的值可能越界(旧固件写入 / 数据损坏), 载入即收敛到
+ * 控制器允许范围. 不钳的后果不是失控(输出仍被加热层钳到 HEATER_POWER_LIMIT),
+ * 而是控制质量异常且没有任何提示 —— 用户只会觉得"温度抖得厉害"却查不出原因.
+ * 上限常量留在本模块: bsp/config.c 只负责存, 不必知道 PID 的合法范围. */
+static inline int16_t pid_gain_clamp(int16_t v, int16_t max)
+{
+    if (v < 0)
+        return 0;
+    if (v > max)
+        return max;
+    return v;
+}
+
 /* 按当前型号从配置加载 PID 参数 (激进/保守) 并复位状态.
  * 型号切换后调用, 使现役 PID 系数随型号切换而更新, 避免用错型号参数控温. */
 void PID_Controller_Reload(void)
 {
     uint8_t h = Config_GetHandleIdx();
 
-    pid.agg_kp  = g_config.pid_agg_kp[h];
-    pid.agg_ki  = g_config.pid_agg_ki[h];
-    pid.agg_kd  = g_config.pid_agg_kd[h];
-    pid.cons_kp = g_config.pid_cons_kp[h];
-    pid.cons_ki = g_config.pid_cons_ki[h];
-    pid.cons_kd = g_config.pid_cons_kd[h];
+    pid.agg_kp  = pid_gain_clamp(g_config.pid_agg_kp[h],  PID_KP_MAX);
+    pid.agg_ki  = pid_gain_clamp(g_config.pid_agg_ki[h],  PID_KI_MAX);
+    pid.agg_kd  = pid_gain_clamp(g_config.pid_agg_kd[h],  PID_KD_MAX);
+    pid.cons_kp = pid_gain_clamp(g_config.pid_cons_kp[h], PID_KP_MAX);
+    pid.cons_ki = pid_gain_clamp(g_config.pid_cons_ki[h], PID_KI_MAX);
+    pid.cons_kd = pid_gain_clamp(g_config.pid_cons_kd[h], PID_KD_MAX);
     PID_Controller_Reset();
 }
 

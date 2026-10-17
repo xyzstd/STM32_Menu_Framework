@@ -80,16 +80,32 @@ static void handle_exit(void *ud)
  * 由 display 在轮询到结论后调用(链检期间已丢弃输入, cur_idx 不会被改). */
 static void handle_apply_switch(void)
 {
+    uint8_t old_idx = Config_GetHandleIdx();   /* 切换前型号: 落盘失败要回滚 */
     bool saved;
 
     /* 确认切换: 写配置 + 触发安全闭合 */
     g_config.handle_type = cur_idx;
     saved = Config_Save();
+
+    if (!saved)
+    {
+        /* 落盘失败必须回滚 RAM 型号: 否则本次运行按新型号的温度曲线与 PID 增益
+         * 控温, 重启后又变回旧型号 —— 用户只听到一声蜂鸣, 实际处于"运行态与
+         * 持久态不一致"的状态, 且下一次开机行为突变.
+         * 回滚后仍走同一条安全闭合链路, 把 PID/目标温度重新收敛回原型号. */
+        g_config.handle_type = old_idx;
+    }
+
     WorkTask_OnHandleChanged();
-    if (saved)
-        Toast_Saved();   /* 仅在确实落盘成功时弹框 */
-    else
-        Buzzer_Beep(BUZZER_EVENT_ALARM);   /* 失败必须告警, 否则用户以为已存下 */
+
+    if (!saved)
+    {
+        Buzzer_Beep(BUZZER_EVENT_ALARM);
+        cf.active = false;   /* 本次切换未生效: 退回单型号视图, 允许重试 */
+        return;              /* 不跳页 —— 避免用户以为已切换成功 */
+    }
+
+    Toast_Saved();   /* 仅在确实落盘成功时弹框 */
 
 #if !HW_SIM_MODE
     /* 切换到尚无冷态电流参考(未标定)的型号: 直接引导进 Cur Cal 完成冷态标定,
