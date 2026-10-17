@@ -182,41 +182,9 @@ static bool     type_guide_boot;
  *   分级处置: 危险(T12 量级进非 T12 配置) → 锁 Err4; 无害(450°C 级互插、
  *   T12 配置插 450°C 头) → 引导 Tip Cal 校正不锁死. */
 
-#if !HW_SIM_MODE
-static uint8_t classify_tip_cur(uint16_t cur);
-static bool is_t12_scale(uint16_t cur, uint8_t idx);
-#endif
-static bool type_cur_match(uint16_t cur, uint8_t idx);
-
-#if !HW_SIM_MODE
-static int32_t spline_interp(const int32_t *x, const int32_t *y, uint8_t n, int32_t xv);
-static int16_t cal_offset_interp(int16_t temp_base);
-static int16_t adc_to_temp(uint16_t adc_val);
-#endif
-
-#if !HW_SIM_MODE
-static uint16_t calc_vin_x10(uint16_t adc);
-#endif
-static void read_input_voltage(void);
-static void read_motion_sensor(void);
-#if !HW_SIM_MODE
-static void remember_last_temp(void);
-#endif
-static void check_sleep_shutdown(uint32_t now);
-
-static void latch_fault(bool *fault_flag);
-static void check_heater_diagnostic(uint32_t now);
-
-static void run_pid_cycle(void);
-
-#if !HW_SIM_MODE
-static void boot_cal_eval(void);
-static void selftest_advance(void);
-#endif
-
-static void WorkTask_Retry(void);
-
-/* 非阻塞测量脉冲推进: 两种模式都有实现(模拟模式在 Start 里直接置就绪) */
+/* 非阻塞测量脉冲推进: 两种模式都有实现(模拟模式在 Start 里直接置就绪).
+ * 定义在文件后段(脉冲状态机旁)而 WorkTask_Process 先引用, 故保留此前置声明 ——
+ * 其余静态函数的定义均已在其引用之前, 无需声明. */
 static bool pulse_step(void);
 
 
@@ -614,8 +582,10 @@ static void check_heater_diagnostic(uint32_t now)
     }
 
     /* 仅在闭环已把输出拉满(90% 上限)时才判定: 输出未满说明闭环尚未尽全力,
-     * 此时"无温升"不能归因于加热器失效, 否则大负载/弱供电下会误锁 heater_fault。 */
-    if (work.power < (HEATER_POWER_MAX * 9 / 10))
+     * 此时"无温升"不能归因于加热器失效, 否则大负载/弱供电下会误锁 heater_fault。
+     * 阈值直接用 HEATER_POWER_LIMIT(加热层真正的钳位值), 不在这里重算 9/10 ——
+     * 重算会让"改了上限却忘了改诊断"变成静默漂移。 */
+    if (work.power < HEATER_POWER_LIMIT)
     {
         work.diag_temp_last = work.measured_temp;
         work.diag_tick = now;
@@ -786,12 +756,13 @@ static void selftest_advance(void)
 #endif /* !HW_SIM_MODE */
 
 /* 执行 PID 控制周期 */
-static void run_pid_cycle(void)
+/* 步骤 1 的实体: 读取实测温度, 含热电偶短路/开路保护与冷端补偿.
+ * 返回 false = 热电偶故障已锁存, 调用方应放弃本轮控制.
+ * 成功时写入 *out, 并同步 work.measured_temp. */
+static bool read_measured_temp(int16_t *out)
 {
     int16_t meas_temp;
-    int16_t power;
 
-    /* 1~2. 读取实测温度 */
 #if HW_SIM_MODE
     /* 模拟: 温度随时间向设定值逼近, 模拟真实加热过程, 使 PID / 温度到达 /
       加热器故障检测都能正常工作 */
@@ -817,7 +788,7 @@ static void run_pid_cycle(void)
     if (adc_val < THERMO_ADC_MIN)
     {
         latch_fault(&work.thermo_fault);
-        return;
+        return false;
     }
 
     /* 热电偶开路/未插检测: ADC 达运放饱和域(≥4000)连续 8 个周期 → 锁存断热,
@@ -828,7 +799,7 @@ static void run_pid_cycle(void)
         if (++work.thermo_open_cnt >= THERMO_OPEN_COUNT)
         {
             latch_fault(&work.thermo_fault);
-            return;
+            return false;
         }
     }
     else
@@ -856,7 +827,142 @@ static void run_pid_cycle(void)
 #endif
     work.measured_temp = meas_temp;
 
-    /* 3.4 校准页(Cur Cal)加热抑制 / 插头不匹配引导断热: 只读温显示冷却进度,
+    *out = meas_temp;
+    return true;
+}
+
+/* 前馈查表: 按温差取开环基础功率, 断点间线性插值(表值 0~1000 尺度).
+ * 与 PID 取 max 而非叠加 —— 升温段由前馈接管, 免去 PID 积分从零缓爬. */
+static int16_t feedforward_for(int16_t diff)
+{
+    static const int16_t ff_d[5] = { 0, 10, 25, 50, 100 };
+    static const int16_t ff_v[5] = { 0, 180, 350, 600, 900 };
+
+    if (diff >= ff_d[4])
+        return ff_v[4];
+
+    if (diff > 0)
+    {
+        uint8_t k;
+        for (k = 0; k < 4; k++)
+            if (diff < ff_d[k + 1])
+                break;
+        return (int16_t)(ff_v[k] +
+             (int32_t)(ff_v[k + 1] - ff_v[k]) * (diff - ff_d[k]) /
+             (ff_d[k + 1] - ff_d[k]));
+    }
+
+    return 0;
+}
+
+/* 步骤 6 的实体: 自整定(继电反馈). 返回 true = 本轮由整定接管, 调用方跳过
+ * PID/前馈与加热诊断(振荡温升会误报诊断). 过温/过流保护在此之前已执行. */
+static bool run_autotune_cycle(int16_t meas_temp)
+{
+    if (!PID_TuneActive())
+        return false;
+
+    work.power = PID_TuneAdvance(meas_temp);
+    Heater_SetPower(work.power);
+
+    if (PID_TuneFinish())
+    {
+        if (PID_TuneLastSucceeded())
+        {
+            PID_Gain_t tg;
+            uint8_t h = Config_GetHandleIdx();
+            PID_TuneGetResult(&tg);
+            /* 钳位到页面可显示/可编辑上限(与 page/pid.c 同源): 整定短暂可产出
+             * Kd 达 3×10^4(经 tune_gain_sat 饱和到 32767), 原样存入会让用户
+             * 一进 PID 页就被页面上限静默钳掉, 且 2 位整数显示截断高位. */
+            if (tg.kp > PID_KP_MAX) tg.kp = PID_KP_MAX;
+            if (tg.ki > PID_KI_MAX) tg.ki = PID_KI_MAX;
+            if (tg.kd > PID_KD_MAX) tg.kd = PID_KD_MAX;
+            int16_t old_kp = g_config.pid_cons_kp[h];
+            int16_t old_ki = g_config.pid_cons_ki[h];
+            int16_t old_kd = g_config.pid_cons_kd[h];
+            bool saved;
+
+            g_config.pid_cons_kp[h] = tg.kp;   /* 写入当前型号保守组 */
+            g_config.pid_cons_ki[h] = tg.ki;
+            g_config.pid_cons_kd[h] = tg.kd;
+            saved = Config_Save();
+            work.tune_save_succeeded = saved;
+
+            if (!saved)
+            {
+                /* 保存失败时运行参数、RAM 配置均回滚到整定前快照.
+                 * Config_Save 先擦页再写; 若失败发生在擦除之后, 旧 Flash 内容可能已
+                 * 不完整, 故恢复旧值后尽力再写一次. 若 Flash 持续故障, 持久化状态仍
+                 * 无法保证, 但本次运行绝不启用未保存的新增益, 且 UI 明确报告失败. */
+                g_config.pid_cons_kp[h] = old_kp;
+                g_config.pid_cons_ki[h] = old_ki;
+                g_config.pid_cons_kd[h] = old_kd;
+                (void)Config_Save();
+                Buzzer_Beep(BUZZER_EVENT_ALARM);
+            }
+            else
+            {
+                Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
+            }
+
+            /* 仅成功落盘的新参数可用于本次运行; 失败则从已回滚的旧配置重载.
+             * Reload 内含 Reset, 也清除整定期间遗留的微分历史, 避免首帧尖峰. */
+            PID_Controller_Reload();
+        }
+        else
+        {
+            Buzzer_Beep(BUZZER_EVENT_ALARM);
+        }
+        PID_TuneAbort();   /* 复位状态机(keep: half_count 供进度显示,
+                            * last_success 供页面显示成败) */
+    }
+
+    return true;
+}
+
+/* 步骤 9 的实体: 温度到达判定. 去抖 —— 连续 TEMP_REACHED_CNT 个周期在阈值内
+ * 才置位, 越界立即清零(置位慢、清除快: 提示要稳, 退出要及时). 首次置位蜂鸣. */
+static void update_temp_reached(int16_t meas_temp)
+{
+    int16_t setpoint = PID_Controller_GetSetpoint();
+    int16_t diff = meas_temp - setpoint;
+    if (diff < 0)
+        diff = (int16_t)(-diff);
+
+    /* 去抖: 连续 TEMP_REACHED_CNT 个周期在阈值内才置位; 一旦越界立即清零
+     * (置位慢、清除快 —— 提示要稳, 退出要及时) */
+    if (diff <= TEMP_REACHED_THRESHOLD)
+    {
+        if (work.reached_cnt < TEMP_REACHED_CNT)
+            work.reached_cnt++;
+    }
+    else
+    {
+        work.reached_cnt = 0;
+    }
+    work.temp_reached = (work.reached_cnt >= TEMP_REACHED_CNT);
+
+    if (work.temp_reached && !work.temp_reached_prev)
+    {
+        Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
+    }
+    work.temp_reached_prev = work.temp_reached;
+}
+
+/* 执行 PID 控制周期.
+ * 步骤顺序即安全优先级: 测温与保护在前, 输出与判定在后 —— 任一步锁存故障即
+ * 提前返回, 不再往下走. 各步骤的实体见上方同名 static 函数. */
+static void run_pid_cycle(void)
+{
+    int16_t meas_temp;
+    int16_t power;
+
+    /* 步骤 1 · 读取实测温度(含热电偶短路/开路保护与冷端补偿) */
+    if (!read_measured_temp(&meas_temp))
+        return;   /* 热电偶故障已锁存 */
+
+    /* 步骤 2 · 校准页(Cur Cal)加热抑制 / 插头不匹配引导断热: 只读温显示冷却进度,
      * 断热不控热. 置于温度采样/热电偶失效检测之后(短路/开路保护仍生效),
      * 跳过 PID 输出与加热器诊断 —— 冷却等待 10s 无温升会误锁存 heater_fault */
     if (cal_suppress || tip_guide)
@@ -866,7 +972,7 @@ static void run_pid_cycle(void)
         return;
     }
 
-    /* 3. 过温保护 (锁存: 直到手动清除才恢复, 防读数抖动在阈值附近反复开断) */
+    /* 步骤 3 · 过温保护 (锁存: 直到手动清除才恢复, 防读数抖动在阈值附近反复开断) */
     if (meas_temp > OVER_TEMP_LIMIT)
     {
         work.overtemp_fault = true;
@@ -877,7 +983,8 @@ static void run_pid_cycle(void)
     }
 
 #if !HW_SIM_MODE
-    /* 3.5 过流保护: AD_GetCurrent() = 导通相位采样 - 关断相位采样(同一注入组,
+
+    /* 步骤 4 · 过流保护: AD_GetCurrent() = 导通相位采样 - 关断相位采样(同一注入组,
      * CC4 逐帧在导通/关断中点交替触发, 两路都与 PWM 相位锁定)
      * 差分校准后消去运放失调/偏置, 接近真实工作电流, 超过阈值判过流 → 断热。
      * 只在真实硬件模式有效(HW_SIM 下无电流采样, 恒 0, 不触发)。 */
@@ -891,94 +998,18 @@ static void run_pid_cycle(void)
     }
 #endif
 
-    /* 4. 更新 PID 实测温度 */
+    /* 步骤 5 · 更新 PID 实测温度 */
     PID_Controller_SetMeasured(meas_temp);
 
-    /* 4.5 自整定模式: 继电反馈. 过温/过流保护已在上方执行; 整定中跳过
-     * PID/前馈(由继电输出接管)与加热诊断(振荡温升会误报诊断). */
-    if (PID_TuneActive())
-    {
-        work.power = PID_TuneAdvance(meas_temp);
-        Heater_SetPower(work.power);
-
-        if (PID_TuneFinish())
-        {
-            if (PID_TuneLastSucceeded())
-            {
-                PID_Gain_t tg;
-                uint8_t h = Config_GetHandleIdx();
-                PID_TuneGetResult(&tg);
-                /* 钳位到页面可显示/可编辑上限(与 page/pid.c 同源): 整定短暂可产出
-                 * Kd 达 3×10^4(经 tune_gain_sat 饱和到 32767), 原样存入会让用户
-                 * 一进 PID 页就被页面上限静默钳掉, 且 2 位整数显示截断高位. */
-                if (tg.kp > PID_KP_MAX) tg.kp = PID_KP_MAX;
-                if (tg.ki > PID_KI_MAX) tg.ki = PID_KI_MAX;
-                if (tg.kd > PID_KD_MAX) tg.kd = PID_KD_MAX;
-                int16_t old_kp = g_config.pid_cons_kp[h];
-                int16_t old_ki = g_config.pid_cons_ki[h];
-                int16_t old_kd = g_config.pid_cons_kd[h];
-                bool saved;
-
-                g_config.pid_cons_kp[h] = tg.kp;   /* 写入当前型号保守组 */
-                g_config.pid_cons_ki[h] = tg.ki;
-                g_config.pid_cons_kd[h] = tg.kd;
-                saved = Config_Save();
-                work.tune_save_succeeded = saved;
-
-                if (!saved)
-                {
-                    /* 保存失败时运行参数、RAM 配置均回滚到整定前快照.
-                     * Config_Save 先擦页再写; 若失败发生在擦除之后, 旧 Flash 内容可能已
-                     * 不完整, 故恢复旧值后尽力再写一次. 若 Flash 持续故障, 持久化状态仍
-                     * 无法保证, 但本次运行绝不启用未保存的新增益, 且 UI 明确报告失败. */
-                    g_config.pid_cons_kp[h] = old_kp;
-                    g_config.pid_cons_ki[h] = old_ki;
-                    g_config.pid_cons_kd[h] = old_kd;
-                    (void)Config_Save();
-                    Buzzer_Beep(BUZZER_EVENT_ALARM);
-                }
-                else
-                {
-                    Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
-                }
-
-                /* 仅成功落盘的新参数可用于本次运行; 失败则从已回滚的旧配置重载.
-                 * Reload 内含 Reset, 也清除整定期间遗留的微分历史, 避免首帧尖峰. */
-                PID_Controller_Reload();
-            }
-            else
-            {
-                Buzzer_Beep(BUZZER_EVENT_ALARM);
-            }
-            PID_TuneAbort();   /* 复位状态机(keep: half_count 供进度显示,
-                                * last_success 供页面显示成败) */
-        }
+    /* 步骤 6 · 自整定模式: 继电反馈. 整定中跳过 PID/前馈与加热诊断. */
+    if (run_autotune_cycle(meas_temp))
         return;
-    }
 
-    /* 5. 前馈与 PID 协同: 前馈查表连续增加冷启动/大焊点功率, 并把实际前馈下限
-     * 传入 PID, 让积分器在前馈主导时冻结正向累积. 高误差下仍计算激进 PID,
-     * 不再在 50°C 处从约 600 直接切到 900; 前馈曲线在 50°C 为 600、100°C 为 900.
-     * 参数组也在 25~35°C 误差范围渐变, 避免旧 30°C 边界的增益跳变. */
+    /* 步骤 7 · 前馈与 PID 协同: 前馈按温差连续给基础功率, 并把实际前馈下限传入
+     * PID, 让积分器在前馈主导时冻结正向累积; 最终取 max(PID, 前馈). */
     {
-        static const int16_t ff_d[5] = { 0, 10, 25, 50, 100 };
-        static const int16_t ff_v[5] = { 0, 180, 350, 600, 900 };
-        int16_t setpoint = PID_Controller_GetSetpoint();
-        int16_t diff     = (int16_t)(setpoint - meas_temp);   /* >0 = 需要加热 */
-        int16_t ff       = 0;
-
-        if (diff >= ff_d[4])
-            ff = ff_v[4];
-        else if (diff > 0)
-        {
-            uint8_t k;
-            for (k = 0; k < 4; k++)
-                if (diff < ff_d[k + 1])
-                    break;
-            ff = (int16_t)(ff_v[k] +
-                 (int32_t)(ff_v[k + 1] - ff_v[k]) * (diff - ff_d[k]) /
-                 (ff_d[k + 1] - ff_d[k]));
-        }
+        int16_t diff = (int16_t)(PID_Controller_GetSetpoint() - meas_temp);
+        int16_t ff   = feedforward_for(diff);
 
         power = PID_Controller_Compute(ff);
         if (power < ff)
@@ -986,37 +1017,13 @@ static void run_pid_cycle(void)
     }
     work.power = power;
 
-    /* 6. 设置加热器功率 */
+    /* 步骤 8 · 设置加热器功率 */
     Heater_SetPower(power);
 
-    /* 7. 检测温度是否到达目标 */
-    {
-        int16_t setpoint = PID_Controller_GetSetpoint();
-        int16_t diff = meas_temp - setpoint;
-        if (diff < 0)
-            diff = (int16_t)(-diff);
+    /* 步骤 9 · 检测温度是否到达目标 */
+    update_temp_reached(meas_temp);
 
-        /* 去抖: 连续 TEMP_REACHED_CNT 个周期在阈值内才置位; 一旦越界立即清零
-         * (置位慢、清除快 —— 提示要稳, 退出要及时) */
-        if (diff <= TEMP_REACHED_THRESHOLD)
-        {
-            if (work.reached_cnt < TEMP_REACHED_CNT)
-                work.reached_cnt++;
-        }
-        else
-        {
-            work.reached_cnt = 0;
-        }
-        work.temp_reached = (work.reached_cnt >= TEMP_REACHED_CNT);
-
-        if (work.temp_reached && !work.temp_reached_prev)
-        {
-            Buzzer_Beep(BUZZER_EVENT_TEMP_REACHED);
-        }
-        work.temp_reached_prev = work.temp_reached;
-    }
-
-    /* 8. 加热器故障检测 (自整定期间已在上方提前返回, 不在此列) */
+    /* 步骤 10 · 加热器故障检测 (自整定期间已在步骤 6 提前返回, 不在此列) */
     check_heater_diagnostic(Timer_GetTick());
 }
 
@@ -1072,8 +1079,12 @@ void WorkTask_Init(void)
     PID_Controller_SetSetpoint((int16_t)g_config.default_temp);
     PID_Controller_Reset();
 
-    /* 运行时目标温度初值 = 默认温度 (RAM, 掉电丢失) */
-    runtime_temp = (int16_t)g_config.default_temp;
+    /* 运行时目标温度初值 = 默认温度 (RAM, 掉电丢失).
+     * 走 SetRuntimeTemp 而不是直接赋值: Flash 里的 default_temp 可能越界(旧固件
+     * 写入 / 数据损坏), 直接赋值会让 HOME 显示一个超出可调范围的温度, 而 PID 目标
+     * 早已被 SetSetpoint 钳过 —— 显示与实际不一致, 且用户第一次转动编码器时数值
+     * 会"跳"回范围内. */
+    WorkTask_SetRuntimeTemp((int16_t)g_config.default_temp);
 
     /* 首次引导: 模拟模式自检直接完成, 此时即"即将进入正常加热"前一刻;
      * 真实模式由 selftest_advance 全链路通过时置位(引导不能早于自检结束,
