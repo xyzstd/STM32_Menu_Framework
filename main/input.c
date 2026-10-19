@@ -19,20 +19,25 @@
  * 旋转事件另带时间戳，主循环阻塞恢复后会丢弃过期旋转，避免陈旧动作突然补执行。 */
 #define INPUT_EVT_QUEUE_SIZE       32u
 #define INPUT_EVT_QUEUE_MASK       (INPUT_EVT_QUEUE_SIZE - 1u)
-#define INPUT_KEY_RESERVED_SLOTS    4u
+#define INPUT_KEY_RESERVED_SLOTS    3u
 /* 编码器可占用格数: 容量 − 1 个空槽判定位 − 按键预留槽.
  * 命名出来, 免得 evt_enqueue 里每次现算三个常量相减(读者要自己验算式). */
 #define INPUT_ENCODER_MAX_SLOTS    (INPUT_EVT_QUEUE_SIZE - 1u - INPUT_KEY_RESERVED_SLOTS)
 #define INPUT_ENCODER_MAX_AGE_MS   12u
 
+/* 相位锁死时批量作废的旋转事件标记: 不是合法菜单事件, 消费时直接跳过.
+ * 用"逐格作废"而不是清空队列, 是为了不牵连按键 —— 本队列的基本约定是
+ * "旋转可丢、按键不可丢"(见 evt_enqueue 的预留槽). */
+#define INPUT_EVT_DROPPED          0xFFu
+
 /* 每轮主循环最多分发的事件数。
- * 常规 2: 配合渲染层 UI_RENDER_COOLDOWN_MS(2ms) 合并窗口, 快速旋转时逐格跟手。
+ * 常规 4: 配合渲染层 UI_RENDER_COOLDOWN_MS(2ms) 合并窗口, 快速旋转时逐格跟手。
  * 队列中已有按键待处理时放宽到 8: 按键**不插队** —— 队列里积压的旋转是"按键之前
  * 产生、且尚未显示"的输入(menu_notify 是 dispatch 与 UI_RequestRefresh 绑定的),
  * 让按键插到它们前面会把按键落到过期的选中项上(点错目标), 随后那几格旋转再落进
  * 新页面, 与"进子菜单卡一格"是同一类错位。所以只加速排空、不改顺序, 使按键延迟
  * 从 "N 轮" 降到 "约 1 轮"。放宽期间渲染仍受 2ms 合并窗口约束, 不会连刷。 */
-#define INPUT_DRAIN_NORMAL  2u
+#define INPUT_DRAIN_NORMAL  4u
 #define INPUT_DRAIN_BURST   8u
 
 /* 消费上限守卫: 放宽值必须严格大于常规值(否则"按键在场时加速排空"名不副实,
@@ -54,7 +59,7 @@ typedef char input_evt_queue_size_must_be_valid[
 
 typedef struct {
     uint16_t tick16;   /* Timer_GetTick 低 16 位; 事件年龄远小于 32768ms */
-    int8_t   step;     /* 当前队列仅存 -1/0/+1 */
+    int8_t   step;     /* 编码器步恒为 +1, 按键为 0(方向只编码在 event 里, 无负值) */
     uint8_t  event;
 } input_evt_t;
 
@@ -269,7 +274,8 @@ void Input_Init(void)
 }
 
 
-/* 主循环每轮出队并分发事件. 三条规则, 与下面的编号一一对应:
+/* 主循环每轮出队并分发事件. 四条规则, 与下面的编号一一对应:
+ *   ⓪ 编码器相位锁死(累计原始计数超阈值仍无步)时, 作废积压旋转事件并重同步相位;
  *   ① 过期旋转(超 INPUT_ENCODER_MAX_AGE_MS)直接丢弃, 不占本轮额度、不在阻塞恢复后补执行;
  *   ② 每轮消费上限 INPUT_DRAIN_NORMAL, 队列中有按键待处理时放宽到 INPUT_DRAIN_BURST;
  *   ③ 分发后若菜单上下文指纹变化, 调 Input_ResetForJump 复位输入(清队列 + 重同步相位). */
@@ -277,12 +283,33 @@ void Input_Process(void)
 {
     input_evt_t evt;
     uint8_t n = 0;
-    uint8_t budget = Input_HasKeyPending() ? INPUT_DRAIN_BURST : INPUT_DRAIN_NORMAL;
+    uint8_t budget;
+
+    /* ⓪ 相位锁死自恢复: 判定在 bsp/encoder.c. 只作废旋转事件、保留按键, 再重同步
+     * 相位 —— 下一格即可正常出步, 不需要用户反向旋转.
+     * 只改写 [head, tail) 区间: 生产者(中断)只往 tail 追加, 不会回写该区间;
+     * 且队列的 head 只有消费者能改, 故不能在中断里做这件事. */
+    if (Encoder_TakeStuck())
+    {
+        uint8_t i = evt_q.head;
+
+        while (i != evt_q.tail)
+        {
+            if (is_encoder_evt(&evt_q.buf[i]))
+                evt_q.buf[i].event = INPUT_EVT_DROPPED;
+            i = (uint8_t)((i + 1u) & INPUT_EVT_QUEUE_MASK);
+        }
+
+        Encoder_RequestResync();
+    }
+
+    budget = Input_HasKeyPending() ? INPUT_DRAIN_BURST : INPUT_DRAIN_NORMAL;
 
     while (n < budget && evt_dequeue(&evt))
     {
-        /* ① 过期旋转丢弃: 不让旧输入在阻塞恢复后突然执行 */
-        if (is_encoder_evt(&evt) && evt_age_ms(&evt) > INPUT_ENCODER_MAX_AGE_MS)
+        /* ① 过期/已作废的旋转丢弃: 不让旧输入在阻塞恢复后突然执行 */
+        if (evt.event == INPUT_EVT_DROPPED ||
+            (is_encoder_evt(&evt) && evt_age_ms(&evt) > INPUT_ENCODER_MAX_AGE_MS))
             continue;
 
         n++;   /* ② 只有真正分发的才计入本轮额度 */

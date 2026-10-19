@@ -19,8 +19,17 @@
 
 #define ENC_TICKS_PER_STEP  4   /* 每齿格的正交计数(满 4 计数 = 一个菜单步) */
 
+/* 卡死自恢复阈值(原始计数): 正常转动时两次出步之间的累计原始计数不会超过 ~8;
+ * 叠加换向反射与触点抖动, 最坏合法情况约 12. 取 16 留余量 —— 若累计到 16 仍无步,
+ * 说明相位被反向抖动反复反射吃空(表现为"快速旋转时界面不动, 要反向才恢复").
+ * 此时丢弃残差相位并请求上层作废积压旋转事件, 下一格即可正常出步, 无需反向.
+ * 快速旋转下 16 计数约 60~100ms, 恢复延迟不可感知. */
+#define ENC_STUCK_COUNTS    16
+
 static uint16_t enc_last = 0;   /* 上次读取的计数器值 */
 static int16_t  enc_acc  = 0;   /* 未满一格的余量计数 */
+static uint16_t enc_stuck_acc = 0;            /* 自上次出步以来累计的原始计数(饱和) */
+static volatile bool enc_stuck_req = false;   /* 相位锁死: 请求上层清事件队列 */
 
 /* 跳转重同步请求: 主循环置位、取样上下文执行(见 Encoder_RequestResync).
  * 单字节标志, 主循环写/中断读, 无需临界区. */
@@ -96,6 +105,7 @@ int16_t Encoder_GetSteps(void)
     {
         enc_resync_req = false;
         enc_acc = 0;
+        enc_stuck_acc = 0;
     }
 
     if (delta == 0)
@@ -105,6 +115,15 @@ int16_t Encoder_GetSteps(void)
     residual = enc_acc;
     steps = 0;
     dir = (delta > 0) ? 1 : -1;
+
+    /* 累计原始计数(含反向抖动): 出步即清零, 用于卡死判定 */
+    {
+        int32_t ad = (delta > 0) ? delta : -(int32_t)delta;
+
+        enc_stuck_acc = (ad > (int32_t)(0xFFFFu - enc_stuck_acc))
+                      ? (uint16_t)0xFFFFu
+                      : (uint16_t)(enc_stuck_acc + ad);
+    }
 
     /* 转向预支: 若新方向与旧残差反号, 先只处理第一个单位计数.
      * sum 仍与旧残差同号=该单位尚未越锚, 反射相位; 随后残差已与新方向同号,
@@ -126,7 +145,29 @@ int16_t Encoder_GetSteps(void)
     steps = (int16_t)(residual / ENC_TICKS_PER_STEP);  /* C99 有符号除法向零截断 */
     residual -= (int32_t)steps * ENC_TICKS_PER_STEP;
     enc_acc = (int16_t)residual;
+
+    if (steps != 0)
+        enc_stuck_acc = 0;
+    else if (enc_stuck_acc >= ENC_STUCK_COUNTS)
+    {
+        enc_acc = 0;            /* 丢弃残差相位: 下一格重新从 0 起算 */
+        enc_stuck_acc = 0;
+        enc_stuck_req = true;   /* 队列清空由主循环(消费者)执行 */
+    }
+
     return steps;
+}
+
+
+/* 取走"相位锁死"请求(见 ENC_STUCK_COUNTS): true = 已判死并丢弃了残差相位,
+ * 调用方应作废积压的旋转事件(旧事件对应的相位已失效)。主循环上下文调用。 */
+bool Encoder_TakeStuck(void)
+{
+    if (!enc_stuck_req)
+        return false;
+
+    enc_stuck_req = false;
+    return true;
 }
 #undef TIMx
 #undef TIMx_CLK

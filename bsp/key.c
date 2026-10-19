@@ -1,4 +1,5 @@
 #include "stm32f10x.h"
+#include <stdbool.h>
 #include "key.h"
 
 
@@ -32,7 +33,7 @@ void Key_Init(key_info_t *key, GPIO_TypeDef *gpio, uint16_t pin, void (*callback
 }
 
 
-static uint8_t is_key_pressed(key_info_t *key)
+static bool is_key_pressed(key_info_t *key)
 {
     return !GPIO_ReadInputDataBit(key->gpiox, key->key_pin);
 }
@@ -119,7 +120,7 @@ static void process_key_pressed(key_info_t *key)
     }
 }
 
-static void process_pressed_release(key_info_t *key)
+static void process_key_wait_release(key_info_t *key)
 {
     if(!is_key_pressed(key))
     {
@@ -139,7 +140,7 @@ static void process_pressed_release(key_info_t *key)
 
 static void process_key_click_judge(key_info_t *key)
 {
-#if defined(ENABLE_DCLICK) && ENABLE_DCLICK==1
+#if ENABLE_DCLICK
     update_timer(key);
 
     if(is_key_pressed(key))
@@ -147,15 +148,14 @@ static void process_key_click_judge(key_info_t *key)
         if(key->timer <= KEY_DOUBLE_TIME)
             key->event_callback(KEY_EVENT_DOUBLE_CLICK);
         key->state = KEY_STATE_WAIT_RELEASE;
+        return;
     }
-    else if(key->timer > KEY_DOUBLE_TIME)
-    {
+
+    if(key->timer <= KEY_DOUBLE_TIME)
+        return;
 #endif
-        key->event_callback(KEY_EVENT_CLICK);
-        key->state = KEY_STATE_IDLE;
-#if defined(ENABLE_DCLICK) && ENABLE_DCLICK==1
-    }
-#endif
+    key->event_callback(KEY_EVENT_CLICK);
+    key->state = KEY_STATE_IDLE;
 }
 
 
@@ -183,7 +183,7 @@ void Key_Scan(key_info_t *key)
             break;
 
         case KEY_STATE_WAIT_RELEASE:
-            process_pressed_release(key);
+            process_key_wait_release(key);
             break;
 
         case KEY_STATE_CLICK_JUDGE:
