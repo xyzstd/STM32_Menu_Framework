@@ -1,4 +1,4 @@
-﻿#include "menu.h"
+#include "menu.h"
 
 typedef struct{
     uint8_t current;
@@ -115,7 +115,7 @@ void Menu_EventDispatch(const menu_cmd_t *cmd)
 static void menu_state_handler(const menu_cmd_t *cmd)
 {
     const menu_item_t *item=Menu_GetItem(menu_ctrl.current);
-    menu_result_t ret=MENU_RET_OK;
+    menu_result_t ret=MENU_RET_STAY;
     uint8_t acted_id;
 
     if(item==NULL || !menu_ops_activatable(item->ops))
@@ -225,7 +225,7 @@ static void menu_back(void)
     if(!item)
         return;
 
-    if(item->parent >= menu_max_num)
+    if(item->parent == MENU_NO_PARENT || item->parent >= menu_max_num)
         return;
 
     menu_ctrl.current=item->parent;

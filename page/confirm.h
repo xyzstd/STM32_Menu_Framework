@@ -14,7 +14,7 @@
  *       menu_result_t r = confirm_handle(cmd, &cf, &ok);
  *       if (ok) { ...执行写操作...; return MENU_RET_DONE; }   // YES 确认
  *       if (r == MENU_RET_DONE) { ...取消处理...; return ...; } // NO / 长按取消
- *       return MENU_RET_OK;                                    // 仍在确认态
+ *       return MENU_RET_STAY;                                    // 仍在确认态
  *   }
  * 显示: confirm_display(&cf, title) 只画内容(不含 Clear/Update, 由宿主统一管理). */
 typedef struct {

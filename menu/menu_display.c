@@ -268,9 +268,14 @@ static menu_period_t menu_list_display(void)
 
     if (!Menu_GetSiblingRange(selected, &first, &last))
     {
-        /* 当前节点无兄弟列表(孤立/配置错误): 退出列表态, 清除窗口记录 */
+        /* 当前节点无兄弟列表(孤立/表配置错误): 回落 HOME, 不能只清窗口记录就返回 ——
+         * 那样既不重绘也不跳转, 屏幕停在旧帧且方向键全部失效(无法自愈), 是内核里
+         * 唯一会"冻屏"的路径. 跳转后返回一个短周期, 让调度方在 20ms 内再渲染一帧
+         * (此时状态已是 HOME 的 handler, 走 menu_page_display).
+         * 正常导航不会进入本分支, 故不影响任何既有行为. */
         win_first = 0xFF;
-        return 0;
+        Menu_SetCurrentId(MENU_HOME_ID);
+        return 20;
     }
 
     uint8_t count = last - first + 1;

@@ -178,7 +178,7 @@ static menu_result_t sleep_set_edit(const menu_cmd_t *cmd)
     default:
         break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 static void sleep_set_enter(void *ud)
@@ -414,7 +414,7 @@ static menu_result_t func_set_edit(const menu_cmd_t *cmd)
     default:
         break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 static void func_set_enter(void *ud)
@@ -548,7 +548,7 @@ static menu_result_t reset_handler(const menu_cmd_t *cmd, void *ud)
     }
     if (r == MENU_RET_DONE)
         return MENU_RET_DONE;   /* 选 NO / 长按: 取消并退出 */
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 static menu_period_t reset_display(void *ud)
@@ -574,7 +574,7 @@ static menu_result_t version_handler(const menu_cmd_t *cmd, void *ud)
     (void)ud;
     if (cmd->event == MENU_EVENT_CLICK || cmd->event == MENU_EVENT_LPRESS)
         return MENU_RET_DONE;   /* 结束本页(叶子项) → 回父列表 */
-    return MENU_RET_OK;         /* UP/DOWN: 只读页无内容可滚, 忽略留守 */
+    return MENU_RET_STAY;         /* UP/DOWN: 只读页无内容可滚, 忽略留守 */
 }
 
 /* 只显示版本号, 8x16 居中(水平 (128-8*len)/2, 垂直 (64-16)/2 = 24)。

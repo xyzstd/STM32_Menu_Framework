@@ -1,16 +1,16 @@
-﻿#ifndef __MENU_H
+#ifndef __MENU_H
 #define __MENU_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 
-#define MENU_NO_PARENT 0U    /* parent: 无父(仅占位虚拟根, parent 也指向自身 0) */
-#define MENU_NO_CHILD  0U    /* first_child: 叶子项无子项 */
-#define MENU_HOME_ID 1U      /* HOME 位于索引 0 的占位虚拟根之下 */
-#define MENU_LEAF    0U       /* child_num: 叶子项无子项个数 */
+#define MENU_NO_PARENT 0U    /* parent: none; only the virtual root, which points to itself */
+#define MENU_NO_CHILD  0U    /* first_child: leaf has no children */
+#define MENU_HOME_ID 1U      /* HOME is the only child of the virtual root at index 0 */
+#define MENU_LEAF    0U      /* child_num: leaf has no children */
 
-#define MENU_FLAG_DIRECT_HANDLER  0x01U   /* 常驻页: 进入/返回时直接激活为 handler(如 HOME) */
+#define MENU_FLAG_DIRECT_HANDLER  0x01U   /* resident page: enter/back activates it as handler (e.g. HOME) */
 
 typedef enum{
     MENU_EVENT_UP=0,
@@ -20,8 +20,8 @@ typedef enum{
 }menu_event_t;
 
 typedef struct{
-	menu_event_t event;
-	int16_t step;
+    menu_event_t event;
+    int16_t step;
 }menu_cmd_t;
 
 typedef enum{
@@ -30,8 +30,8 @@ typedef enum{
 }menu_state_t;
 
 typedef enum{
-    MENU_RET_OK=0,          /* 继续处理, 留在本页 */
-    MENU_RET_DONE,          /* 结束本页; 离场方向由节点结构(child_num)推导: 有子项→下钻, 否则→回父列表 */
+    MENU_RET_STAY=0,
+    MENU_RET_DONE,
 }menu_result_t;
 
 typedef uint16_t menu_period_t;
@@ -48,9 +48,9 @@ typedef struct{
     uint8_t parent;
     uint8_t first_child;
     uint8_t child_num;
-	uint8_t flags;
+    uint8_t flags;
     const char *name;
-	void *user_data;
+    void *user_data;
     const menu_ops_t *ops;
 }menu_item_t;
 

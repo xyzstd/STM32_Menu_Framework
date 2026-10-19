@@ -61,7 +61,7 @@ menu_result_t param_handler(const menu_cmd_t *cmd, param_t *it)
     default:
         break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 param_exit_result_t param_exit(param_t *it)

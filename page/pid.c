@@ -99,7 +99,7 @@ static menu_result_t pid_edit_handler(const menu_cmd_t *cmd, pid_edit_t *e)
     default:
         break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 /* ==================== 激进参数: 载入/落盘 ==================== */

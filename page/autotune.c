@@ -49,7 +49,7 @@ static menu_result_t tune_handler(const menu_cmd_t *cmd, void *ud)
             PID_TuneAbort();   /* 主动退出: 中止未完成整定 */
         return MENU_RET_DONE;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 static void tune_exit(void *ud)

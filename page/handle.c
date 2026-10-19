@@ -133,7 +133,7 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
     /* 结论由 display 轮询取回. 此处忽略事件, 防止 cur_idx 在检测期间被改,
      * 造成"检测的是 A 型号、落地的是 B 型号". 链检约一个 PID 周期(200ms). */
     if (chk_active)
-        return MENU_RET_OK;
+        return MENU_RET_STAY;
 
     /* ---- 确认页处理 (优先) ---- */
     if (cf.active)
@@ -153,17 +153,17 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
                 {
                     Buzzer_Beep(BUZZER_EVENT_ALARM);
                     cf.active = false;   /* 未受理(故障/自检中/已有测量): 退回重选 */
-                    return MENU_RET_OK;
+                    return MENU_RET_STAY;
                 }
                 chk_active = true;       /* 进入链检: 结果由 display 轮询 */
-                return MENU_RET_OK;
+                return MENU_RET_STAY;
             }
 
             /* 同型号确认(未真正切换): 返回上一层 */
             return MENU_RET_DONE;
         }
         /* 选"否"/长按: 取消, 返回单型号视图重选; 其余仍在确认态 */
-        return MENU_RET_OK;
+        return MENU_RET_STAY;
     }
 
     /* ---- 单个型号视图 ---- */
@@ -187,7 +187,7 @@ static menu_result_t handle_handler(const menu_cmd_t *cmd, void *ud)
         default:
             break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 static menu_period_t handle_display(void *ud)

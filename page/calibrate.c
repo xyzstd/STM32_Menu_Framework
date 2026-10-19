@@ -142,7 +142,7 @@ static menu_result_t calibrate_handler(const menu_cmd_t *cmd, void *user_data)
         default:
             break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 static menu_period_t calibrate_display(void *user_data)

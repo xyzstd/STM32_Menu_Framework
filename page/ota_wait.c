@@ -29,7 +29,7 @@ static menu_result_t ota_wait_handler(const menu_cmd_t *cmd, void *user_data)
     (void)user_data;
     if (cmd->event == MENU_EVENT_LPRESS)
         return MENU_RET_DONE;   /* 长按: 放弃等待, 返回列表 */
-    return MENU_RET_OK;         /* CLICK/UP/DOWN: 留在本页继续等握手 */
+    return MENU_RET_STAY;         /* CLICK/UP/DOWN: 留在本页继续等握手 */
 }
 
 static menu_period_t ota_wait_display(void *user_data)

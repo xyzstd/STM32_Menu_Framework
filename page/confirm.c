@@ -39,7 +39,7 @@ menu_result_t confirm_handle(const menu_cmd_t *cmd, confirm_t *c, bool *confirme
     default:
         break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 void confirm_display(const confirm_t *c, const char *title)

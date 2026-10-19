@@ -168,13 +168,13 @@ static menu_result_t cur_cal_handler(const menu_cmd_t *cmd, void *ud)
                 Buzzer_Beep(BUZZER_EVENT_ALARM);
             /* 跳转后由内核重同步编码器相位(见 input.c 的 menu_ctx) */
             Menu_SetCurrentId(MENU_HOME_ID);   /* 跳过引导: 回 HOME (exit 清标志) */
-            return MENU_RET_OK;
+            return MENU_RET_STAY;
         }
         return MENU_RET_DONE;
     default:
         break;
     }
-    return MENU_RET_OK;
+    return MENU_RET_STAY;
 }
 
 static void cur_cal_enter(void *ud)

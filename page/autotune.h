@@ -1,4 +1,4 @@
-﻿#ifndef __AUTOTUNE_H
+#ifndef __AUTOTUNE_H
 #define __AUTOTUNE_H
 
 #include "menu.h"
