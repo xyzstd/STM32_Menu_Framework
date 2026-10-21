@@ -6,9 +6,8 @@
 void Input_Init(void);
 void Input_Process(void);   /* 主循环: 消费事件队列, 执行菜单逻辑 */
 void Input_ClearEvents(void); /* 主循环: 清空事件队列(跳转后丢弃积压事件) */
-void Input_ResyncEncoder(void); /* 跳转后重同步编码器相位(丢弃未满一格的残留, 计数基准不动) */
 
-/* 页面切换后的输入复位: 清空积压事件 + 重同步编码器半格相位(等价于上面两个函数)。
+/* 页面切换后的输入复位: 清空积压事件 + 重同步编码器半格相位。
  * 打包成一个调用, 调用点不会再漏掉一半、或把顺序写错。
  * ⚠️ 必须在**跳转之后**调用 —— 跳转会经 menu_exit_handler 调当前页的 exit, 参数页
  * dirty 时 param_exit → Config_Save() 要擦写 Flash 25~50ms, 期间 TIM2 照常把编码器/

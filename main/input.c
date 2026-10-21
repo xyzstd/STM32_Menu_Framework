@@ -12,7 +12,6 @@
 #define ENC_MAX_EVENTS_PER_POLL  4
 
 /* 采样分频(ms): 定时器节拍 1ms. */
-#define KEY_SCAN_MS      5
 #define ENC_POLL_MS      4
 
 /* 单队列 SPSC：保留末尾槽位给按键事件；旋转事件达到阈值就丢弃最新值。
@@ -93,7 +92,9 @@ static inline uint8_t evt_used(void)
     return (uint8_t)((uint8_t)(evt_q.tail - evt_q.head) & INPUT_EVT_QUEUE_MASK);
 }
 
-/* 按键事件 = 需要预留槽的那一类: 旋转可以丢, 按键不能丢 */
+/* 按键事件 = 需要预留槽的那一类: 旋转可以丢, 按键不能丢.
+ * 队列里只有按键与旋转两类事件, 故本函数同时定义了"旋转事件" —— 别处一律用
+ * !is_key_event(...), 不要再写一个 is_encoder_evt, 否则新增事件类型时两处会漂移. */
 static inline bool is_key_event(uint8_t event)
 {
     return event == MENU_EVENT_CLICK || event == MENU_EVENT_LPRESS;
@@ -131,17 +132,6 @@ static bool evt_dequeue(input_evt_t *out)
 }
 
 
-/* 列表态的方向反转: 正转(UP)在列表里是"下移". UP/DOWN 之外原样返回,
- * 调用方不必先判类型 —— 把"只对方向事件生效"这一条件收进函数本身. */
-static inline menu_event_t menu_list_dir(menu_event_t event)
-{
-    if (event == MENU_EVENT_UP)
-        return MENU_EVENT_DOWN;
-    if (event == MENU_EVENT_DOWN)
-        return MENU_EVENT_UP;
-    return event;
-}
-
 /* 事件出口(主循环上下文): 唤醒 + 方向映射 + 分发 + 请求刷新.
  * 编码器入队语义为原始方向: 正向=UP(增大), 反向=DOWN. 消费时映射:
  *   - 列表导航(NORMAL): 反转, 正转→DOWN(菜单下移, 原语义);
@@ -151,7 +141,12 @@ static void menu_notify(menu_cmd_t *cmd)
     WorkTask_MarkActivity();
 
     if (Menu_GetState() == MENU_STATE_NORMAL)
-        cmd->event = menu_list_dir(cmd->event);
+    {
+        if (cmd->event == MENU_EVENT_UP)
+            cmd->event = MENU_EVENT_DOWN;
+        else if (cmd->event == MENU_EVENT_DOWN)
+            cmd->event = MENU_EVENT_UP;
+    }
 
     Menu_EventDispatch(cmd);
     UI_RequestRefresh();
@@ -243,12 +238,6 @@ static inline uint16_t evt_age_ms(const input_evt_t *evt)
     return (uint16_t)((uint16_t)Timer_GetTick() - evt->tick16);
 }
 
-/* 旋转事件 = 带"过期"语义的那一类(按键永不丢弃) */
-static inline bool is_encoder_evt(const input_evt_t *evt)
-{
-    return evt->event == MENU_EVENT_UP || evt->event == MENU_EVENT_DOWN;
-}
-
 /* 分发一条事件, 返回 true = 菜单上下文已变(调用方需复位输入) */
 static bool input_dispatch(const input_evt_t *evt)
 {
@@ -295,7 +284,7 @@ void Input_Process(void)
 
         while (i != evt_q.tail)
         {
-            if (is_encoder_evt(&evt_q.buf[i]))
+            if (!is_key_event(evt_q.buf[i].event))
                 evt_q.buf[i].event = INPUT_EVT_DROPPED;
             i = (uint8_t)((i + 1u) & INPUT_EVT_QUEUE_MASK);
         }
@@ -309,7 +298,7 @@ void Input_Process(void)
     {
         /* ① 过期/已作废的旋转丢弃: 不让旧输入在阻塞恢复后突然执行 */
         if (evt.event == INPUT_EVT_DROPPED ||
-            (is_encoder_evt(&evt) && evt_age_ms(&evt) > INPUT_ENCODER_MAX_AGE_MS))
+            (!is_key_event(evt.event) && evt_age_ms(&evt) > INPUT_ENCODER_MAX_AGE_MS))
             continue;
 
         n++;   /* ② 只有真正分发的才计入本轮额度 */
@@ -318,16 +307,6 @@ void Input_Process(void)
         if (input_dispatch(&evt))
             Input_ResetForJump();
     }
-}
-
-
-/* 重同步编码器相位(丢弃未满一格的残留计数).
- * 常规调用路径是 Input_ResetForJump(它同时清队列) —— 单独用本函数只在"不需要
- * 丢事件、只想丢半格残留"的场合。与 Input_ClearEvents 同层暴露: 页面/调度层
- * 只依赖 input.h, 不直接触碰 bsp/encoder.h. */
-void Input_ResyncEncoder(void)
-{
-    Encoder_RequestResync();
 }
 
 
@@ -351,7 +330,7 @@ void Input_ClearEvents(void)
 void Input_ResetForJump(void)
 {
     Input_ClearEvents();
-    Input_ResyncEncoder();
+    Encoder_RequestResync();
 }
 
 
