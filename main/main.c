@@ -93,7 +93,7 @@ int main(void)
         Buzzer_Process();
         WorkTask_Process();
         UI_Task_Process();
-        OLED_FlushStep();   /* 分帧刷屏: 每轮推一页(≤1.5ms), 避免整屏推送阻塞输入 */
+        OLED_FlushStep();   /* 分帧刷屏: 每轮 1~2 页(≤6.4ms), 避免整屏推送阻塞输入 */
         Watchdog_Kick();    /* 喂狗: 主循环正常运行时周期性刷新 */
     }
 }
