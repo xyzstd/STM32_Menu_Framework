@@ -189,9 +189,10 @@ uint16_t AD_GetValue(uint8_t channel_adc)
     }
 
     /* 去极值平均: 丢弃一帧最大、一帧最小(偶发毛刺/PWM 开关沿), 对剩余 N-2 帧求均值
-     * (四舍五入), 避免被单帧毛刺拉偏。 */
+     * (四舍五入), 避免被单帧毛刺拉偏。四舍五入加的是"半个除数"(N-2)/2 = 3, 而非
+     * N/2 = 4 —— 后者会让余数在 2/6 处就进位, 比正确四舍五入平均偏高 1/6 LSB。 */
     sum -= (uint32_t)vmin + vmax;
-    return (uint16_t)((sum + TEMP_OVERSAMPLE / 2) / (TEMP_OVERSAMPLE - 2));
+    return (uint16_t)((sum + (TEMP_OVERSAMPLE - 2) / 2) / (TEMP_OVERSAMPLE - 2));
 }
 
 /* 读取 T12 热电偶温度 ADC (PA0, CH0) */
