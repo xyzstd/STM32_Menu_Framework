@@ -1,49 +1,50 @@
-﻿#ifndef __KEY_H
+#ifndef __KEY_H
 #define __KEY_H
 
 #include "stm32f10x.h"
 #include <stdint.h>
 
-#define ENABLE_DCLICK 0
 
-/* 计时阈值(单位: 扫描次数, 每 5ms 一次 —— 见 input.c 的 KEY_SCAN_MS) */
+#define KEY_SCAN_MS      5
+/* All thresholds are in scan ticks; one tick = KEY_SCAN_MS (5 ms), which input.c
+ * uses as the Key_Scan() period.
+ * They count CONSECUTIVE samples agreeing with the level being waited for, so
+ * contact bounce shorter than the threshold is discarded by construction. */
 enum{
-    KEY_DELAY_TIME     = 4,    /* 20ms: 按下/松手确认门槛 */
-    KEY_DOUBLE_TIME    = 0,    /* 双击判定窗口(ENABLE_DCLICK=0 时不用) */
-    KEY_LONG_TIME      = 80,  /* 400ms: 长按判定 */
-    KEY_ARM_LEVEL_TIME = 30    /* 150ms: 上电装填需连续见到的稳定高电平次数 */
+    KEY_PRESS_TICKS   = 5,    /* 25 ms of low level  -> press confirmed */
+    KEY_RELEASE_TICKS = 5,    /* 25 ms of high level -> release confirmed */
+    KEY_LONG_TICKS    = 80,   /* 400 ms held (from the confirmed press) -> LONG_PRESS */
+    KEY_ARM_TICKS     = 40    /* 200 ms of high level before the key is armed */
 };
 
-/* 按键事件类型 */
+/* Key events. NONE is never emitted; it only keeps a zeroed instance harmless. */
 typedef enum {
-    KEY_EVENT_NONE,                /* 无事件 */
-    KEY_EVENT_CLICK,               /* 单击事件 */
-    KEY_EVENT_DOUBLE_CLICK,        /* 双击事件 */
-    KEY_EVENT_LONG_PRESS           /* 长按事件 */
+    KEY_EVENT_NONE = 0,
+    KEY_EVENT_CLICK,        /* pressed then released before KEY_LONG_TICKS */
+    KEY_EVENT_LONG_PRESS    /* held for KEY_LONG_TICKS; the release is swallowed */
 } key_event_t;
 
-/* 按键状态 */
+/* Key states. Both edges are confirmed before anything is reported, so the
+ * consumer never sees bounce, and each state does exactly one job. */
 typedef enum {
-    KEY_STATE_ARM,                 /* 上电装填状态(等待引脚稳定为高) */
-    KEY_STATE_IDLE,                /* 空闲状态 */
-    KEY_STATE_DEBOUNCE,            /* 消抖状态(按下侧确认) */
-    KEY_STATE_PRESSED,             /* 按下状态 */
-    KEY_STATE_CLICK_JUDGE,         /* 松手后等待单击判定(ENABLE_DCLICK=0 时立即发 CLICK) */
-    KEY_STATE_WAIT_RELEASE,        /* 长按后等待松手(仅回 IDLE, 无事件) */
+    KEY_STATE_ARM = 0,      /* power-on: a key held through reset must not count */
+    KEY_STATE_RELEASED,     /* released, waiting for a press */
+    KEY_STATE_PRESSED,      /* press confirmed, measuring hold time */
+    KEY_STATE_WAIT_RELEASE  /* long press reported, waiting for the release */
 } key_state_t;
 
-/* 按键结构体, 存储按键状态及相关变量 */
+/* Key instance */
 typedef struct {
-    void (*event_callback)(key_event_t event); /* 事件回调函数 */
-    GPIO_TypeDef *gpiox;                       /* 按键所在 GPIO */
-    uint16_t key_pin;
-    key_state_t state;                         /* 当前按键状态 */
-    uint8_t timer;                             /* 计时器(扫描次数) */
-    uint8_t rel_cnt;                           /* 释放侧连续高电平计数(松手确认) */
+    void (*event_cb)(key_event_t event);   /* event callback */
+    GPIO_TypeDef *gpiox;                   /* GPIO port of the key */
+    uint16_t key_pin;                      /* pin mask, GPIO_Pin_x */
+    key_state_t state;                     /* current state */
+    uint8_t stable;                        /* consecutive samples matching the level being waited for */
+    uint8_t hold;                          /* samples since the press was confirmed */
 } key_info_t;
 
-/* 函数声明 */
-void Key_Init(key_info_t *key, GPIO_TypeDef *gpio, uint16_t pin, void (*callback)(key_event_t));
+/* API */
+void Key_Init(key_info_t *key, GPIO_TypeDef *gpio, uint16_t pin, void (*event_cb)(key_event_t));
 void Key_Scan(key_info_t *key);
 
 #endif
