@@ -42,18 +42,36 @@ def iter_sources():
 
 def main():
     fix = '--fix' in sys.argv
-    missing, ok, ascii_only, fixed = [], [], [], 0
+    missing, ok, ascii_only, fixed, dup = [], [], [], 0, []
 
     for path in iter_sources():
         with open(path, 'rb') as f:
             raw = f.read()
         rel = os.path.relpath(path, ROOT)
-        has_bom = raw.startswith(BOM)
-        non_ascii = any(b > 0x7F for b in (raw[3:] if has_bom else raw))
+
+        # BOM 会被编辑器反复叠加(每次保存都再写一个), 先剥掉所有前导 BOM 再数.
+        # 只剥字节层面的重复, 不动文件内容; 剥完的 raw_body 才是真正的文件正文.
+        n_bom = 0
+        while raw.startswith(BOM):
+            n_bom += 1
+            raw = raw[len(BOM):]
+
+        non_ascii = any(b > 0x7F for b in raw)
 
         if not non_ascii:
             ascii_only.append(rel)
-        elif has_bom:
+            if n_bom > 0 and fix:
+                # 纯 ASCII 却带 BOM: 与 menu.c/key.c 的"无 BOM"约定不一致
+                with open(path, 'wb') as f:
+                    f.write(raw)
+                fixed += 1
+        elif n_bom > 1:
+            dup.append((rel, n_bom))
+            if fix:
+                with open(path, 'wb') as f:
+                    f.write(BOM + raw)
+                fixed += 1
+        elif n_bom == 1:
             ok.append(rel)
         else:
             missing.append(rel)
@@ -67,11 +85,13 @@ def main():
     print('含非 ASCII 但缺 BOM   : %d' % len(missing))
     for p in missing:
         print('   MISSING  ' + p)
+    for p, n in dup:
+        print('   DUP %dx  %s' % (n, p))
     if fix and fixed:
-        print('\n已补回 BOM: %d 个文件' % fixed)
-    elif missing and not fix:
-        print('\n用 --fix 补回.')
-    return 1 if (missing and not fix) else 0
+        print('\n已修正: %d 个文件 (缺 BOM 补回 / 重复 BOM 归一为 1 个)' % fixed)
+    elif (missing or dup) and not fix:
+        print('\n用 --fix 补回或归一化.')
+    return 1 if ((missing or dup) and not fix) else 0
 
 
 if __name__ == '__main__':
