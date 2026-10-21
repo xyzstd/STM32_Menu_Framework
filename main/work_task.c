@@ -87,6 +87,7 @@ static bool     sleep_suppress;
 /* 校准页(Cur Cal)加热抑制: 页面期间只维持温度读数供"Cooling"显示,
  * 断热不控热, 让热态烙铁头自然降温到冷态后完成标定. */
 static bool     cal_suppress;
+static bool     hold_dirty;      /* 学到的前馈系数待落盘(见 WorkTask_Process) */
 
 /* 插头不匹配引导断热: 自检发现当前配置型号已标定、但插入头电流不符
  * (插了另一量级的头)时置位, 引导用户进 Cur Cal 标定新头前持续断热,
@@ -833,26 +834,138 @@ static bool read_measured_temp(int16_t *out)
 
 /* 前馈查表: 按温差取开环基础功率, 断点间线性插值(表值 0~1000 尺度).
  * 与 PID 取 max 而非叠加 —— 升温段由前馈接管, 免去 PID 积分从零缓爬. */
+/* 前馈底座系数(*100): hold = (T_set - 25) * k / 100.
+ * 用"系数"而不是"绝对功率", 是因为维持功率随设定温度近似线性变化 ——
+ * 存绝对值会在休眠(设定点切到 sleep_temp)时被学成低功率值, 醒来后按高温
+ * 加热就偏小; 系数在 200~450°C 区间基本不变, 学一次即可通用.
+ * 未学习时种子 60(=0.60): 仿真显示略低于实际散热需求时, 缺口由积分在限幅
+ * 内补足, 不会过冲; 偏高则会直接变成过冲, 故宁可取小. */
+#define HOLD_K_SEED        60
+#define HOLD_K_MAX         200
+
+static int16_t ff_hold(void)
+{
+    int32_t  sp = (int32_t)PID_Controller_GetSetpoint() - 25;
+    uint16_t k  = g_config.pid_hold_k[Config_GetHandleIdx()];
+
+    if (sp <= 0)
+        return 0;
+
+    if (k == 0)
+        k = HOLD_K_SEED;
+
+    return (int16_t)(sp * (int32_t)k / 100);
+}
+
+/* 前馈: 温差曲线 + 稳态底座.
+ * 底座的意义: 原实现误差→0 时前馈为 0, 稳态功率全由积分承担, 而 ki 小且整除
+ * 截断(误差 2°C 时每周期只涨 1), 到温后还要 30~40s 才稳住; 450°C 时积分限幅
+ * 甚至低于维持功率, 会永久差约 2°C. 加底座后积分只补模型误差.
+ * 过冲侧(-10°C < diff <= 0)把底座线性收掉, 避免降低设定值后仍按旧功率保温. */
 static int16_t feedforward_for(int16_t diff)
 {
     static const int16_t ff_d[5] = { 0, 10, 25, 50, 100 };
     static const int16_t ff_v[5] = { 0, 180, 350, 600, 900 };
+    int32_t ff;
 
     if (diff >= ff_d[4])
-        return ff_v[4];
-
-    if (diff > 0)
+    {
+        ff = ff_v[4];
+    }
+    else if (diff > 0)
     {
         uint8_t k;
         for (k = 0; k < 4; k++)
             if (diff < ff_d[k + 1])
                 break;
-        return (int16_t)(ff_v[k] +
+        ff = (int32_t)ff_v[k] +
              (int32_t)(ff_v[k + 1] - ff_v[k]) * (diff - ff_d[k]) /
-             (ff_d[k + 1] - ff_d[k]));
+             (ff_d[k + 1] - ff_d[k]);
+        ff += ff_hold();
+    }
+    else if (diff > -10)
+    {
+        ff = (int32_t)ff_hold() * (diff + 10) / 10;
+    }
+    else
+    {
+        ff = 0;
     }
 
-    return 0;
+    if (ff > PID_OUTPUT_MAX)
+        ff = PID_OUTPUT_MAX;
+    if (ff < 0)
+        ff = 0;
+
+    return (int16_t)ff;
+}
+
+/* 稳态维持功率学习: 到温并稳定后, 把实际功率折算成底座系数存进 pid_hold_k.
+ * 判定 |误差| ≤ 4°C 连续 15 个 PID 周期(3s); 更新用 1/8 慢滤波, 变化 ≥ 12 个
+ * 单位才落盘 —— 稳态下偶发一次 25~50ms 擦写, 不影响加热(功率由硬件 PWM 保持).
+ * 目的: 前馈底座自动适配不同烙铁头/电源电压, 免人工标定. */
+#define HOLD_STABLE_ERR     4
+#define HOLD_STABLE_CYCLES  15
+#define HOLD_SAVE_DELTA_K   2
+#define HOLD_SAVE_IDLE_MS   2000u   /* 空闲多久后才落盘(Flash 擦页会停顿 20~40ms) */
+
+static void learn_ff_hold(int16_t error, int16_t power)
+{
+    static uint8_t stable_cnt = 0;
+    uint8_t  h = Config_GetHandleIdx();
+    int32_t  sp;
+    int32_t  k_now;
+    uint16_t k;
+    int16_t  d;
+
+    /* 只在 ACTIVE 学: 休眠时设定点被切到 sleep_temp、关机时加热已断,
+     * 这两种状态的功率都不能代表用户设定温度下的维持功率. */
+    if (work.state != WORK_STATE_ACTIVE)
+    {
+        stable_cnt = 0;
+        return;
+    }
+
+    sp = (int32_t)PID_Controller_GetSetpoint() - 25;
+    if (sp < 25)   /* 设定点过低: 分母太小, 学到的系数噪声极大 */
+    {
+        stable_cnt = 0;
+        return;
+    }
+
+    if (error > HOLD_STABLE_ERR || error < -HOLD_STABLE_ERR)
+    {
+        stable_cnt = 0;
+        return;
+    }
+
+    if (stable_cnt < HOLD_STABLE_CYCLES)
+    {
+        stable_cnt++;
+        return;
+    }
+
+    k_now = (int32_t)power * 100 / sp;
+    if (k_now < 0)
+        k_now = 0;
+    else if (k_now > HOLD_K_MAX)
+        k_now = HOLD_K_MAX;
+
+    k = g_config.pid_hold_k[h];
+    if (k == 0)
+        k = HOLD_K_SEED;   /* 从种子起步, 避免第一次学习跳变 */
+
+    k = (uint16_t)(((int32_t)k * 7 + k_now) / 8);
+
+    d = (int16_t)(k - (int16_t)g_config.pid_hold_k[h]);
+    if (d < 0)
+        d = (int16_t)-d;
+
+    if (d >= HOLD_SAVE_DELTA_K)
+    {
+        g_config.pid_hold_k[h] = k;
+        hold_dirty = true;   /* 落盘推迟到用户空闲, 见 WorkTask_Process */
+    }
 }
 
 /* 步骤 6 的实体: 自整定(继电反馈). 返回 true = 本轮由整定接管, 调用方跳过
@@ -878,14 +991,14 @@ static bool run_autotune_cycle(int16_t meas_temp)
             if (tg.kp > PID_KP_MAX) tg.kp = PID_KP_MAX;
             if (tg.ki > PID_KI_MAX) tg.ki = PID_KI_MAX;
             if (tg.kd > PID_KD_MAX) tg.kd = PID_KD_MAX;
-            int16_t old_kp = g_config.pid_cons_kp[h];
-            int16_t old_ki = g_config.pid_cons_ki[h];
-            int16_t old_kd = g_config.pid_cons_kd[h];
+            int16_t old_kp = g_config.pid_kp[h];
+            int16_t old_ki = g_config.pid_ki[h];
+            int16_t old_kd = g_config.pid_kd[h];
             bool saved;
 
-            g_config.pid_cons_kp[h] = tg.kp;   /* 写入当前型号保守组 */
-            g_config.pid_cons_ki[h] = tg.ki;
-            g_config.pid_cons_kd[h] = tg.kd;
+            g_config.pid_kp[h] = tg.kp;   /* 写入当前型号(单组) */
+            g_config.pid_ki[h] = tg.ki;
+            g_config.pid_kd[h] = tg.kd;
             saved = Config_Save();
             work.tune_save_succeeded = saved;
 
@@ -895,9 +1008,9 @@ static bool run_autotune_cycle(int16_t meas_temp)
                  * Config_Save 先擦页再写; 若失败发生在擦除之后, 旧 Flash 内容可能已
                  * 不完整, 故恢复旧值后尽力再写一次. 若 Flash 持续故障, 持久化状态仍
                  * 无法保证, 但本次运行绝不启用未保存的新增益, 且 UI 明确报告失败. */
-                g_config.pid_cons_kp[h] = old_kp;
-                g_config.pid_cons_ki[h] = old_ki;
-                g_config.pid_cons_kd[h] = old_kd;
+                g_config.pid_kp[h] = old_kp;
+                g_config.pid_ki[h] = old_ki;
+                g_config.pid_kd[h] = old_kd;
                 (void)Config_Save();
                 Buzzer_Beep(BUZZER_EVENT_ALARM);
             }
@@ -1017,6 +1130,9 @@ static void run_pid_cycle(void)
     }
     work.power = power;
 
+    /* 稳态维持功率学习: 到温稳定后把实际功率记为该型号的前馈底座 */
+    learn_ff_hold((int16_t)(PID_Controller_GetSetpoint() - meas_temp), power);
+
     /* 步骤 8 · 设置加热器功率 */
     Heater_SetPower(power);
 
@@ -1089,12 +1205,9 @@ void WorkTask_Init(void)
     /* 首次引导: 模拟模式自检直接完成, 此时即"即将进入正常加热"前一刻;
      * 真实模式由 selftest_advance 全链路通过时置位(引导不能早于自检结束,
      * 否则会与自检的测量脉冲冲突).
-     * 模拟联调: 出厂参考未标定会置位引导标志, 开机即被 ui_task 拉进 First Cal
-     * 引导页且型号锁定, 旋转/转向全部无响应(卡格) → 模拟模式跳过引导,
-     * 直接进入正常加热联调; 真实模式行为不变. */
-#if HW_SIM_MODE
-    work.boot_cal_pending = false;
-#endif
+     * 模拟模式无需额外分支: 出厂参考未标定会置位引导标志, 开机即被 ui_task
+     * 拉进 First Cal 页且型号锁定, 旋转/转向全部无响应(卡格) —— 而上方已无
+     * 条件清零(两模式统一), 模拟模式自然不会置引导. */
 }
 
 void WorkTask_Process(void)
@@ -1114,6 +1227,15 @@ void WorkTask_Process(void)
 
     /* 2. 休眠/关机计时检测 (每帧) */
     check_sleep_shutdown(now);
+
+    /* 2.5 前馈系数延迟落盘: Flash 擦页期间 CPU 无法从 Flash 取指, 会整机停顿
+     * 20~40ms(连 TIM2 1ms 中断都停). 放在 PID 周期里会打断输入/渲染, 故改为
+     * 用户空闲 2s 后一次性写入 —— 稳态学习只在此时机触发, 每次会话 1~3 次. */
+    if (hold_dirty && (uint32_t)(now - work.last_activity) >= HOLD_SAVE_IDLE_MS)
+    {
+        hold_dirty = false;
+        (void)Config_Save();
+    }
 
     /* 3. PID 控制周期 (每 200ms): 传感器采样与温度闭环在同一次节拍内完成 */
     if ((now - work.last_pid_tick) < PID_INTERVAL_MS)
@@ -1232,7 +1354,7 @@ void WorkTask_SetCalSuppress(bool en)
         cal_suppress = false;
         /* 恢复加热前刷新加热器诊断基准: 抑制期间烙铁头已自然降温到冷态,
          * 沿用进入前的热态基准会在恢复后立即误判 heater_fault (rise 为负
-         * < 阈值, 与 Recover 过温路径 L1357 同一逻辑) */
+         * < 阈值, 与 WorkTask_Recover 过温分支同一逻辑) */
         work.diag_tick      = Timer_GetTick();
         work.diag_temp_last = work.measured_temp;
         if (!WorkTask_HasFault())
@@ -1284,10 +1406,7 @@ void WorkTask_OnHandleChanged(void)
     /* 先重载 PID(内部 Reset), 再用新型号上限钳位目标并复位 */
     PID_Controller_Reload();
 
-    if (runtime_temp > (int16_t)Config_GetTempMax())
-        runtime_temp = (int16_t)Config_GetTempMax();
-    if (runtime_temp < TEMP_MIN)
-        runtime_temp = TEMP_MIN;
+    WorkTask_SetRuntimeTemp(runtime_temp);   /* 按新型号上限钳位(与 Init 同源, 免两处各写一份) */
 
     PID_Controller_SetSetpoint(runtime_temp);
     PID_Controller_Reset();

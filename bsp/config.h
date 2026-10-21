@@ -15,10 +15,9 @@
 #endif
 
 #define CONFIG_MAGIC      0x5AA55AA5UL
-#define CONFIG_VERSION    13   /* 12→13: 移除 Boost 功能, config_t 删除 boost_max[] 字段;
-                                * 同时 T12 常规上限 400→450(三型号统一).
-                                * 旧 v12 数据由 config_v12_t 逐字段迁移, 保留 PID 增益/
-                                * 温度/时间/蜂鸣/亮度等用户设置, 仅 temp_max 取新默认. */
+#define CONFIG_VERSION    15   /* 14→15: 新增 pid_hold_k[](学到的前馈底座系数).
+                                * 旧版本(v14 及更早)不做迁移: 数据模型已变, 直接回
+                                * 出厂默认(见 Config_Load 的 else 分支). */
 
 /* 配置 Flash 存储地址 (使用 App Flash 最后一页, 0x0803F800) */
 #define CONFIG_FLASH_ADDR  0x0803F800UL
@@ -67,7 +66,7 @@ typedef struct
 {
     uint32_t magic;
     uint16_t version;
-    uint16_t size;           /* sizeof(config_t), 结构体变化时用于版本迁移 */
+    uint16_t size;           /* sizeof(config_t): 同版本内结构体扩展时按旧长度兼容读取 */
 
     /* 当前手柄型号 (见 HANDLE_*) */
     uint8_t  handle_type;
@@ -76,15 +75,18 @@ typedef struct
     uint16_t default_temp;      /* 默认目标温度 °C */
     uint16_t sleep_temp;        /* 休眠温度 °C */
 
-    /* PID 参数 (*100), 每型号一套
-     * 分段控制: ΔT>50°C 全速, 30~50°C 用激进组(积分限幅 15%), ≤30°C 用保守组(限幅 30%)
-     * 积分限幅为内置固定值, 不存入配置 */
-    int16_t pid_agg_kp[HANDLE_NUM];   /* 激进 Kp (*100) */
-    int16_t pid_agg_ki[HANDLE_NUM];   /* 激进 Ki (*100) */
-    int16_t pid_agg_kd[HANDLE_NUM];   /* 激进 Kd (*100) */
-    int16_t pid_cons_kp[HANDLE_NUM];  /* 保守 Kp (*100) */
-    int16_t pid_cons_ki[HANDLE_NUM];  /* 保守 Ki (*100) */
-    int16_t pid_cons_kd[HANDLE_NUM];  /* 保守 Kd (*100) */
+    /* PID 增益 (*100), 每型号一套. 2026-10-19 起为单组(原双组已合并):
+     * 仿真与静态分析显示保守组在误差 25°C 以下被前馈完全遮蔽, 双组的唯一
+     * 实际收益是过冲段阻尼, 而保守 Kp=0.50 刹车过弱、过冲反而更大.
+     * 积分限幅按 |误差| 调度(10% / 5%): 稳态功率由前馈底座 pid_hold_k 承担. */
+    int16_t pid_kp[HANDLE_NUM];   /* Kp (*100) */
+    int16_t pid_ki[HANDLE_NUM];   /* Ki (*100) */
+    int16_t pid_kd[HANDLE_NUM];   /* Kd (*100) */
+
+    /* 学到的前馈底座系数 (*100): hold = (T_set-25)*k/100, 每型号一套; 0 = 未学习.
+     * 用系数而非绝对功率: 维持功率随设定温度近似线性, 存绝对值会被休眠时的
+     * 低设定点学偏. 详见 work_task.c 的 ff_hold / learn_ff_hold. */
+    uint16_t pid_hold_k[HANDLE_NUM];
 
     /* 每型号的温度上限 (°C): T12/T245/T210 统一 450 */
     uint16_t temp_max[HANDLE_NUM];
@@ -145,69 +147,6 @@ typedef struct
     uint16_t crc;
 
 }type_cal_t;
-
-/* 旧版 (v10) 配置布局镜像: 校准字段仍在 config 内, 仅供版本迁移解析 */
-typedef struct
-{
-    uint32_t magic;
-    uint16_t version;
-    uint8_t  handle_type;
-    uint8_t  res0;                 /* 对齐填充, 与 v10 实际布局一致 */
-    uint16_t default_temp;
-    uint16_t sleep_temp;
-    int16_t  pid_agg_kp[HANDLE_NUM];
-    int16_t  pid_agg_ki[HANDLE_NUM];
-    int16_t  pid_agg_kd[HANDLE_NUM];
-    int16_t  pid_cons_kp[HANDLE_NUM];
-    int16_t  pid_cons_ki[HANDLE_NUM];
-    int16_t  pid_cons_kd[HANDLE_NUM];
-    uint16_t temp_max[HANDLE_NUM];
-    uint16_t boost_max[HANDLE_NUM];
-    int8_t   cal_off_100[HANDLE_NUM];
-    int8_t   cal_off_200[HANDLE_NUM];
-    int8_t   cal_off_300[HANDLE_NUM];
-    int8_t   cal_off_350[HANDLE_NUM];
-    int8_t   cal_off_400[HANDLE_NUM];
-    int8_t   cal_off_450[HANDLE_NUM];
-    uint16_t sleep_time;
-    uint16_t shutdown_time;
-    uint8_t  buzzer_enable;
-    uint8_t  brightness;
-    uint16_t cal_adc_100[HANDLE_NUM];
-    uint16_t cal_adc_200[HANDLE_NUM];
-    uint16_t cal_adc_300[HANDLE_NUM];
-    uint16_t cal_adc_350[HANDLE_NUM];
-    uint16_t cal_adc_400[HANDLE_NUM];
-    uint16_t cal_adc_450[HANDLE_NUM];
-    uint16_t crc;
-
-}config_v10_t;
-
-/* v12 布局快照(含已删除的 boost_max[]): 仅供 12→13 迁移读取旧数据.
- * 字段顺序/类型与当时的 config_t 完全一致, 编译器填充也随之相同.
- * 注: v12 已有独立校准页(cal_t / type_cal_t), 故本结构不含 cal_* 字段. */
-typedef struct
-{
-    uint32_t magic;
-    uint16_t version;
-    uint16_t size;
-    uint8_t  handle_type;
-    uint16_t default_temp;
-    uint16_t sleep_temp;
-    int16_t  pid_agg_kp[HANDLE_NUM];
-    int16_t  pid_agg_ki[HANDLE_NUM];
-    int16_t  pid_agg_kd[HANDLE_NUM];
-    int16_t  pid_cons_kp[HANDLE_NUM];
-    int16_t  pid_cons_ki[HANDLE_NUM];
-    int16_t  pid_cons_kd[HANDLE_NUM];
-    uint16_t temp_max[HANDLE_NUM];
-    uint16_t boost_max[HANDLE_NUM];
-    uint16_t sleep_time;
-    uint16_t shutdown_time;
-    uint8_t  buzzer_enable;
-    uint8_t  brightness;
-    uint16_t crc;
-}config_v12_t;
 
 extern config_t g_config;
 extern cal_t    g_cal;

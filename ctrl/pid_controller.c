@@ -2,10 +2,13 @@
 #include "config.h"
 
 /*
- * 分段式整数 PID 控制器
+ * 整数 PID 控制器 (单组参数)
  *
- * 参数调度在 25~35°C 误差带内线性混合保守/激进参数, 避免 30°C 处跳变;
- * 大误差下由工作层连续前馈抬高基准, PID 仍参与输出而非硬切满功率.
+ * 2026-10-19 由双组(激进/保守)合并为单组: 静态分析与仿真显示, 保守组在
+ * 误差 25°C 以下被前馈完全遮蔽(积分跟踪把 PID 输出钉在前馈值), 双组的唯一
+ * 实际收益是过冲段阻尼; 而保守组 Kp=0.50 刹车过弱, 过冲反而比激进组更大.
+ * 合并后默认取原激进组(11.00/0.50/1.00), 到温更快、过冲更小、菜单少 3 个参数.
+ * 积分限幅仍按 |误差| 调度(10% → 5%), 与增益无关.
  *
  * 所有计算使用整数运算, 无浮点:
  *   - Kp/Ki/Kd 存储为 *100, 计算时除以 PID_SCALE(100)
@@ -19,26 +22,16 @@
  * 即 d_filter = (1-k)*旧 + k*新。k 越小 D 越平滑(响应越慢),
  * k 越大越接近原始微分(测量噪声放大越明显)。 */
 #define PID_D_FILTER       192
-#define PID_BLEND_LOW      25
-#define PID_BLEND_HIGH     35
 
-static int16_t pid_blend_gain(int16_t cons, int16_t agg, int16_t error)
-{
-    int32_t span = PID_BLEND_HIGH - PID_BLEND_LOW;
-    int32_t pos  = error - PID_BLEND_LOW;
-    return (int16_t)(cons + ((int32_t)(agg - cons) * pos) / span);
-}
+/* 积分限幅的调度区间: |误差| ≤ 25°C 用 10%, ≥ 35°C 收紧到 5%, 中间线性过渡.
+ * 只影响积分, 与增益组无关(单组化后不再有增益混合带). */
+#define PID_LIM_LOW        25
+#define PID_LIM_HIGH       35
 
 static struct {
-    /* 激进 PID 参数 */
-    int16_t agg_kp;
-    int16_t agg_ki;
-    int16_t agg_kd;
-
-    /* 保守 PID 参数 */
-    int16_t cons_kp;
-    int16_t cons_ki;
-    int16_t cons_kd;
+    int16_t kp;
+    int16_t ki;
+    int16_t kd;
 
     int16_t setpoint;       /* 目标温度 °C */
     int16_t measured;       /* 实测温度 °C */
@@ -73,18 +66,15 @@ static inline int16_t pid_gain_clamp(int16_t v, int16_t max)
     return v;
 }
 
-/* 按当前型号从配置加载 PID 参数 (激进/保守) 并复位状态.
+/* 按当前型号从配置加载 PID 参数并复位状态.
  * 型号切换后调用, 使现役 PID 系数随型号切换而更新, 避免用错型号参数控温. */
 void PID_Controller_Reload(void)
 {
     uint8_t h = Config_GetHandleIdx();
 
-    pid.agg_kp  = pid_gain_clamp(g_config.pid_agg_kp[h],  PID_KP_MAX);
-    pid.agg_ki  = pid_gain_clamp(g_config.pid_agg_ki[h],  PID_KI_MAX);
-    pid.agg_kd  = pid_gain_clamp(g_config.pid_agg_kd[h],  PID_KD_MAX);
-    pid.cons_kp = pid_gain_clamp(g_config.pid_cons_kp[h], PID_KP_MAX);
-    pid.cons_ki = pid_gain_clamp(g_config.pid_cons_ki[h], PID_KI_MAX);
-    pid.cons_kd = pid_gain_clamp(g_config.pid_cons_kd[h], PID_KD_MAX);
+    pid.kp = pid_gain_clamp(g_config.pid_kp[h], PID_KP_MAX);
+    pid.ki = pid_gain_clamp(g_config.pid_ki[h], PID_KI_MAX);
+    pid.kd = pid_gain_clamp(g_config.pid_kd[h], PID_KD_MAX);
     PID_Controller_Reset();
 }
 
@@ -143,36 +133,20 @@ int16_t PID_Controller_Compute(int16_t feedforward_floor)
     else if (feedforward_floor > PID_OUTPUT_MAX)
         feedforward_floor = PID_OUTPUT_MAX;
 
-    /* 平滑参数调度: ≤25°C 保守, ≥35°C 激进, 中间 10°C 线性混合.
-     * 对负误差保持保守参数, 仅积分限幅根据过冲幅度收紧. */
-    if (error <= PID_BLEND_LOW)
-    {
-        cur_kp = pid.cons_kp;
-        cur_ki = pid.cons_ki;
-        cur_kd = pid.cons_kd;
-    }
-    else if (error >= PID_BLEND_HIGH)
-    {
-        cur_kp = pid.agg_kp;
-        cur_ki = pid.agg_ki;
-        cur_kd = pid.agg_kd;
-    }
-    else
-    {
-        cur_kp = pid_blend_gain(pid.cons_kp, pid.agg_kp, error);
-        cur_ki = pid_blend_gain(pid.cons_ki, pid.agg_ki, error);
-        cur_kd = pid_blend_gain(pid.cons_kd, pid.agg_kd, error);
-    }
+    /* 单组增益: 不再按误差切换参数组(双组已于 2026-10-19 合并) */
+    cur_kp = pid.kp;
+    cur_ki = pid.ki;
+    cur_kd = pid.kd;
 
     abs_error = (error < 0) ? (int16_t)(-error) : error;
-    if (abs_error <= PID_BLEND_LOW)
+    if (abs_error <= PID_LIM_LOW)
         lim = PID_INTEGRAL_LIMIT;
-    else if (abs_error >= PID_BLEND_HIGH)
+    else if (abs_error >= PID_LIM_HIGH)
         lim = PID_INTEGRAL_LIMIT_AGG;
     else
         lim = (int16_t)(PID_INTEGRAL_LIMIT -
               ((PID_INTEGRAL_LIMIT - PID_INTEGRAL_LIMIT_AGG) *
-               (abs_error - PID_BLEND_LOW) / (PID_BLEND_HIGH - PID_BLEND_LOW)));
+               (abs_error - PID_LIM_LOW) / (PID_LIM_HIGH - PID_LIM_LOW)));
 
     p_term = (int32_t)cur_kp * error / PID_SCALE;
 
@@ -243,34 +217,19 @@ int16_t PID_Controller_Compute(int16_t feedforward_floor)
     return (int16_t)output;
 }
 
-void PID_Controller_SetAggKp(int16_t kp)
+void PID_Controller_SetKp(int16_t kp)
 {
-    pid.agg_kp = kp;
+    pid.kp = kp;
 }
 
-void PID_Controller_SetAggKi(int16_t ki)
+void PID_Controller_SetKi(int16_t ki)
 {
-    pid.agg_ki = ki;
+    pid.ki = ki;
 }
 
-void PID_Controller_SetAggKd(int16_t kd)
+void PID_Controller_SetKd(int16_t kd)
 {
-    pid.agg_kd = kd;
-}
-
-void PID_Controller_SetConsKp(int16_t kp)
-{
-    pid.cons_kp = kp;
-}
-
-void PID_Controller_SetConsKi(int16_t ki)
-{
-    pid.cons_ki = ki;
-}
-
-void PID_Controller_SetConsKd(int16_t kd)
-{
-    pid.cons_kd = kd;
+    pid.kd = kd;
 }
 
 int16_t PID_Controller_GetOutput(void)
@@ -284,7 +243,7 @@ int16_t PID_Controller_GetOutput(void)
  *   以"低于设定点满功率 / 高于设定点断电"的继电激励使温度围绕设定点等幅振荡,
  *   记录峰谷幅值 a 与临界周期 Tu. 由描述函数法求临界增益
  *     Ku = 4h/(π·a), h = 继电幅值(功率差的一半, 0~1000)
- *   再按 Z-N 继电整定式给出保守组(稳态段)参数:
+ *   再按 Z-N 继电整定式给出单组参数:
  *     Kp = 0.6·Ku,  Ki = Kp/(0.5·Tu),  Kd = Kp·Tu/8
  *   存储格式 *100 (与 PID_SCALE 一致).
  *

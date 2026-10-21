@@ -7,12 +7,15 @@
 #include "buzzer.h"
 
 /*
- * PID 参数设置: 两个子页面
- *   - 激进参数 (ΔT 30~50°C 使用): KP/KI/KD
- *   - 保守参数 (ΔT ≤30°C 使用):  KP/KI/KD
+ * PID 参数设置: 单组参数 (KP/KI/KD)
+ *
+ * 2026-10-19 由双组(激进/保守)合并为单组. 静态分析与仿真显示保守组在误差
+ * 25°C 以下被前馈完全遮蔽, 双组唯一收益是过冲段阻尼, 而保守组 Kp=0.50
+ * 刹车过弱、过冲反而更大 —— 合并后到温更快、过冲更小、参数少一半.
+ * 详见 docs/ 与 build_tools/pid_sim.py.
  *
  * 实际值 = 存储值 / 100 (KP/KI/KD)
- * 积分限幅为内置固定值 (PID 输出满量程 30%), 不提供页面调节.
+ * 积分限幅为内置值 (按 |误差| 在 10%~5% 间调度), 不提供页面调节.
  *
  * 多参数编辑状态机由本页自行实现(非跨文件模板, 与 calibrate 同风格):
  *   导航态 UP/DOWN 环形移动 focus; CLICK 切换调参态;
@@ -34,7 +37,7 @@ static const char *const pid_labels[PID_FIELD_NUM] = {"KP:", "KI:", "KD:"};
 static const int16_t pid_max[PID_FIELD_NUM]  = {PID_KP_MAX, PID_KI_MAX, PID_KD_MAX};
 static const int16_t pid_step[PID_FIELD_NUM] = {PID_STEP, PID_STEP, PID_STEP};
 
-/* 编辑状态机实例: 焦点/编辑态/脏标记与编辑缓冲, 每组(激进/保守)一份 */
+/* 编辑状态机实例: 焦点/编辑态与编辑缓冲 */
 typedef struct {
     int16_t val[PID_FIELD_NUM];   /* 编辑缓冲 */
     int16_t base[PID_FIELD_NUM];  /* enter 时初值: 判"是否真改了" + 落盘失败回滚 */
@@ -42,24 +45,17 @@ typedef struct {
     uint8_t editing;              /* 0=导航态, 1=调参态 */
 } pid_edit_t;
 
-static pid_edit_t agg;   /* 激进参数组 */
-static pid_edit_t cons;  /* 保守参数组 */
+static pid_edit_t pe;
 
 static menu_result_t pid_edit_handler(const menu_cmd_t *cmd, pid_edit_t *e);
-static void pid_agg_load(void);
-static bool pid_agg_store(void);
-static void pid_cons_load(void);
-static bool pid_cons_store(void);
+static void pid_load(void);
+static bool pid_store(void);
 static void pid_edit_draw_row(int16_t y, const char *name, int16_t val);
 static menu_period_t pid_edit_display(const pid_edit_t *e);
-static void pid_agg_enter(void *ud);
-static menu_result_t pid_agg_handler(const menu_cmd_t *cmd, void *ud);
-static menu_period_t pid_agg_display(void *ud);
-static void pid_agg_exit(void *ud);
-static void pid_cons_enter(void *ud);
-static menu_result_t pid_cons_handler(const menu_cmd_t *cmd, void *ud);
-static menu_period_t pid_cons_display(void *ud);
-static void pid_cons_exit(void *ud);
+static void pid_enter(void *ud);
+static menu_result_t pid_handler(const menu_cmd_t *cmd, void *ud);
+static menu_period_t pid_display(void *ud);
+static void pid_exit(void *ud);
 
 /* 编辑状态机: 导航聚焦(环形) / 调参增减(线性钳位) / CLICK 切换 / LPRESS 退出 */
 static menu_result_t pid_edit_handler(const menu_cmd_t *cmd, pid_edit_t *e)
@@ -102,90 +98,54 @@ static menu_result_t pid_edit_handler(const menu_cmd_t *cmd, pid_edit_t *e)
     return MENU_RET_STAY;
 }
 
-/* ==================== 激进参数: 载入/落盘 ==================== */
+/* ==================== 载入/落盘 ==================== */
 
-static void pid_agg_load(void)
-{
-    uint8_t h = Config_GetHandleIdx();
-    agg.val[0] = (int16_t)g_config.pid_agg_kp[h];
-    agg.val[1] = (int16_t)g_config.pid_agg_ki[h];
-    agg.val[2] = (int16_t)g_config.pid_agg_kd[h];
-    agg.base[0] = agg.val[0];
-    agg.base[1] = agg.val[1];
-    agg.base[2] = agg.val[2];
-}
-
-/* 写 g_config + 落盘; 返回 true = 已成功写入 Flash.
- * 失败时把 g_config / PID 控制器 / 编辑缓冲**一并回滚**到 enter 初值 ——
- * 不回滚的话运行时按新增益工作而 Flash 仍是旧值, 重启后悄悄变回去; 且重进
- * 本页 load 会读到新值, 表现成"已经保存了", 正是最误导人的静默数据丢失. */
-static bool pid_agg_store(void)
+static void pid_load(void)
 {
     uint8_t h = Config_GetHandleIdx();
     uint8_t i;
 
-    g_config.pid_agg_kp[h] = agg.val[0];
-    g_config.pid_agg_ki[h] = agg.val[1];
-    g_config.pid_agg_kd[h] = agg.val[2];
-    PID_Controller_SetAggKp(agg.val[0]);
-    PID_Controller_SetAggKi(agg.val[1]);
-    PID_Controller_SetAggKd(agg.val[2]);
+    pe.val[0] = (int16_t)g_config.pid_kp[h];
+    pe.val[1] = (int16_t)g_config.pid_ki[h];
+    pe.val[2] = (int16_t)g_config.pid_kd[h];
 
-    if (Config_Save())
-        return true;
-
-    g_config.pid_agg_kp[h] = agg.base[0];
-    g_config.pid_agg_ki[h] = agg.base[1];
-    g_config.pid_agg_kd[h] = agg.base[2];
-    PID_Controller_SetAggKp(agg.base[0]);
-    PID_Controller_SetAggKi(agg.base[1]);
-    PID_Controller_SetAggKd(agg.base[2]);
     for (i = 0; i < PID_FIELD_NUM; i++)
-        agg.val[i] = agg.base[i];
-    return false;
+        pe.base[i] = pe.val[i];
 }
 
-/* ==================== 保守参数 ==================== */
-
-static void pid_cons_load(void)
-{
-    uint8_t h = Config_GetHandleIdx();
-    cons.val[0] = (int16_t)g_config.pid_cons_kp[h];
-    cons.val[1] = (int16_t)g_config.pid_cons_ki[h];
-    cons.val[2] = (int16_t)g_config.pid_cons_kd[h];
-    cons.base[0] = cons.val[0];
-    cons.base[1] = cons.val[1];
-    cons.base[2] = cons.val[2];
-}
-
-/* 同 pid_agg_store: 返回 true = 已落盘; 失败则回滚到 enter 初值. */
-static bool pid_cons_store(void)
+/* 落盘: 先写 RAM(缓存权威), 再 Config_Save; 失败则把配置与控制器一起回滚.
+ * 返回 false 时调用方必须告警 —— 否则用户以为已存下, 重启后悄悄变回旧值. */
+static bool pid_store(void)
 {
     uint8_t h = Config_GetHandleIdx();
     uint8_t i;
 
-    g_config.pid_cons_kp[h] = cons.val[0];
-    g_config.pid_cons_ki[h] = cons.val[1];
-    g_config.pid_cons_kd[h] = cons.val[2];
-    PID_Controller_SetConsKp(cons.val[0]);
-    PID_Controller_SetConsKi(cons.val[1]);
-    PID_Controller_SetConsKd(cons.val[2]);
+    g_config.pid_kp[h] = pe.val[0];
+    g_config.pid_ki[h] = pe.val[1];
+    g_config.pid_kd[h] = pe.val[2];
 
     if (Config_Save())
+    {
+        PID_Controller_SetKp(pe.val[0]);
+        PID_Controller_SetKi(pe.val[1]);
+        PID_Controller_SetKd(pe.val[2]);
         return true;
+    }
 
-    g_config.pid_cons_kp[h] = cons.base[0];
-    g_config.pid_cons_ki[h] = cons.base[1];
-    g_config.pid_cons_kd[h] = cons.base[2];
-    PID_Controller_SetConsKp(cons.base[0]);
-    PID_Controller_SetConsKi(cons.base[1]);
-    PID_Controller_SetConsKd(cons.base[2]);
+    /* 落盘失败: RAM 与控制器都退回 enter 时的值, 保证"运行中生效的"
+     * 与"Flash 里存的"始终一致 */
+    g_config.pid_kp[h] = pe.base[0];
+    g_config.pid_ki[h] = pe.base[1];
+    g_config.pid_kd[h] = pe.base[2];
+    PID_Controller_SetKp(pe.base[0]);
+    PID_Controller_SetKi(pe.base[1]);
+    PID_Controller_SetKd(pe.base[2]);
     for (i = 0; i < PID_FIELD_NUM; i++)
-        cons.val[i] = cons.base[i];
+        pe.val[i] = pe.base[i];
     return false;
 }
 
-/* ==================== 共享 display 布局 (本页私有) ==================== */
+/* ==================== display 布局 (本页私有) ==================== */
 
 static void pid_edit_draw_row(int16_t y, const char *name, int16_t val)
 {
@@ -231,18 +191,29 @@ static menu_period_t pid_edit_display(const pid_edit_t *e)
     return 0;
 }
 
-/* ==================== 激进参数页: 薄闭包绑定静态实例 ==================== */
+/* ==================== 页面: 薄闭包绑定静态实例 ==================== */
 
-static void pid_agg_enter(void *ud)
+static void pid_enter(void *ud)
 {
     (void)ud;
-    pid_agg_load();
-    agg.focus = 0;
-    agg.editing = 0;
+    pid_load();
+    pe.focus = 0;
+    pe.editing = 0;
 }
-static menu_result_t pid_agg_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return pid_edit_handler(cmd, &agg); }
-static menu_period_t pid_agg_display(void *ud){ (void)ud; return pid_edit_display(&agg); }
-static void pid_agg_exit(void *ud)
+
+static menu_result_t pid_handler(const menu_cmd_t *cmd, void *ud)
+{
+    (void)ud;
+    return pid_edit_handler(cmd, &pe);
+}
+
+static menu_period_t pid_display(void *ud)
+{
+    (void)ud;
+    return pid_edit_display(&pe);
+}
+
+static void pid_exit(void *ud)
 {
     uint8_t i;
     bool changed = false;
@@ -251,53 +222,18 @@ static void pid_agg_exit(void *ud)
     /* 只有确实改动了值才落盘(见文件顶部说明) */
     for (i = 0; i < PID_FIELD_NUM; i++)
     {
-        if (agg.val[i] != agg.base[i]) { changed = true; break; }
+        if (pe.val[i] != pe.base[i]) { changed = true; break; }
     }
     if (!changed)
         return;
 
-    if (pid_agg_store())
+    if (pid_store())
         Toast_Saved();   /* 仅在确实落盘成功时弹框: 失败却提示"已保存"会误导用户 */
     else
         Buzzer_Beep(BUZZER_EVENT_ALARM);   /* 失败必须告警, 否则用户以为已存下 */
 }
 
-const menu_ops_t pid_agg_ops = {
-    .enter = pid_agg_enter, .handler = pid_agg_handler,
-    .display = pid_agg_display, .exit = pid_agg_exit,
-};
-
-/* ==================== 保守参数页 ==================== */
-
-static void pid_cons_enter(void *ud)
-{
-    (void)ud;
-    pid_cons_load();
-    cons.focus = 0;
-    cons.editing = 0;
-}
-static menu_result_t pid_cons_handler(const menu_cmd_t *cmd, void *ud){ (void)ud; return pid_edit_handler(cmd, &cons); }
-static menu_period_t pid_cons_display(void *ud){ (void)ud; return pid_edit_display(&cons); }
-static void pid_cons_exit(void *ud)
-{
-    uint8_t i;
-    bool changed = false;
-    (void)ud;
-
-    for (i = 0; i < PID_FIELD_NUM; i++)
-    {
-        if (cons.val[i] != cons.base[i]) { changed = true; break; }
-    }
-    if (!changed)
-        return;
-
-    if (pid_cons_store())
-        Toast_Saved();
-    else
-        Buzzer_Beep(BUZZER_EVENT_ALARM);
-}
-
-const menu_ops_t pid_cons_ops = {
-    .enter = pid_cons_enter, .handler = pid_cons_handler,
-    .display = pid_cons_display, .exit = pid_cons_exit,
+const menu_ops_t pid_ops = {
+    .enter = pid_enter, .handler = pid_handler,
+    .display = pid_display, .exit = pid_exit,
 };

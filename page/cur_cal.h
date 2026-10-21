@@ -8,7 +8,7 @@
  * CurCal_BootEnter 的跳转会被 Menu_SetCurrentId 的范围检查**静默丢弃**
  * (首次冷态标定引导失效, 却不报错、不崩溃, 极难定位).
  * 由 build_tools/check_menu_table.py 第 13 项校验兜底. */
-#define CUR_CAL_MENU_ID  15
+#define CUR_CAL_MENU_ID  14
 
 extern const menu_ops_t cur_cal_ops;
 

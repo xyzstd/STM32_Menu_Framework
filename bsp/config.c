@@ -16,13 +16,12 @@ static const config_t default_config =
     .handle_type   = HANDLE_T12,
     .default_temp  = 300,
     .sleep_temp    = 200,
-    /* PID 参数 (每型号一套; T245/T210 先用 T12 参考值占位, 可在型号页自行微调) */
-    .pid_agg_kp    = {1100, 1100, 1100},   /* 激进 11.00 */
-    .pid_agg_ki    = {50,   50,   50  },   /* 激进 0.50 */
-    .pid_agg_kd    = {100,  100,  100 },   /* 激进 1.00 */
-    .pid_cons_kp   = {50,   50,   50  },   /* 保守 0.50 */
-    .pid_cons_ki   = {60,   60,   60  },   /* 保守 0.60 */
-    .pid_cons_kd   = {600,  600,  600 },   /* 保守 6.00 */
+    /* PID 增益 (单组; 取原"激进组"值 —— 仿真显示它在大误差段与双组等价,
+     * 在接近目标段更快且过冲更小). T245/T210 先同 T12 占位, 可自行微调. */
+    .pid_kp        = {1100, 1100, 1100},   /* 11.00 */
+    .pid_ki        = {50,   50,   50  },   /* 0.50 */
+    .pid_kd        = {100,  100,  100 },   /* 1.00 */
+    .pid_hold_k    = {0,    0,    0   },   /* 0 = 未学习, 首次运行自动学 */
     /* 温度上限: T12/T245/T210 统一 450°C */
     .temp_max      = {450,  450,  450 },
     .sleep_time    = 5,      /* 5分钟 */
@@ -31,12 +30,6 @@ static const config_t default_config =
     .brightness    = 180,
     .crc           = 0,
 };
-
-/* 迁移结构必须与 v12 当时的 config_t 完全同布局(大小 72 / crc 偏移 68):
- * 布局若被改动, 读取旧数据会字段错位 —— 那比"回落默认"更糟(会静默写入错误配置).
- * 编译期守卫: 一旦有人增删本结构字段, 构建立即失败. 数值经 gcc 独立核对. */
-typedef char config_v12_layout_must_match[
-    (sizeof(config_v12_t) == 72 && offsetof(config_v12_t, crc) == 68) ? 1 : -1];
 
 /* 默认校准 (每型号一套, 参考 Cai-Zi; T245/T210 先同 T12 占位, 可在校准页重新标定) */
 static const cal_t default_cal =
@@ -75,8 +68,6 @@ static uint16_t config_calc_crc(const config_t *cfg);
 static uint16_t cal_calc_crc(const cal_t *c);
 static uint16_t typecal_calc_crc(const type_cal_t *c);
 static bool save_page(uint32_t addr, const void *buf, uint16_t len);
-static void cal_migrate_v10(const config_v10_t *old);
-
 /* 型号索引越界保护: 非法 handle_type 一律回落到 T12 */
 uint8_t Config_GetHandleIdx(void)
 {
@@ -184,19 +175,6 @@ static bool save_page(uint32_t addr, const void *buf, uint16_t len)
 #endif
 }
 
-/* v10 旧校准字段整体迁入独立校准页 (升级固件不丢校准).
- * 以默认校准打底(带 magic/version), 仅覆盖 5 偏移 + 5 ADC 数据;
- * 各字段在 v10 与 cal_t 内均连续排布, 分两块整体拷贝.
- * v10 有 6 点(100/200/300/350/400/450), 现为 5 点(200~450): 从 200 起拷 5 组,
- * 100°C 点自然被丢弃 —— 起点用 cal_off_200/cal_adc_200, 长度按 CAL_POINT_NUM(5). */
-static void cal_migrate_v10(const config_v10_t *old)
-{
-    memcpy(&g_cal, &default_cal, sizeof(g_cal));
-    memcpy(g_cal.cal_off_200, old->cal_off_200, sizeof(g_cal.cal_off_200) * CAL_POINT_NUM);
-    memcpy(g_cal.cal_adc_200, old->cal_adc_200, sizeof(g_cal.cal_adc_200) * CAL_POINT_NUM);
-    (void)Cal_Save();
-}
-
 /* ==================== 载入后的字段合法性收敛 ====================
  * 为什么需要: g_config 的字段被 work_task 直接消费 —— sleep_temp 直接作 PID
  * setpoint、sleep_time/shutdown_time 直接乘 60 作阈值, **运行期不做二次校验**;
@@ -298,73 +276,12 @@ void Config_Load(void)
         if (config_calc_crc(&g_config) != g_config.crc)
             (void)Config_Reset();
     }
-    else if (version == 10)
-    {
-        /* v10 旧布局: 逐字段迁移用户设置, 旧校准字段一并迁入独立校准页 (升级不丢校准).
-         * 注: 校验沿用 sizeof-2 的覆盖范围(与旧固件一致). 旧固件同样存在"覆盖范围含
-         * crc 自身"的缺陷, 其写出的 v10 数据本就不可能通过校验 —— 即本迁移路径实际
-         * 不会命中; 保留原覆盖范围以免"修正后反而认下按旧缺陷写出的数据". */
-        config_v10_t old;
-        Flash_Read(CONFIG_FLASH_ADDR, &old, sizeof(old));
-
-        if (crc16((const uint8_t *)&old, sizeof(old) - sizeof(old.crc)) != old.crc)
-        {
-            (void)Config_Reset();
-            return;
-        }
-
-        g_config.handle_type   = old.handle_type;
-        g_config.default_temp  = old.default_temp;
-        g_config.sleep_temp    = old.sleep_temp;
-        memcpy(g_config.pid_agg_kp,  old.pid_agg_kp,  sizeof(g_config.pid_agg_kp));
-        memcpy(g_config.pid_agg_ki,  old.pid_agg_ki,  sizeof(g_config.pid_agg_ki));
-        memcpy(g_config.pid_agg_kd,  old.pid_agg_kd,  sizeof(g_config.pid_agg_kd));
-        memcpy(g_config.pid_cons_kp, old.pid_cons_kp, sizeof(g_config.pid_cons_kp));
-        memcpy(g_config.pid_cons_ki, old.pid_cons_ki, sizeof(g_config.pid_cons_ki));
-        memcpy(g_config.pid_cons_kd, old.pid_cons_kd, sizeof(g_config.pid_cons_kd));
-        /* temp_max 属型号硬件常量(非用户设置), 不迁移, 取新默认 */
-        g_config.sleep_time    = old.sleep_time;
-        g_config.shutdown_time = old.shutdown_time;
-        g_config.buzzer_enable = old.buzzer_enable;
-        g_config.brightness    = old.brightness;
-
-        cal_migrate_v10(&old);   /* 旧校准迁入独立页 (校验通过, 数据可信) */
-        (void)Config_Save();   /* 回写当前版本布局 */
-    }
-    else if (version == 12)
-    {
-        /* v12 布局(含已移除的 boost_max): 必须逐字段迁移, 不能按旧长度整体拷贝 ——
-         * boost_max 已从 config_t 中删除, 整体拷贝会让其后的 sleep_time/shutdown_time/
-         * buzzer/brightness 全部错位. temp_max 属型号硬件常量, 不迁移(取新的 450 默认).
-         * CRC 覆盖范围与 v12 写入时一致(offsetof(crc)), 故能正确校验. */
-        config_v12_t old;
-        Flash_Read(CONFIG_FLASH_ADDR, &old, sizeof(old));
-
-        if (crc16((const uint8_t *)&old, (uint16_t)offsetof(config_v12_t, crc)) != old.crc)
-        {
-            (void)Config_Reset();
-            return;
-        }
-
-        g_config.handle_type   = old.handle_type;
-        g_config.default_temp  = old.default_temp;
-        g_config.sleep_temp    = old.sleep_temp;
-        memcpy(g_config.pid_agg_kp,  old.pid_agg_kp,  sizeof(g_config.pid_agg_kp));
-        memcpy(g_config.pid_agg_ki,  old.pid_agg_ki,  sizeof(g_config.pid_agg_ki));
-        memcpy(g_config.pid_agg_kd,  old.pid_agg_kd,  sizeof(g_config.pid_agg_kd));
-        memcpy(g_config.pid_cons_kp, old.pid_cons_kp, sizeof(g_config.pid_cons_kp));
-        memcpy(g_config.pid_cons_ki, old.pid_cons_ki, sizeof(g_config.pid_cons_ki));
-        memcpy(g_config.pid_cons_kd, old.pid_cons_kd, sizeof(g_config.pid_cons_kd));
-        g_config.sleep_time    = old.sleep_time;
-        g_config.shutdown_time = old.shutdown_time;
-        g_config.buzzer_enable = old.buzzer_enable;
-        g_config.brightness    = old.brightness;
-
-        (void)Config_Save();   /* 回写新布局 */
-    }
     else
     {
-        (void)Config_Reset();   /* 无法解析的版本 → 出厂默认 */
+        /* 旧版本(v13 双组 PID 及更早): 数据模型已变, 不做逐字段迁移, 直接回出厂默认.
+         * 理由: v13 的保守组已无对应字段, 迁过去只能丢一半; 而其余用户设置(温度/休眠/
+         * 亮度等)重新设一遍成本很低, 换来的是不再维护三份历史结构体与迁移分支. */
+        (void)Config_Reset();
     }
 }
 
@@ -426,8 +343,8 @@ bool Cal_IsHandleValid(uint8_t h)
  * 为何必须校验: 偏移经 cal_offset_interp → spline_interp **直接叠加到读温**上.
  * 越界值(如 -128)会让报温严重偏低, PID 因此持续满功率 → 实际温度远超设定(不安全方向);
  * 页面也会因 '0' + |v|/10 拼出非数字字符.
- * 正常路径(页面编辑 + Cal_SetOff)恒写入钳位后的值, 故越界只可能来自版本迁移
- * (cal_migrate_v10 的 memcpy)或"CRC 自洽但语义越界"的存量数据.
+ * 正常路径(页面编辑 + Cal_SetOff)恒写入钳位后的值, 故越界只可能来自
+ * "CRC 自洽但语义越界"的存量数据(旧固件写入 / 数据位翻转).
  * 布局前提: 五个偏移数组在 cal_t 内连续无填充 —— 与 Cal_GetOff/Cal_SetOff 的指针
  * 步进访问同一假设, 已由上面的 guard_cal_off_contiguous 编译期守卫保证. */
 static bool cal_offsets_valid(void)
