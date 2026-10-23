@@ -89,6 +89,11 @@ static bool     sleep_suppress;
 static bool     cal_suppress;
 static bool     hold_dirty;      /* 学到的前馈系数待落盘(见 WorkTask_Process) */
 
+/* 前馈系数的滤波中间值(RAM): 学习必须逐周期继续收敛, 而落盘要跨过 |Δk|>=2 的
+ * 死区. 若把滤波值直接存在 g_config 里, 死区一旦不满足就不再写回, 下一周期又从
+ * 旧值重算 → 收敛条件退化成 |k_now-k|<16, 学习值永久偏低 14~15(约 19%). */
+static uint16_t hold_k_filt[HANDLE_NUM];
+
 /* 插头不匹配引导断热: 自检发现当前配置型号已标定、但插入头电流不符
  * (插了另一量级的头)时置位, 引导用户进 Cur Cal 标定新头前持续断热,
  * 标定完成或跳过后由 BootCalDone 清除. */
@@ -342,16 +347,36 @@ static int32_t spline_interp(const int32_t *x, const int32_t *y, uint8_t n, int3
     {
         int32_t dx_l = x[k] - x[k - 1];
         int32_t dx_r = x[k + 1] - x[k];
-        int32_t mlo;
+        int32_t a3, b3, lim3;
+
         if (m[k - 1] == 0 || m[k] == 0)   /* 某侧平缓(极点)则切线归零, 防过冲 */
         {
             t[k] = 0;
             continue;
         }
+
+        /* 节点是局部极值(两侧斜率异号): 切线必须水平, 否则段内会冲过端点.
+         * 校准偏移曲线可正可负, 必然出现这种节点. */
+        if ((m[k - 1] > 0) != (m[k] > 0))
+        {
+            t[k] = 0;
+            continue;
+        }
+
         t[k] = (m[k - 1] * dx_r + m[k] * dx_l) / (dx_l + dx_r);
-        if (t[k] < 0) t[k] = 0;
-        mlo = (m[k - 1] < m[k]) ? m[k - 1] : m[k];
-        if (t[k] > 3 * mlo) t[k] = 3 * mlo;   /* 保证段内单调 */
+
+        /* Fritsch-Carlson 钳位: |t| <= 3*min(|m[k-1]|, |m[k]|), 符号保持不变.
+         * 原写法用 min(m[k-1], m[k]) —— 两侧斜率异号时它是负数, 3*mlo 也是负数,
+         * 会把刚归零的切线再钳成与段内走向相反的方向(段内过冲, 实测最多 8°C).
+         * 改用绝对值定上界并双向钳, 递增/递减/变号三种情形都正确. */
+        a3 = 3 * ((m[k - 1] < 0) ? -m[k - 1] : m[k - 1]);
+        b3 = 3 * ((m[k] < 0) ? -m[k] : m[k]);
+        lim3 = (b3 < a3) ? b3 : a3;
+
+        if (t[k] > lim3)
+            t[k] = lim3;
+        else if (t[k] < -lim3)
+            t[k] = -lim3;
     }
 
     /* 定位所在段 */
@@ -951,11 +976,18 @@ static void learn_ff_hold(int16_t error, int16_t power)
     else if (k_now > HOLD_K_MAX)
         k_now = HOLD_K_MAX;
 
-    k = g_config.pid_hold_k[h];
+    k = hold_k_filt[h];
     if (k == 0)
-        k = HOLD_K_SEED;   /* 从种子起步, 避免第一次学习跳变 */
+    {
+        k = g_config.pid_hold_k[h];
+        if (k == 0)
+            k = HOLD_K_SEED;   /* 从种子起步, 避免第一次学习跳变 */
+    }
 
-    k = (uint16_t)(((int32_t)k * 7 + k_now) / 8);
+    /* 1/8 慢滤波, 加半个除数做四舍五入: 直接整除时 |k_now-k|<8 就停住,
+     * 残留最多 7(450°C 下底座仍偏 29 单位). 四舍五入后残留 <= 3. */
+    k = (uint16_t)(((int32_t)k * 7 + k_now + 4) / 8);
+    hold_k_filt[h] = k;        /* 中间值每周期推进, 不受落盘死区限制 */
 
     d = (int16_t)(k - (int16_t)g_config.pid_hold_k[h]);
     if (d < 0)
@@ -1402,6 +1434,14 @@ void WorkTask_OnHandleChanged(void)
 #else
     work.boot_cal_pending = (TypeCal_GetRef(Config_GetHandleIdx()) == 0);
 #endif
+
+    /* 清空前馈系数的滤波中间值(RAM). Config_Reset(恢复默认)会把 pid_hold_k 置 0,
+     * 但本副本若不清, learn_ff_hold 里 k=hold_k_filt[h] 非 0 就不再读配置 ——
+     * "恢复默认"后前馈底座仍是上一次学到的值, 直到重启才回到种子, 与"恢复默认=
+     * 回出厂"的语义不符. 换型号路径同样安全: 清空后 k 回落 g_config.pid_hold_k[h],
+     * 各型号已学值仍在配置里, 不会丢. */
+    for (uint8_t i = 0; i < HANDLE_NUM; i++)
+        hold_k_filt[i] = 0;
 
     /* 先重载 PID(内部 Reset), 再用新型号上限钳位目标并复位 */
     PID_Controller_Reload();
