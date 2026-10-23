@@ -22,7 +22,7 @@ static uint32_t oled_snap_sum[OLED_PAGE_NUM];
  * OLED_UpdateDiff 只做"比较指纹 + 置位", 真正的 I2C 推送由主循环每轮
  * OLED_FlushStep 推一页完成 —— 把"一次整屏 8 页 ≈25ms 的同步阻塞"拆成
  * "每轮 1~2 页(单次 ≤6.4ms)", 让 Input_Process 在两次推送之间得到执行.
- * 否则整屏推送期间主循环停摆, 每轮只能消费 2 个输入事件, 事件消费速率掉到
+ * 否则整屏推送期间主循环停摆, 每轮只能消费 2 个输入事件(当时的上限), 消费速率掉到
  * ~140/s(低于编码器 250/s) → 队列积压 → 表现为"转了不动、过一会才恢复". */
 static uint8_t oled_dirty = 0;
 static uint8_t oled_flush_next = 0;

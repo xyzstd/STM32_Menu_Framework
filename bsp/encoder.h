@@ -14,8 +14,4 @@ int16_t Encoder_GetSteps(void);
  * 调用, 防旧上下文的相位带入新页面吃掉新方向第一格. 主循环置位, 取样上下文执行. */
 void Encoder_RequestResync(void);
 
-/* 取走"相位锁死"请求: true = 已判定卡死并丢弃了残差相位, 调用方应作废积压的旋转事件.
- * 主循环上下文调用; 无请求时返回 false. */
-bool Encoder_TakeStuck(void);
-
 #endif

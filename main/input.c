@@ -24,26 +24,6 @@
 #define INPUT_ENCODER_MAX_SLOTS    (INPUT_EVT_QUEUE_SIZE - 1u - INPUT_KEY_RESERVED_SLOTS)
 #define INPUT_ENCODER_MAX_AGE_MS   12u
 
-/* 相位锁死时批量作废的旋转事件标记: 不是合法菜单事件, 消费时直接跳过.
- * 用"逐格作废"而不是清空队列, 是为了不牵连按键 —— 本队列的基本约定是
- * "旋转可丢、按键不可丢"(见 evt_enqueue 的预留槽). */
-#define INPUT_EVT_DROPPED          0xFFu
-
-/* 每轮主循环最多分发的事件数。
- * 常规 4: 配合渲染层 UI_RENDER_COOLDOWN_MS(2ms) 合并窗口, 快速旋转时逐格跟手。
- * 队列中已有按键待处理时放宽到 8: 按键**不插队** —— 队列里积压的旋转是"按键之前
- * 产生、且尚未显示"的输入(menu_notify 是 dispatch 与 UI_RequestRefresh 绑定的),
- * 让按键插到它们前面会把按键落到过期的选中项上(点错目标), 随后那几格旋转再落进
- * 新页面, 与"进子菜单卡一格"是同一类错位。所以只加速排空、不改顺序, 使按键延迟
- * 从 "N 轮" 降到 "约 1 轮"。放宽期间渲染仍受 2ms 合并窗口约束, 不会连刷。 */
-#define INPUT_DRAIN_NORMAL  4u
-#define INPUT_DRAIN_BURST   8u
-
-/* 消费上限守卫: 放宽值必须严格大于常规值(否则"按键在场时加速排空"名不副实,
- * 等于没放宽), 且常规值至少为 1(否则队列永不被消费). 违反即负数组长度 = 编译失败. */
-typedef char input_drain_budget_must_be_valid[
-    (INPUT_DRAIN_NORMAL >= 1u && INPUT_DRAIN_NORMAL < INPUT_DRAIN_BURST) ? 1 : -1];
-
 /* 队列头尾用 uint8_t, 空槽法需留 1 格; 掩码求占用量要求容量为 2 的幂.
  * 另加两条, 守卫"按键永不因编码器刷太快而进不了队"这一性质:
  *   - INPUT_KEY_RESERVED_SLOTS >= 1: 预留为 0 时下面的"容量 > 预留+1"依然成立,
@@ -109,8 +89,10 @@ static void evt_enqueue(uint8_t event, int8_t step)
     if (!is_key_event(event) && evt_used() >= INPUT_ENCODER_MAX_SLOTS)
         return;
 
+    /* 队满判断: 空槽法下 tail+1 == head 即满 —— 容量 32 但最多只存 31 个.
+     * 丢弃新事件而不改写消费者尚未取走的槽位: 宁可少一格输入, 不能破坏队列. */
     if (next == evt_q.head)
-        return;   /* 极端情况下连按键预留槽也耗尽: 丢弃新事件，不改写消费者队列内容 */
+        return;
 
     slot = &evt_q.buf[evt_q.tail];
 
@@ -263,47 +245,23 @@ void Input_Init(void)
 }
 
 
-/* 主循环每轮出队并分发事件. 四条规则, 与下面的编号一一对应:
- *   ⓪ 编码器相位锁死(累计原始计数超阈值仍无步)时, 作废积压旋转事件并重同步相位;
- *   ① 过期旋转(超 INPUT_ENCODER_MAX_AGE_MS)直接丢弃, 不占本轮额度、不在阻塞恢复后补执行;
- *   ② 每轮消费上限 INPUT_DRAIN_NORMAL, 队列中有按键待处理时放宽到 INPUT_DRAIN_BURST;
- *   ③ 分发后若菜单上下文指纹变化, 调 Input_ResetForJump 复位输入(清队列 + 重同步相位). */
+/* 主循环每轮出队并分发事件, 队列整轮排空. 两条规则, 与下面的编号一一对应:
+ *   ① 过期旋转(超 INPUT_ENCODER_MAX_AGE_MS)直接丢弃, 不在阻塞恢复后补执行;
+ *   ② 分发后若菜单上下文指纹变化, 调 Input_ResetForJump 复位输入(清队列 + 重同步相位).
+ * 不设消费上限: 正常一轮最多产出 8 个事件(7.5ms / 4ms 轮询 x 每次上限 4 步), 而分发
+ * 一个只要约 3.3µs —— 上限唯一的作用是在积压时把事件留到下一轮, 反而制造延迟.
+ * 整轮排空也不会多渲染: 渲染由 UI_RENDER_COOLDOWN_MS(2ms) 合并成"每轮最多一帧". */
 void Input_Process(void)
 {
     input_evt_t evt;
-    uint8_t n = 0;
-    uint8_t budget;
 
-    /* ⓪ 相位锁死自恢复: 判定在 bsp/encoder.c. 只作废旋转事件、保留按键, 再重同步
-     * 相位 —— 下一格即可正常出步, 不需要用户反向旋转.
-     * 只改写 [head, tail) 区间: 生产者(中断)只往 tail 追加, 不会回写该区间;
-     * 且队列的 head 只有消费者能改, 故不能在中断里做这件事. */
-    if (Encoder_TakeStuck())
+    while (evt_dequeue(&evt))
     {
-        uint8_t i = evt_q.head;
-
-        while (i != evt_q.tail)
-        {
-            if (!is_key_event(evt_q.buf[i].event))
-                evt_q.buf[i].event = INPUT_EVT_DROPPED;
-            i = (uint8_t)((i + 1u) & INPUT_EVT_QUEUE_MASK);
-        }
-
-        Encoder_RequestResync();
-    }
-
-    budget = Input_HasKeyPending() ? INPUT_DRAIN_BURST : INPUT_DRAIN_NORMAL;
-
-    while (n < budget && evt_dequeue(&evt))
-    {
-        /* ① 过期/已作废的旋转丢弃: 不让旧输入在阻塞恢复后突然执行 */
-        if (evt.event == INPUT_EVT_DROPPED ||
-            (!is_key_event(evt.event) && evt_age_ms(&evt) > INPUT_ENCODER_MAX_AGE_MS))
+        /* ① 过期旋转丢弃: 不让旧输入在阻塞恢复后突然执行 */
+        if (!is_key_event(evt.event) && evt_age_ms(&evt) > INPUT_ENCODER_MAX_AGE_MS)
             continue;
 
-        n++;   /* ② 只有真正分发的才计入本轮额度 */
-
-        /* ③ 上下文已变: 清积压事件 + 重同步编码器相位 */
+        /* ② 上下文已变: 清积压事件 + 重同步编码器相位 */
         if (input_dispatch(&evt))
             Input_ResetForJump();
     }
@@ -331,26 +289,4 @@ void Input_ResetForJump(void)
 {
     Input_ClearEvents();
     Encoder_RequestResync();
-}
-
-
-/* 队列中是否有按键事件待处理(见 input.h): 只读扫描, 不改 head/tail。
- * 并发安全: 快照 head 与 tail 后只读 [head, tail) 区间 —— 生产者(1ms 中断)是先写
- * buf[tail] 再推进 tail, 故该区间内的槽位必已写完; 扫描期间生产者只会往更后面追加,
- * 不会改写本区间。tail 快照之后新入队的按键本次看不到, 下一轮即见 —— 作为"是否放宽
- * 本轮消费上限"的启发式判据, 这个时间差无影响。 */
-bool Input_HasKeyPending(void)
-{
-    uint8_t i   = evt_q.head;
-    uint8_t end = evt_q.tail;
-
-    while (i != end)
-    {
-        if (is_key_event(evt_q.buf[i].event))
-            return true;
-
-        i = (uint8_t)((i + 1u) & INPUT_EVT_QUEUE_MASK);
-    }
-
-    return false;
 }
